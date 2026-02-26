@@ -150,7 +150,13 @@ class SettingUpdate(BaseModel):
 # ── LIFESPAN ──────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await ensure_dagens_kamp_table()
+       # Initialize database tables (optional - app works without DB)
+    try:
+        await ensure_dagens_kamp_table()
+        await ensure_bankroll_tables(db_execute)
+    except Exception as e:
+        print(f"[LIFESPAN] Database initialization warning: {e}")
+        print("[LIFESPAN] Continuing without database...")
     await ensure_bankroll_tables(db_execute)
     # Start background scheduler
     task = asyncio.create_task(background_scheduler())
