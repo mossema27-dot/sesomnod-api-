@@ -14,8 +14,11 @@ COPY dagens_kamp.py .
 COPY auto_result.py .
 COPY bankroll.py .
 
-# Railway injects PORT env variable automatically
-ENV PORT=8080
+# Railway injects PORT env variable automatically, default to 8000
+ENV PORT=8000
+
+# EXPOSE the port for Railway healthcheck
+EXPOSE 8000
 
 # Run the application
-CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 1
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 1
