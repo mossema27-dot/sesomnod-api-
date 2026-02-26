@@ -423,14 +423,14 @@ app.add_middleware(
 # ── HEALTH ────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    bankroll = await get_current_bankroll(db_query)
+    
     return {
         "status": "ok",
-        "service": "SesomNod Engine API",
-        "version": "3.0.0",
-        "bankroll": bankroll,
-        "bankroll_goal": BANKROLL_GOAL,
-        "disclaimer": DISCLAIMER,
+        "service": "sesomnod-api"
+        
+        
+        
+        
     }
 
 # ── PICKS ENDPOINTS ───────────────────────────────────────────
