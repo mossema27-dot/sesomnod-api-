@@ -1,306 +1,191 @@
-"""
-SesomNod Engine v7.1 - "REST Edition"
-=====================================
-GARANTIER:
-- Starter alltid
-- Stopper ALDRI av seg selv
-- /health returnerer alltid 200
-- DB-feil er ufarlig (Graceful Degradation)
-- Import-feil i andre moduler er ufarlig
-- Alle exceptions fanges på alle nivåer
-- Ingen kode kan tvinge appen til å stoppe (Fortress Mode)
-- Bruker Supabase REST API via httpx (Løser Railway IPv6-problem)
-"""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KRITISK: Patch sys.exit og os._exit FØR noen imports
-# Dette hindrer andre moduler fra å drepe prosessen
-# ─────────────────────────────────────────────────────────────────────────────
 import sys
 import os
+import json
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
+# FORTRESS: Block sys.exit before ANY imports
 _original_exit = sys.exit
 def _safe_exit(code=0):
-    import logging
-    logging.getLogger("sesomnod").critical(
-        f"[FORTRESS] sys.exit({code}) blokkert! Appen fortsetter."
-    )
-sys.exit = _safe_exit  # Blokker sys.exit globalt
+    print(f"[FORTRESS] sys.exit({code}) blocked! Continuing execution...")
+    return None
+sys.exit = _safe_exit
+_original_os_exit = os._exit
+def _safe_os_exit(code=0):
+    print(f"[FORTRESS] os._exit({code}) blocked! Continuing execution...")
+    return None
+os._exit = _safe_os_exit
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IMPORTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-import asyncio
 import logging
-import signal
-import time
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
-)
-logger = logging.getLogger("sesomnod")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIKKER IMPORT AV ANDRE MODULER
-# ─────────────────────────────────────────────────────────────────────────────
-
-_imported_modules: Dict[str, Any] = {}
-_import_errors: Dict[str, str] = {}
-
-def _safe_import(module_name: str) -> Optional[Any]:
-    """Importerer en modul trygt — hvis den feiler, logger vi og går videre."""
+# Safe import function
+def _safe_import(module_name):
     try:
-        import importlib
-        mod = importlib.import_module(module_name)
-        _imported_modules[module_name] = mod
-        logger.info(f"[Import] ✅ {module_name} lastet OK")
-        return mod
+        module = __import__(module_name)
+        print(f"[IMPORT] {module_name} loaded OK")
+        return module
     except Exception as e:
-        _import_errors[module_name] = str(e)
-        logger.warning(f"[Import] ⚠️ {module_name} feilet: {e} — fortsetter uten")
+        print(f"[IMPORT] {module_name} failed: {e}")
         return None
 
-# Prøv å laste andre moduler — feil her stopper IKKE appen
+# Import Fortress modules
 bankroll_module = _safe_import("bankroll")
 dagens_kamp_module = _safe_import("dagens_kamp")
 auto_result_module = _safe_import("auto_result")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KONFIGURASJON
-# ─────────────────────────────────────────────────────────────────────────────
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+import asyncpg
 
-def _clean(key: str) -> str:
-    """Henter og renser miljøvariabel for alle usynlige tegn."""
-    val = os.getenv(key, "")
-    if val:
-        val = (val.strip()
-               .replace("\n", "").replace("\r", "")
-               .replace("\t", "").replace("\x00", "")
-               .replace("\ufeff", ""))
-    return val
-
+# Config
 class Config:
-    SUPABASE_URL: str = _clean("SUPABASE_URL") or "https://vpgasvzrssygogvuolkb.supabase.co"
-    SUPABASE_SERVICE_KEY: str = _clean("SUPABASE_SERVICE_KEY")
-    SUPABASE_ANON_KEY: str = _clean("SUPABASE_ANON_KEY")
-    TELEGRAM_TOKEN: str = _clean("TELEGRAM_TOKEN")
-    TELEGRAM_CHAT_ID: str = _clean("TELEGRAM_CHAT_ID")
-    ODDS_API_KEY: str = _clean("ODDS_API_KEY")
-    PORT: int = int(os.getenv("PORT", "8000"))
-    ENVIRONMENT: str = os.getenv("RAILWAY_ENVIRONMENT", "development")
-    SERVICE_NAME: str = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
+    def __init__(self):
+        self.DATABASE_URL = self._clean(os.getenv("DATABASE_URL", ""))
+        self.SUPABASE_SERVICE_KEY = self._clean(os.getenv("SUPABASE_SERVICE_KEY", ""))
+        self.TELEGRAM_TOKEN = self._clean(os.getenv("TELEGRAM_TOKEN", ""))
+        self.TELEGRAM_CHAT_ID = self._clean(os.getenv("TELEGRAM_CHAT_ID", ""))
+        self.ODDS_API_KEY = self._clean(os.getenv("ODDS_API_KEY", ""))
+    
+    def _clean(self, value):
+        if not value:
+            return value
+        return value.strip().replace('\n', '').replace('\r', '').replace('\t', '')
 
 cfg = Config()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATABASE STATE
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Database state
 class DBState:
     def __init__(self):
-        self.connected: bool = False
-        self.error: str = ""
-        self.attempt_count: int = 0
-        self.consecutive_failures: int = 0
-        self.last_check: float = 0.0
-        self.last_success: float = 0.0
-        self._lock = asyncio.Lock()
-
-    async def mark_ok(self):
-        async with self._lock:
-            was_offline = not self.connected
-            self.connected = True
-            self.error = ""
-            self.last_check = time.time()
-            self.last_success = time.time()
-            self.consecutive_failures = 0
-            if was_offline:
-                logger.info("[DB] ✅ Supabase REST API tilkoblet!")
-
-    async def mark_fail(self, error: str):
-        async with self._lock:
-            self.connected = False
-            self.error = error
-            self.last_check = time.time()
-            self.consecutive_failures += 1
-
-    def to_dict(self) -> Dict[str, Any]:
-        now = time.time()
-        return {
-            "connected": self.connected,
-            "error": self.error or None,
-            "attempt_count": self.attempt_count,
-            "consecutive_failures": self.consecutive_failures,
-            "last_check_ago_sec": round(now - self.last_check, 1) if self.last_check else None,
-            "last_success_ago_sec": round(now - self.last_success, 1) if self.last_success else None,
-        }
+        self.online = False
+        self.pool = None
+        self.error = None
+        self.attempt_count = 0
 
 db_state = DBState()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SUPABASE REST HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def ping_supabase(client: httpx.AsyncClient) -> bool:
-    """Sjekk om Supabase REST API er tilgjengelig via /rest/v1/ endepunktet"""
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
-        return False
-    try:
-        # Vi pinger rot-endepunktet for REST API-et
-        response = await client.get(
-            f"{cfg.SUPABASE_URL}/rest/v1/",
-            headers={
-                "apikey": cfg.SUPABASE_SERVICE_KEY,
-                "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}"
-            },
-            timeout=5.0
-        )
-        if response.status_code == 200:
-            await db_state.mark_ok()
-            return True
-        else:
-            await db_state.mark_fail(f"HTTP {response.status_code}")
-            return False
-    except Exception as e:
-        await db_state.mark_fail(str(e))
-        return False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# APP SETUP & LIFESPAN
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Lifespan manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"🚀 {cfg.SERVICE_NAME} v7.1 REST Edition starter...")
+    print("[STARTUP] SesomNod API v7.2 PostgreSQL Edition starting...")
     
-    # Opprett global HTTP-klient med Supabase-headers
-    app.state.db_client = httpx.AsyncClient(
-        base_url=f"{cfg.SUPABASE_URL}/rest/v1",
-        headers={
-            "apikey": cfg.SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation"
-        },
-        timeout=30.0
-    )
-    
-    # Første sjekk av database
-    await ping_supabase(app.state.db_client)
+    # Connect to database
+    try:
+        if cfg.DATABASE_URL:
+            db_state.pool = await asyncpg.create_pool(
+                cfg.DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                command_timeout=60
+            )
+            # Test connection
+            async with db_state.pool.acquire() as conn:
+                result = await conn.fetchval("SELECT 1")
+                if result == 1:
+                    db_state.online = True
+                    print(f"[DB] Connected to PostgreSQL via Session Pooler!")
+        else:
+            print("[DB] No DATABASE_URL set")
+    except Exception as e:
+        db_state.error = str(e)
+        print(f"[DB] Connection failed: {e}")
     
     yield
     
-    # Shutdown logic
-    await app.state.db_client.aclose()
-    logger.info("👋 SesomNod Engine avslutter.")
+    # Shutdown
+    print("[SHUTDOWN] Cleaning up...")
+    if db_state.pool:
+        await db_state.pool.close()
 
 app = FastAPI(
-    title="SesomNod Engine API",
-    version="7.1.0",
+    title="SesomNod Engine",
+    version="7.2.0-postgresql",
     lifespan=lifespan
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ENDEPUNKTER
-# ─────────────────────────────────────────────────────────────────────────────
+@app.middleware("http")
+async def request_middleware(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal error", "detail": str(e)}
+        )
 
 @app.get("/health")
-async def health(request: Request):
-    # Oppdater db-sjekk ved hvert kall for å ha ferske data i health
-    await ping_supabase(request.app.state.db_client)
+async def health():
+    db_status = {
+        "connected": db_state.online,
+        "error": db_state.error,
+        "attempt_count": db_state.attempt_count
+    }
+    
     return {
-        "status": "online",
-        "service": cfg.SERVICE_NAME,
-        "version": "7.1.0-rest",
-        "db": db_state.to_dict(),
-        "env": cfg.ENVIRONMENT,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "status": "online" if db_state.online else "degraded",
+        "service": "sesomnod-api",
+        "version": "7.2.0-postgresql",
+        "db": db_status,
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 @app.get("/bankroll")
-async def get_bankroll(request: Request):
+async def get_bankroll():
+    if not db_state.online or not db_state.pool:
+        raise HTTPException(status_code=503, detail="Database offline")
+    
     try:
-        response = await request.app.state.db_client.get(
-            "/bankroll",
-            params={"order": "timestamp.desc", "limit": 100}
-        )
-        if response.status_code == 200:
-            await db_state.mark_ok()
-            return {"status": "ok", "data": response.json()}
-        else:
-            err_msg = f"HTTP {response.status_code}: {response.text[:100]}"
-            await db_state.mark_fail(err_msg)
-            return {"status": "error", "message": err_msg, "data": []}
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM bankroll ORDER BY timestamp DESC LIMIT 100"
+            )
+            return {"data": [dict(row) for row in rows]}
     except Exception as e:
-        logger.error(f"Bankroll feil: {e}")
-        await db_state.mark_fail(str(e))
-        return {"status": "error", "message": str(e), "data": []}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/picks")
-async def get_picks(request: Request):
+async def get_picks():
+    if not db_state.online or not db_state.pool:
+        raise HTTPException(status_code=503, detail="Database offline")
+    
     try:
-        response = await request.app.state.db_client.get(
-            "/picks",
-            params={"order": "created_at.desc", "limit": 100}
-        )
-        if response.status_code == 200:
-            await db_state.mark_ok()
-            return {"status": "ok", "data": response.json()}
-        else:
-            err_msg = f"HTTP {response.status_code}: {response.text[:100]}"
-            await db_state.mark_fail(err_msg)
-            return {"status": "error", "message": err_msg, "data": []}
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM picks ORDER BY created_at DESC LIMIT 100"
+            )
+            return {"data": [dict(row) for row in rows]}
     except Exception as e:
-        logger.error(f"Picks feil: {e}")
-        await db_state.mark_fail(str(e))
-        return {"status": "error", "message": str(e), "data": []}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/dagens-kamp")
-async def get_dagens_kamp(request: Request):
+async def get_dagens_kamp():
+    if not db_state.online or not db_state.pool:
+        raise HTTPException(status_code=503, detail="Database offline")
+    
     try:
-        response = await request.app.state.db_client.get(
-            "/dagens_kamp",
-            params={"order": "created_at.desc", "limit": 1}
-        )
-        if response.status_code == 200:
-            await db_state.mark_ok()
-            data = response.json()
-            return {"status": "ok", "data": data[0] if data else None}
-        else:
-            err_msg = f"HTTP {response.status_code}: {response.text[:100]}"
-            await db_state.mark_fail(err_msg)
-            return {"status": "error", "message": err_msg, "data": None}
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM dagens_kamp ORDER BY created_at DESC LIMIT 1"
+            )
+            if row:
+                return {"data": dict(row)}
+            return {"data": None}
     except Exception as e:
-        logger.error(f"Dagens kamp feil: {e}")
-        await db_state.mark_fail(str(e))
-        return {"status": "error", "message": str(e), "data": None}
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {
+        "message": "SesomNod Engine v7.2",
+        "version": "7.2.0-postgresql",
+        "status": "running"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
