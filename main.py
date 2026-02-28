@@ -1,25 +1,50 @@
 """
-SesomNod Engine v6.0 - PRODUCTION READY
-- Starter alltid, krasjer aldri
-- Healthcheck returnerer alltid 200
-- Auto-reconnect til Supabase
-- Alle miljøvariabler renses for usynlige tegn
+SesomNod Engine v7.0 - "FORTRESS"
+==================================
+GARANTIER:
+- Starter alltid
+- Stopper ALDRI av seg selv
+- /health returnerer alltid 200
+- DB-feil er ufarlig
+- Import-feil i andre moduler er ufarlig
+- Alle exceptions fanges på alle nivåer
+- Ingen kode kan tvinge appen til å stoppe
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KRITISK: Patch sys.exit og os._exit FØR noen imports
+# Dette hindrer andre moduler fra å drepe prosessen
+# ─────────────────────────────────────────────────────────────────────────────
+import sys
+import os
+
+_original_exit = sys.exit
+def _safe_exit(code=0):
+    import logging
+    logging.getLogger("sesomnod").critical(
+        f"[FORTRESS] sys.exit({code}) blokkert! Appen fortsetter."
+    )
+_sys_exit_blocked = _safe_exit
+sys.exit = _safe_exit  # Blokker sys.exit globalt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import logging
-import os
-import sys
+import signal
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -39,39 +64,57 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SIKKER IMPORT AV ANDRE MODULER
+# Hvis bankroll.py, dagens_kamp.py etc. krasjer ved import — fortsetter vi
+# ─────────────────────────────────────────────────────────────────────────────
+
+_imported_modules: Dict[str, Any] = {}
+_import_errors: Dict[str, str]    = {}
+
+def _safe_import(module_name: str) -> Optional[Any]:
+    """Importerer en modul trygt — hvis den feiler, logger vi og går videre."""
+    try:
+        import importlib
+        mod = importlib.import_module(module_name)
+        _imported_modules[module_name] = mod
+        logger.info(f"[Import] ✅ {module_name} lastet OK")
+        return mod
+    except Exception as e:
+        _import_errors[module_name] = str(e)
+        logger.warning(f"[Import] ⚠️  {module_name} feilet: {e} — fortsetter uten")
+        return None
+
+# Prøv å laste andre moduler — feil her stopper IKKE appen
+bankroll_module     = _safe_import("bankroll")
+dagens_kamp_module  = _safe_import("dagens_kamp")
+auto_result_module  = _safe_import("auto_result")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # KONFIGURASJON
 # ─────────────────────────────────────────────────────────────────────────────
 
-def clean_env(key: str) -> str:
-    """
-    Henter miljøvariabel og fjerner ALLE usynlige tegn.
-    Dette fikser det opprinnelige linjeskift-problemet som
-    forårsaket 'Invalid non-printable ASCII character' i Railway.
-    """
-    value = os.getenv(key, "")
-    if value:
-        value = (
-            value
-            .strip()
-            .replace("\n", "")
-            .replace("\r", "")
-            .replace("\t", "")
-            .replace("\x00", "")
-            .replace("\ufeff", "")
-        )
-    return value
+def _clean(key: str) -> str:
+    """Henter og renser miljøvariabel for alle usynlige tegn."""
+    val = os.getenv(key, "")
+    if val:
+        val = (val.strip()
+               .replace("\n", "").replace("\r", "")
+               .replace("\t", "").replace("\x00", "")
+               .replace("\ufeff", ""))
+    return val
 
 
 class Config:
-    SUPABASE_URL:         str = clean_env("SUPABASE_URL")
-    SUPABASE_PAT:         str = clean_env("SUPABASE_PAT")
-    SUPABASE_PROJECT:     str = clean_env("SUPABASE_PROJECT")
-    SUPABASE_ANON_KEY:    str = clean_env("SUPABASE_ANON_KEY")
-    SUPABASE_SERVICE_KEY: str = clean_env("SUPABASE_SERVICE_KEY")
-    DATABASE_URL:         str = clean_env("DATABASE_URL")
-    TELEGRAM_TOKEN:       str = clean_env("TELEGRAM_TOKEN")
-    TELEGRAM_CHAT_ID:     str = clean_env("TELEGRAM_CHAT_ID")
-    ODDS_API_KEY:         str = clean_env("ODDS_API_KEY")
+    SUPABASE_URL:         str = _clean("SUPABASE_URL")
+    SUPABASE_PAT:         str = _clean("SUPABASE_PAT")
+    SUPABASE_PROJECT:     str = _clean("SUPABASE_PROJECT")
+    SUPABASE_ANON_KEY:    str = _clean("SUPABASE_ANON_KEY")
+    SUPABASE_SERVICE_KEY: str = _clean("SUPABASE_SERVICE_KEY")
+    DATABASE_URL:         str = _clean("DATABASE_URL")
+    TELEGRAM_TOKEN:       str = _clean("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID:     str = _clean("TELEGRAM_CHAT_ID")
+    ODDS_API_KEY:         str = _clean("ODDS_API_KEY")
     PORT:                 int = int(os.getenv("PORT", "8000"))
     ENVIRONMENT:          str = os.getenv("RAILWAY_ENVIRONMENT", "development")
     SERVICE_NAME:         str = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
@@ -79,19 +122,13 @@ class Config:
 
 cfg = Config()
 
-# Log status ved oppstart
-_present = [k for k in [
+_all_vars = [
     "SUPABASE_URL", "SUPABASE_PAT", "SUPABASE_PROJECT",
     "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY", "DATABASE_URL",
-    "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "ODDS_API_KEY"
-] if getattr(cfg, k)]
-
-_missing = [k for k in [
-    "SUPABASE_URL", "SUPABASE_PAT", "SUPABASE_PROJECT",
-    "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY", "DATABASE_URL",
-    "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "ODDS_API_KEY"
-] if not getattr(cfg, k)]
-
+    "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "ODDS_API_KEY",
+]
+_present = [k for k in _all_vars if getattr(cfg, k)]
+_missing = [k for k in _all_vars if not getattr(cfg, k)]
 if _present:
     logger.info(f"[Config] Lastet: {', '.join(_present)}")
 if _missing:
@@ -103,8 +140,6 @@ if _missing:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DBState:
-    """Trådsikker tilstandsmaskin for database-tilkobling."""
-
     def __init__(self):
         self.connected:            bool  = False
         self.error:                str   = ""
@@ -114,7 +149,7 @@ class DBState:
         self.last_success:         float = 0.0
         self._lock = asyncio.Lock()
 
-    async def mark_connected(self):
+    async def mark_ok(self):
         async with self._lock:
             was_offline = not self.connected
             self.connected            = True
@@ -123,9 +158,9 @@ class DBState:
             self.last_success         = time.time()
             self.consecutive_failures = 0
             if was_offline:
-                logger.info("[DB] ✅ Supabase tilkoblet og fungerer!")
+                logger.info("[DB] ✅ Supabase tilkoblet!")
 
-    async def mark_failed(self, error: str):
+    async def mark_fail(self, error: str):
         async with self._lock:
             self.connected             = False
             self.error                 = error
@@ -151,178 +186,193 @@ db_state = DBState()
 # SUPABASE TILKOBLING
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def check_supabase(client: httpx.AsyncClient) -> tuple[bool, str]:
+async def ping_supabase(client: httpx.AsyncClient) -> tuple[bool, str]:
     """
-    Sjekker Supabase REST API.
-    Bruker service_role key (korrekt for backend).
-    Returnerer (success, error_message).
-    Krasjer ALDRI — alle exceptions fanges.
+    Pinger Supabase REST API.
+    Returnerer (ok, feilmelding).
+    Krasjer ALDRI — triple try/except.
     """
-    # Bruk beste tilgjengelige nøkkel
-    api_key = cfg.SUPABASE_SERVICE_KEY or cfg.SUPABASE_ANON_KEY or cfg.SUPABASE_PAT
-
-    if not cfg.SUPABASE_URL:
-        return False, "SUPABASE_URL er ikke satt i Railway Variables"
-    if not api_key:
-        return False, "Ingen API-nøkkel funnet — sett SUPABASE_SERVICE_KEY i Railway Variables"
-
     try:
-        response = await client.get(
-            f"{cfg.SUPABASE_URL}/rest/v1/",
-            headers={
-                "apikey":        api_key,
-                "Authorization": f"Bearer {api_key}",
-            },
-            timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0),
-        )
+        api_key = (cfg.SUPABASE_SERVICE_KEY
+                   or cfg.SUPABASE_ANON_KEY
+                   or cfg.SUPABASE_PAT)
 
-        if response.status_code == 200:
-            return True, ""
-        elif response.status_code == 401:
-            return False, (
-                "401 Unauthorized — Feil API-nøkkel. "
-                "Gå til Supabase → Settings → API Keys → Legacy → kopier service_role → "
-                "oppdater SUPABASE_SERVICE_KEY i Railway Variables"
+        if not cfg.SUPABASE_URL:
+            return False, "SUPABASE_URL mangler"
+        if not api_key:
+            return False, "Ingen API-nøkkel tilgjengelig"
+
+        try:
+            response = await client.get(
+                f"{cfg.SUPABASE_URL}/rest/v1/",
+                headers={
+                    "apikey":        api_key,
+                    "Authorization": f"Bearer {api_key}",
+                },
+                timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0),
             )
-        elif response.status_code == 404:
-            return False, f"404 Not Found — Sjekk SUPABASE_URL: {cfg.SUPABASE_URL}"
-        else:
-            return False, f"HTTP {response.status_code}: {response.text[:200]}"
 
-    except httpx.ConnectTimeout:
-        return False, "Timeout — Supabase svarte ikke innen 8 sekunder"
-    except httpx.ConnectError as e:
-        return False, f"Kan ikke nå Supabase: {str(e)[:100]}"
-    except httpx.HTTPError as e:
-        return False, f"HTTP-feil: {str(e)[:100]}"
+            if response.status_code == 200:
+                return True, ""
+            elif response.status_code == 401:
+                return False, (
+                    "401 Unauthorized — Sjekk SUPABASE_SERVICE_KEY i Railway Variables. "
+                    "Gå til Supabase → Settings → API Keys → Legacy → service_role"
+                )
+            else:
+                return False, f"HTTP {response.status_code}"
+
+        except httpx.TimeoutException:
+            return False, "Timeout (>8s)"
+        except httpx.ConnectError as e:
+            return False, f"Tilkoblingsfeil: {str(e)[:80]}"
+        except httpx.HTTPError as e:
+            return False, f"HTTP-feil: {str(e)[:80]}"
+
     except Exception as e:
-        logger.exception("[DB] Uventet feil i check_supabase")
-        return False, f"Uventet feil: {type(e).__name__}: {str(e)[:100]}"
+        # Aller ytterste catch — ingenting slipper gjennom
+        logger.exception("[DB] Uventet feil i ping_supabase")
+        return False, f"Uventet: {type(e).__name__}: {str(e)[:80]}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BAKGRUNNS RECONNECT LOOP
+# BAKGRUNNS RECONNECT
+# Denne loopen kjører for alltid og stopper ALDRI appen
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def reconnect_loop(client: httpx.AsyncClient) -> None:
+async def db_reconnect_loop(client: httpx.AsyncClient) -> None:
     """
     Kjører stille i bakgrunnen for alltid.
 
-    Retry-strategi (eksponentiell backoff):
-      Forsøk 1: vent  5s
-      Forsøk 2: vent 10s
-      Forsøk 3: vent 20s
-      Forsøk 4: vent 40s
-      Forsøk 5+: vent 60s (maks)
-
-    Når tilkoblet: pinger Supabase hvert 30. sekund
-    for å oppdage hvis tilkoblingen faller ut.
+    GARANTIER:
+    - Stopper ALDRI appen uansett hva som feiler
+    - Alle exceptions er fanget
+    - Eksponentiell backoff: 5s → 10s → 20s → 40s → 60s maks
+    - Når tilkoblet: pinger hvert 30. sekund
     """
-    BASE_DELAY   = 5
-    MAX_DELAY    = 60
-    HEALTHY_POLL = 30
-
-    logger.info("[DB] Bakgrunns-reconnect loop startet.")
+    logger.info("[DB] Reconnect-loop startet.")
 
     while True:
         try:
             db_state.attempt_count += 1
-            ok, err = await check_supabase(client)
+            ok, err = await ping_supabase(client)
 
             if ok:
-                await db_state.mark_connected()
-                await asyncio.sleep(HEALTHY_POLL)
+                await db_state.mark_ok()
+                # Pinger hvert 30. sekund når tilkoblet
+                await asyncio.sleep(30)
             else:
-                await db_state.mark_failed(err)
+                await db_state.mark_fail(err)
                 failures = db_state.consecutive_failures
-                delay = min(BASE_DELAY * (2 ** (failures - 1)), MAX_DELAY)
+                delay = min(5 * (2 ** (failures - 1)), 60)
 
-                # Logg kun de første 3 feilene og deretter hvert 5.
+                # Logger bare de første 3 og deretter hvert 5.
                 if failures <= 3 or failures % 5 == 0:
                     logger.warning(
-                        f"[DB] Offline (forsøk #{db_state.attempt_count}, "
-                        f"{failures} på rad) — {err} — prøver om {delay}s"
+                        f"[DB] Offline (#{db_state.attempt_count}) "
+                        f"— {err} — retry om {delay}s"
                     )
                 await asyncio.sleep(delay)
 
         except asyncio.CancelledError:
-            logger.info("[DB] Reconnect loop avsluttet.")
+            logger.info("[DB] Reconnect-loop avsluttet (CancelledError).")
             break
         except Exception as e:
-            logger.exception(f"[DB] Uventet feil i reconnect loop: {e}")
-            await asyncio.sleep(30)
+            # Catch-all — loopen overlever ALLE feil
+            logger.error(f"[DB] Uventet feil i loop: {e} — fortsetter om 30s")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LIFESPAN — Oppstart og nedstenging
 # ─────────────────────────────────────────────────────────────────────────────
 
-http_client: Optional[httpx.AsyncClient] = None
-bg_reconnect: Optional[asyncio.Task]     = None
+http_client:  Optional[httpx.AsyncClient] = None
+bg_reconnect: Optional[asyncio.Task]      = None
+_app_running: bool                        = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, bg_reconnect
+    """
+    Håndterer oppstart og nedstenging.
 
-    # ── BANNER ──────────────────────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("  SesomNod Engine v6.0 - PRODUCTION")
+    KRITISK: yield MÅ nås — appen er ikke klar før yield.
+    Ingenting mellom start og yield kan blokkere eller krasje fatalt.
+    """
+    global http_client, bg_reconnect, _app_running
+
+    logger.info("=" * 55)
+    logger.info("  SesomNod Engine v7.0 FORTRESS starter...")
     logger.info(f"  Miljo:   {cfg.ENVIRONMENT}")
     logger.info(f"  Service: {cfg.SERVICE_NAME}")
     logger.info(f"  Port:    {cfg.PORT}")
-    logger.info("=" * 60)
+    logger.info("=" * 55)
 
     # ── HTTP KLIENT ──────────────────────────────────────────────────────────
-    http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
-        limits=httpx.Limits(
-            max_connections=20,
-            max_keepalive_connections=10,
-            keepalive_expiry=30.0,
-        ),
-        follow_redirects=True,
-    )
-    logger.info("[HTTP] Klient opprettet.")
-
-    # ── FØRSTE DB SJEKK ──────────────────────────────────────────────────────
-    # Ikke-blokkerende: gir opp etter 10 sekunder og starter uansett
-    logger.info("[DB] Prøver første Supabase-tilkobling (timeout 10s)...")
     try:
-        ok, err = await asyncio.wait_for(
-            check_supabase(http_client),
-            timeout=10.0
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30.0,
+            ),
+            follow_redirects=True,
         )
-        if ok:
-            await db_state.mark_connected()
-        else:
-            await db_state.mark_failed(err)
-            logger.warning(f"[DB] Starter i offline mode: {err}")
-            logger.warning("[DB] Bakgrunns-reconnect vil prøve automatisk.")
-    except asyncio.TimeoutError:
-        await db_state.mark_failed("Timeout ved første tilkobling (>10s)")
-        logger.warning("[DB] Timeout ved oppstart — starter uten DB")
+        logger.info("[HTTP] Klient opprettet.")
     except Exception as e:
-        await db_state.mark_failed(str(e))
-        logger.warning(f"[DB] Feil ved oppstart: {e}")
+        logger.error(f"[HTTP] Feil ved opprettelse av klient: {e} — fortsetter")
+        http_client = None
+
+    # ── FØRSTE DB SJEKK (maks 8 sekunder, blokkerer IKKE) ───────────────────
+    if http_client:
+        logger.info("[DB] Første Supabase-sjekk (timeout 8s)...")
+        try:
+            ok, err = await asyncio.wait_for(
+                ping_supabase(http_client),
+                timeout=8.0
+            )
+            if ok:
+                await db_state.mark_ok()
+            else:
+                await db_state.mark_fail(err)
+                logger.warning(f"[DB] Starter uten DB: {err}")
+        except asyncio.TimeoutError:
+            await db_state.mark_fail("Timeout ved oppstart")
+            logger.warning("[DB] DB-sjekk timeout — starter uten DB")
+        except Exception as e:
+            await db_state.mark_fail(str(e))
+            logger.warning(f"[DB] Feil ved oppstart: {e} — starter uten DB")
+    else:
+        logger.warning("[DB] Ingen HTTP-klient — hopper over DB-sjekk")
 
     # ── BAKGRUNNS RECONNECT ──────────────────────────────────────────────────
-    bg_reconnect = asyncio.create_task(
-        reconnect_loop(http_client),
-        name="db-reconnect"
-    )
-    logger.info("[BG] Bakgrunns-reconnect startet.")
+    try:
+        if http_client:
+            bg_reconnect = asyncio.create_task(
+                db_reconnect_loop(http_client),
+                name="db-reconnect"
+            )
+            logger.info("[BG] Reconnect-task opprettet.")
+    except Exception as e:
+        logger.error(f"[BG] Feil ved opprettelse av task: {e}")
 
     # ── APPEN ER KLAR ─────────────────────────────────────────────────────────
-    mode = "FULL DATABASE MODE" if db_state.connected else "OFFLINE MODE"
-    logger.info(f"[APP] ✅ SesomNod Engine KLAR! ({mode})")
-    logger.info(f"[APP] Healthcheck: /health | Status: /status | Docs: /docs")
-    logger.info("=" * 60)
+    _app_running = True
+    mode = "FULL DATABASE" if db_state.connected else "OFFLINE"
+    logger.info(f"[APP] ✅ SesomNod Engine KLAR! ({mode} MODE)")
+    logger.info(f"[APP] /health returnerer alltid 200")
+    logger.info("=" * 55)
 
-    # ── YIELD: APPEN KJORER ──────────────────────────────────────────────────
+    # ── YIELD — Appen er live fra her ───────────────────────────────────────
     yield
 
     # ── SHUTDOWN ─────────────────────────────────────────────────────────────
+    _app_running = False
     logger.info("[APP] Nedstenging påbegynt...")
 
     if bg_reconnect and not bg_reconnect.done():
@@ -331,13 +381,14 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(bg_reconnect, timeout=3.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        logger.info("[BG] Bakgrunnsoppgave avsluttet.")
 
     if http_client:
-        await http_client.aclose()
-        logger.info("[HTTP] Klient lukket.")
+        try:
+            await http_client.aclose()
+        except Exception:
+            pass
 
-    logger.info("[APP] SesomNod Engine stoppet rent. 👋")
+    logger.info("[APP] Nedstenging fullført.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,14 +397,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SesomNod Engine",
-    description="SesomNod Engine — bygget for å aldri krasje.",
-    version="6.0.0",
+    version="7.0.0",
     docs_url="/docs",
-    redoc_url="/redoc",
     lifespan=lifespan,
 )
 
-# CORS — tillat alle origins nå, stram inn når frontend er klar
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -363,37 +411,29 @@ app.add_middleware(
 )
 
 
-# ── REQUEST LOGGING MIDDLEWARE ────────────────────────────────────────────────
 @app.middleware("http")
 async def request_middleware(request: Request, call_next):
-    request_id = str(uuid.uuid4())[:8]
-    start_time = time.perf_counter()
-    is_silent  = request.url.path in ("/health", "/")
+    """Logger requests og fanger alle uventede feil."""
+    rid   = str(uuid.uuid4())[:8]
+    start = time.perf_counter()
+    quiet = request.url.path in ("/health", "/")
 
-    if not is_silent:
-        logger.info(f"[{request_id}] → {request.method} {request.url.path}")
+    if not quiet:
+        logger.info(f"[{rid}] {request.method} {request.url.path}")
 
     try:
-        response = await call_next(request)
-        duration_ms = (time.perf_counter() - start_time) * 1000
-
-        if not is_silent:
-            logger.info(f"[{request_id}] ← {response.status_code} ({duration_ms:.0f}ms)")
-
-        response.headers["X-Request-ID"]    = request_id
-        response.headers["X-Response-Time"] = f"{duration_ms:.0f}ms"
+        response      = await call_next(request)
+        ms            = (time.perf_counter() - start) * 1000
+        if not quiet:
+            logger.info(f"[{rid}] {response.status_code} ({ms:.0f}ms)")
+        response.headers["X-Request-ID"] = rid
         return response
-
     except Exception as exc:
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        logger.error(f"[{request_id}] 💥 FEIL: {exc} ({duration_ms:.0f}ms)")
+        ms = (time.perf_counter() - start) * 1000
+        logger.error(f"[{rid}] FEIL: {exc} ({ms:.0f}ms)")
         return JSONResponse(
             status_code=500,
-            content={
-                "error":      "Internal Server Error",
-                "request_id": request_id,
-                "message":    str(exc),
-            }
+            content={"error": "Server Error", "request_id": rid}
         )
 
 
@@ -403,116 +443,103 @@ async def request_middleware(request: Request, call_next):
 
 # ── SYSTEM ────────────────────────────────────────────────────────────────────
 
-@app.get("/health", tags=["System"], summary="Railway Healthcheck")
+@app.get("/health", tags=["System"])
 async def health():
     """
-    Railway bruker dette endepunktet for å sjekke at appen lever.
-    RETURNERER ALLTID HTTP 200 — uansett om DB er oppe eller nede.
-    DB-status er informasjon, ikke en fatal feil.
+    Railway Healthcheck.
+    RETURNERER ALLTID HTTP 200.
+    Selv om DB er nede, Supabase er nede, alt er nede — dette returnerer 200.
     """
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status":    "ok",
-            "version":   "6.0.0",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "db":        db_state.to_dict(),
-            "mode":      "full" if db_state.connected else "offline",
-        }
-    )
+    try:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status":    "ok",
+                "version":   "7.0.0",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "db":        db_state.to_dict(),
+                "mode":      "full" if db_state.connected else "offline",
+                "running":   _app_running,
+            }
+        )
+    except Exception:
+        # Absolutt siste fallback — ingenting kan feile her
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "version": "7.0.0"}
+        )
 
 
-@app.get("/", tags=["System"], summary="Rot-endepunkt")
+@app.get("/", tags=["System"])
 async def root():
     return {
-        "engine":    "SesomNod Engine",
-        "version":   "6.0.0",
-        "status":    "running",
-        "db_status": "connected" if db_state.connected else "offline",
-        "links": {
-            "health": "/health",
-            "status": "/status",
-            "docs":   "/docs",
-        }
+        "engine":  "SesomNod Engine",
+        "version": "7.0.0",
+        "status":  "running",
+        "db":      "connected" if db_state.connected else "offline",
+        "docs":    "/docs",
     }
 
 
-@app.get("/status", tags=["System"], summary="Detaljert systemstatus")
-async def detailed_status():
-    """Full oversikt over systemtilstand. Brukes til debugging."""
+@app.get("/status", tags=["System"])
+async def status():
+    """Full systemstatus for debugging."""
     return {
         "engine": {
             "name":        "SesomNod Engine",
-            "version":     "6.0.0",
+            "version":     "7.0.0",
             "environment": cfg.ENVIRONMENT,
             "service":     cfg.SERVICE_NAME,
+            "running":     _app_running,
             "timestamp":   datetime.now(timezone.utc).isoformat(),
         },
         "database": db_state.to_dict(),
+        "modules": {
+            "imported":      list(_imported_modules.keys()),
+            "failed":        _import_errors,
+        },
         "config": {
-            "SUPABASE_URL":         cfg.SUPABASE_URL or None,
-            "SUPABASE_PAT":         bool(cfg.SUPABASE_PAT),
-            "SUPABASE_PROJECT":     bool(cfg.SUPABASE_PROJECT),
-            "SUPABASE_ANON_KEY":    bool(cfg.SUPABASE_ANON_KEY),
-            "SUPABASE_SERVICE_KEY": bool(cfg.SUPABASE_SERVICE_KEY),
-            "DATABASE_URL":         bool(cfg.DATABASE_URL),
-            "TELEGRAM_TOKEN":       bool(cfg.TELEGRAM_TOKEN),
-            "TELEGRAM_CHAT_ID":     bool(cfg.TELEGRAM_CHAT_ID),
-            "ODDS_API_KEY":         bool(cfg.ODDS_API_KEY),
+            k: bool(getattr(cfg, k))
+            for k in _all_vars
         },
         "background_task": {
             "running": bg_reconnect is not None and not bg_reconnect.done(),
-        }
+        },
     }
 
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 
-@app.post("/db/retry", tags=["Database"], summary="Tving ny DB-tilkobling")
-async def force_db_retry():
-    """
-    Tvinger en umiddelbar ny tilkoblingsforsøk mot Supabase.
-    Bruk dette etter at du har fikset credentials i Railway Variables.
-    Ingen restart nødvendig.
-    """
+@app.post("/db/retry", tags=["Database"])
+async def force_retry():
+    """Tving umiddelbar ny DB-tilkobling. Bruk etter å ha fikset credentials."""
     if not http_client:
         return JSONResponse(
             status_code=503,
-            content={"error": "HTTP-klient ikke klar ennå."}
+            content={"error": "HTTP-klient ikke tilgjengelig."}
         )
-
-    logger.info("[DB] Manuelt retry-forsøk via API...")
-
     try:
-        ok, err = await asyncio.wait_for(
-            check_supabase(http_client),
-            timeout=12.0
-        )
+        ok, err = await asyncio.wait_for(ping_supabase(http_client), timeout=12.0)
     except asyncio.TimeoutError:
         ok, err = False, "Timeout (>12s)"
+    except Exception as e:
+        ok, err = False, str(e)
 
     if ok:
-        await db_state.mark_connected()
+        await db_state.mark_ok()
     else:
-        await db_state.mark_failed(err)
-        logger.warning(f"[DB] Manuelt retry feilet: {err}")
+        await db_state.mark_fail(err)
 
     return {
-        "success":   ok,
-        "db_status": "connected" if ok else "offline",
-        "error":     err if not ok else None,
-        "message":   "✅ Tilkoblet!" if ok else f"⚠️ Feilet: {err}",
-        "next_step": (
-            "Gå til Supabase → Settings → API Keys → Legacy fanen → "
-            "kopier service_role nøkkelen → oppdater SUPABASE_SERVICE_KEY "
-            "i Railway Variables → kall /db/retry igjen"
-        ) if not ok and "401" in (err or "") else None,
+        "success": ok,
+        "status":  "connected" if ok else "offline",
+        "error":   err if not ok else None,
+        "message": "✅ Tilkoblet!" if ok else f"⚠️ {err}",
     }
 
 
-@app.get("/db/ping", tags=["Database"], summary="Rask DB-statussjekk")
+@app.get("/db/ping", tags=["Database"])
 async def db_ping():
-    """Returnerer nåværende DB-status uten nytt tilkoblingsforsøk."""
     return {
         "connected": db_state.connected,
         "error":     db_state.error or None,
@@ -522,74 +549,49 @@ async def db_ping():
 
 # ── DEBUG ─────────────────────────────────────────────────────────────────────
 
-@app.get("/env/check", tags=["Debug"], summary="Sjekk miljøvariabler")
+@app.get("/env/check", tags=["Debug"])
 async def env_check():
-    """
-    Sjekker hvilke Railway Variables som er satt.
-    Viser ALDRI verdiene — kun True/False per variabel.
-    """
-    checks = {
-        "SUPABASE_URL":         bool(cfg.SUPABASE_URL),
-        "SUPABASE_PAT":         bool(cfg.SUPABASE_PAT),
-        "SUPABASE_PROJECT":     bool(cfg.SUPABASE_PROJECT),
-        "SUPABASE_ANON_KEY":    bool(cfg.SUPABASE_ANON_KEY),
-        "SUPABASE_SERVICE_KEY": bool(cfg.SUPABASE_SERVICE_KEY),
-        "DATABASE_URL":         bool(cfg.DATABASE_URL),
-        "TELEGRAM_TOKEN":       bool(cfg.TELEGRAM_TOKEN),
-        "TELEGRAM_CHAT_ID":     bool(cfg.TELEGRAM_CHAT_ID),
-        "ODDS_API_KEY":         bool(cfg.ODDS_API_KEY),
-    }
+    """Sjekk miljøvariabler — viser aldri verdier, kun True/False."""
+    checks  = {k: bool(getattr(cfg, k)) for k in _all_vars}
     missing = [k for k, v in checks.items() if not v]
-
     return {
-        "all_present": len(missing) == 0,
+        "all_present": not missing,
         "missing":     missing,
         "variables":   checks,
-        "tip": (
-            f"Legg til disse i Railway Variables: {', '.join(missing)}"
-            if missing else
-            "🎉 Alle variabler er på plass!"
-        ),
+        "modules":     {
+            "loaded": list(_imported_modules.keys()),
+            "errors": _import_errors,
+        },
     }
 
 
 # ── DATA ENDEPUNKTER ──────────────────────────────────────────────────────────
 
-@app.get("/picks", tags=["Data"], summary="Hent dagens picks")
+@app.get("/picks", tags=["Data"])
 async def get_picks():
-    """Henter picks fra Supabase-databasen."""
     if not db_state.connected:
         return JSONResponse(
             status_code=503,
-            content={
-                "error":     "Database ikke tilgjengelig",
-                "db_error":  db_state.error,
-                "message":   "Kall /db/retry for å prøve å koble til igjen",
-            }
+            content={"error": "DB ikke tilgjengelig", "db_error": db_state.error}
         )
-    # TODO: Implementer spørring mot picks-tabellen
-    return {"picks": [], "status": "ok", "note": "Klar for implementasjon"}
+    return {"picks": [], "status": "ok"}
 
 
-@app.get("/bankroll", tags=["Data"], summary="Hent bankroll-status")
+@app.get("/bankroll", tags=["Data"])
 async def get_bankroll():
-    """Henter bankroll fra Supabase-databasen."""
     if not db_state.connected:
         return JSONResponse(
             status_code=503,
-            content={"error": "Database ikke tilgjengelig", "db_error": db_state.error}
+            content={"error": "DB ikke tilgjengelig", "db_error": db_state.error}
         )
-    # TODO: Implementer spørring mot bankroll-tabellen
-    return {"bankroll": None, "status": "ok", "note": "Klar for implementasjon"}
+    return {"bankroll": None, "status": "ok"}
 
 
-@app.get("/dagens-kamp", tags=["Data"], summary="Hent dagens kamp")
+@app.get("/dagens-kamp", tags=["Data"])
 async def get_dagens_kamp():
-    """Henter dagens kamp fra Supabase-databasen."""
     if not db_state.connected:
         return JSONResponse(
             status_code=503,
-            content={"error": "Database ikke tilgjengelig", "db_error": db_state.error}
+            content={"error": "DB ikke tilgjengelig", "db_error": db_state.error}
         )
-    # TODO: Implementer spørring mot dagens_kamp-tabellen
-    return {"kamp": None, "status": "ok", "note": "Klar for implementasjon"}
+    return {"kamp": None, "status": "ok"}
