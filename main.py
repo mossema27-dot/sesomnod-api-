@@ -101,7 +101,7 @@ def _clean(key: str) -> str:
     return val
 
 class Config:
-    SUPABASE_URL: str = _clean("SUPABASE_URL")
+    SUPABASE_URL: str = _clean("SUPABASE_URL") or "https://vpgasvzrssygogvuolkb.supabase.co"
     SUPABASE_SERVICE_KEY: str = _clean("SUPABASE_SERVICE_KEY")
     SUPABASE_ANON_KEY: str = _clean("SUPABASE_ANON_KEY")
     TELEGRAM_TOKEN: str = _clean("TELEGRAM_TOKEN")
