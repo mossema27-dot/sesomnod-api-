@@ -320,6 +320,13 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
+@app.get("/test-net")
+async def test_network():
+    try:
+        r = await app.state.db_client.get("https://example.com")
+        return {"internet": True, "status": r.status_code}
+    except Exception as e:
+        return {"internet": False, "error": str(e)}
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Fyrer opp Uvicorn på port {cfg.PORT}...")
