@@ -304,31 +304,3 @@ async def get_dagens_kamp(request: Request):
         return {"status": "error", "message": str(e), "data": None}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEILHÅNDTERING
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception(f"[Global] Uventet feil: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "status": "error", 
-            "message": "Intern serverfeil", 
-            "type": type(exc).__name__,
-            "detail": str(exc)[:200]
-        }
-    )
-
-@app.get("/test-net")
-async def test_network():
-    try:
-        r = await app.state.db_client.get("https://example.com")
-        return {"internet": True, "status": r.status_code}
-    except Exception as e:
-        return {"internet": False, "error": str(e)}
-if __name__ == "__main__":
-    import uvicorn
-    logger.info(f"Fyrer opp Uvicorn på port {cfg.PORT}...")
-    uvicorn.run(app, host="0.0.0.0", port=cfg.PORT, log_level="info")
-
