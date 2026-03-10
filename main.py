@@ -279,7 +279,45 @@ async def post_dagens_kamp_telegram():
             logger.warning(f"[Scheduler] Analyse feilet: {analysis['error']}")
             return
 
-        message = dagens_kamp_module.format_dagens_kamp_telegram(analysis)
+        m = analysis["match"]
+        probs = analysis["probabilities"]
+        rec = analysis["recommendation"]
+
+        kickoff_parts = m["kickoff_display"].split(" kl. ")
+        dato = kickoff_parts[0] if len(kickoff_parts) > 1 else m["kickoff_display"]
+        tid = kickoff_parts[1] if len(kickoff_parts) > 1 else ""
+
+        message = (
+            "⚡ SESOMNOD ENGINE\n"
+            "Football Decision Intelligence\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🏆 {m['league_flag']} {m['league']} · MATCH BRIEF\n\n"
+            f"🏟 {m['home_team']}\n"
+            "         VS\n"
+            f"       {m['away_team']}\n\n"
+            f"🕒 {dato} · {tid}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 MODEL PROBABILITIES\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Over 2.5 mål   {probs['over25']}%\n"
+            f"Begge scorer   {probs['btts']}%\n"
+            f"Hjemmeseier    {probs['home_win']}%\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "📈 EDGE ANALYSE\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Odds:      {rec['odds']}\n"
+            f"Edge:      +{rec['ev_pct']}% ✅\n"
+            f"EV:        +{rec['ev_pct']}% 🔥\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "🎯 MODEL DECISION\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"PICK:        {rec['pick']}\n"
+            f"ODDS:        @ {rec['odds']}\n"
+            f"CONFIDENCE:  {rec['confidence']}%\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "You don't get picks. You get control. ⚡\n"
+            "SesomNod Engine"
+        )
 
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
