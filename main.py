@@ -188,6 +188,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                     stake NUMERIC(10,2),
                     result TEXT,
                     profit NUMERIC(10,2),
+                    telegram_posted BOOLEAN DEFAULT FALSE,
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 );
 
