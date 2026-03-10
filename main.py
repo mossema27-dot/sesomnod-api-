@@ -30,10 +30,13 @@ sys.exit = _safe_exit
 import asyncio
 import logging
 import time
+import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import asyncpg
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -149,14 +152,12 @@ async def connect_db() -> bool:
             ssl="require"
         )
 
-        # Test tilkoblingen
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
 
         await db_state.mark_ok(pool)
         logger.info("[DB] ✅ Tilkoblet Railway PostgreSQL!")
 
-        # Opprett tabeller hvis de ikke finnes
         await ensure_tables(pool)
         return True
 
@@ -235,7 +236,6 @@ async def reconnect_loop():
                 else:
                     attempt += 1
             else:
-                # Ping for å sjekke at tilkoblingen fortsatt er aktiv
                 await asyncio.sleep(30)
                 try:
                     async with db_state.pool.acquire() as conn:
@@ -251,6 +251,53 @@ async def reconnect_loop():
             logger.error(f"[DB] Uventet feil i reconnect-loop: {e}")
             await asyncio.sleep(10)
 
+
+# ─────────────────────────────────────────────────────────
+# SCHEDULER JOBS
+# ─────────────────────────────────────────────────────────
+async def post_dagens_kamp_telegram():
+    """Kjører kl. 09:00 UTC — analyserer og poster Dagens Kamp til Telegram."""
+    logger.info("[Scheduler] post_dagens_kamp_telegram startet")
+
+    if not dagens_kamp_module:
+        logger.warning("[Scheduler] dagens_kamp_module ikke lastet — hopper over")
+        return
+
+    if not cfg.ODDS_API_KEY:
+        logger.warning("[Scheduler] ODDS_API_KEY mangler — hopper over")
+        return
+
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        logger.warning("[Scheduler] TELEGRAM_TOKEN/CHAT_ID mangler — hopper over")
+        return
+
+    try:
+        analysis = await dagens_kamp_module.analyze_dagens_kamp(cfg.ODDS_API_KEY)
+
+        if "error" in analysis:
+            logger.warning(f"[Scheduler] Analyse feilet: {analysis['error']}")
+            return
+
+        message = dagens_kamp_module.format_dagens_kamp_telegram(analysis)
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": cfg.TELEGRAM_CHAT_ID,
+                    "text": message,
+                },
+            )
+
+        if resp.status_code == 200:
+            logger.info("[Scheduler] Dagens Kamp postet til Telegram OK")
+        else:
+            logger.error(f"[Scheduler] Telegram feil {resp.status_code}: {resp.text[:200]}")
+
+    except Exception as e:
+        logger.exception(f"[Scheduler] Uventet feil: {e}")
+
+
 # ─────────────────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────────────────
@@ -263,11 +310,21 @@ async def lifespan(app: FastAPI):
     logger.info(f"  DB:      {'Satt ✅' if cfg.DATABASE_URL else 'MANGLER ❌'}")
     logger.info("=" * 60)
 
-    # Første DB-tilkobling
     await connect_db()
-
-    # Start bakgrunns-reconnect
     reconnect_task = asyncio.create_task(reconnect_loop())
+
+    # ── SCHEDULER ──────────────────────────────────────────────
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        post_dagens_kamp_telegram,
+        trigger=CronTrigger(hour=9, minute=0, timezone="UTC"),
+        id="post_dagens_kamp",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("[Scheduler] AsyncIOScheduler startet — Dagens Kamp kjører kl. 09:00 UTC")
+    # ───────────────────────────────────────────────────────────
 
     if db_state.connected:
         logger.info("[APP] ✅ SesomNod Engine KLAR! (FULL MODE)")
@@ -276,8 +333,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
-    logger.info("[APP] Nedstenging påbegynt...")
+    scheduler.shutdown(wait=False)
+    logger.info("[Scheduler] AsyncIOScheduler stoppet")
     reconnect_task.cancel()
     try:
         await reconnect_task
