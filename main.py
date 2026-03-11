@@ -32,7 +32,7 @@ import logging
 import time
 import httpx
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -67,6 +67,20 @@ def _safe_import(module_name: str):
 bankroll_module = _safe_import("bankroll")
 dagens_kamp_module = _safe_import("dagens_kamp")
 auto_result_module = _safe_import("auto_result")
+
+# ─────────────────────────────────────────────────────────
+# SCANNER KONFIGURASJON
+# ─────────────────────────────────────────────────────────
+SCAN_LEAGUES = [
+    {"key": "soccer_epl",                    "name": "Premier League",   "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+    {"key": "soccer_spain_la_liga",           "name": "La Liga",          "flag": "🇪🇸"},
+    {"key": "soccer_germany_bundesliga",      "name": "Bundesliga",       "flag": "🇩🇪"},
+    {"key": "soccer_italy_serie_a",           "name": "Serie A",          "flag": "🇮🇹"},
+    {"key": "soccer_france_ligue_one",        "name": "Ligue 1",          "flag": "🇫🇷"},
+    {"key": "soccer_uefa_champions_league",   "name": "Champions League", "flag": "🏆"},
+]
+EDGE_MIN = 8.0
+CONFIDENCE_HIGH = 70
 
 # ─────────────────────────────────────────────────────────
 # KONFIGURASJON
@@ -195,9 +209,16 @@ async def ensure_tables(pool: asyncpg.Pool):
                 CREATE TABLE IF NOT EXISTS dagens_kamp (
                     id SERIAL PRIMARY KEY,
                     match TEXT,
+                    league TEXT,
+                    home_team TEXT,
+                    away_team TEXT,
                     pick TEXT,
                     odds NUMERIC(5,2),
                     stake NUMERIC(10,2),
+                    edge NUMERIC(6,2),
+                    ev NUMERIC(6,2),
+                    confidence INTEGER,
+                    kickoff TIMESTAMPTZ,
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 );
 
@@ -216,6 +237,18 @@ async def ensure_tables(pool: asyncpg.Pool):
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+
+            # Migrer eksisterende dagens_kamp tabell med nye kolonner
+            await conn.execute("""
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS league TEXT;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_team TEXT;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS away_team TEXT;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS edge NUMERIC(6,2);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS ev NUMERIC(6,2);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS confidence INTEGER;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS kickoff TIMESTAMPTZ;
+            """)
+
         logger.info("[DB] ✅ Tabeller OK")
     except Exception as e:
         logger.warning(f"[DB] Tabell-feil: {e}")
@@ -254,68 +287,279 @@ async def reconnect_loop():
 
 
 # ─────────────────────────────────────────────────────────
+# MULTI-LEAGUE SCANNER
+# ─────────────────────────────────────────────────────────
+async def _scan_leagues(odds_api_key: str) -> list:
+    """
+    Scanner alle SCAN_LEAGUES via Odds API.
+    Returnerer kvalifiserte picks sortert etter EV desc.
+    Filtreringsregler: edge >= EDGE_MIN OG confidence >= CONFIDENCE_HIGH.
+    """
+    candidates = []
+    now = datetime.now(timezone.utc)
+
+    def _median(lst):
+        s = sorted(lst)
+        n = len(s)
+        return s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        for league in SCAN_LEAGUES:
+            try:
+                resp = await client.get(
+                    f"https://api.the-odds-api.com/v4/sports/{league['key']}/odds/",
+                    params={
+                        "apiKey": odds_api_key,
+                        "regions": "eu",
+                        "markets": "h2h,totals",
+                        "oddsFormat": "decimal",
+                    }
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"[Scanner] {league['key']}: HTTP {resp.status_code}")
+                    continue
+
+                matches = resp.json()
+                if not isinstance(matches, list):
+                    continue
+
+                for m in matches:
+                    try:
+                        commence = datetime.fromisoformat(
+                            m["commence_time"].replace("Z", "+00:00")
+                        )
+                        hours = (commence - now).total_seconds() / 3600
+                        if not (6 <= hours <= 96):
+                            continue
+
+                        bookmakers = m.get("bookmakers", [])
+                        if not bookmakers:
+                            continue
+
+                        # Ekstraher consensus odds
+                        home_list, draw_list, away_list, over25_list = [], [], [], []
+                        for bk in bookmakers:
+                            for mkt in bk.get("markets", []):
+                                if mkt["key"] == "h2h":
+                                    for o in mkt.get("outcomes", []):
+                                        if o["name"] == "Draw":
+                                            draw_list.append(o["price"])
+                                        elif len(home_list) <= len(away_list):
+                                            home_list.append(o["price"])
+                                        else:
+                                            away_list.append(o["price"])
+                                elif mkt["key"] == "totals":
+                                    for o in mkt.get("outcomes", []):
+                                        if abs(o.get("point", 0) - 2.5) < 0.1 and o["name"] == "Over":
+                                            over25_list.append(o["price"])
+
+                        if not home_list:
+                            continue
+
+                        ho = round(_median(home_list), 3)
+                        dr = round(_median(draw_list), 3) if draw_list else 3.4
+                        aw = round(_median(away_list), 3) if away_list else 3.5
+
+                        # Remove vig → true probabilities
+                        raw_h, raw_d, raw_a = 1 / ho, 1 / dr, 1 / aw
+                        total = raw_h + raw_d + raw_a
+                        p_home = raw_h / total
+                        p_draw = raw_d / total
+                        p_away = raw_a / total
+
+                        num_bk = len(bookmakers)
+
+                        # Over 2.5 sannsynlighet (Dixon-Coles approx)
+                        decisive = p_home + p_away
+                        p_over25 = min(0.88, max(0.28, 0.35 + decisive * 0.42 - p_draw * 0.15))
+
+                        outcomes_to_check = [
+                            (p_home, ho, f"{m['home_team']} vinner"),
+                            (p_draw, dr, "Uavgjort"),
+                            (p_away, aw, f"{m['away_team']} vinner"),
+                        ]
+                        if over25_list:
+                            outcomes_to_check.append(
+                                (p_over25, round(_median(over25_list), 3), "Over 2.5 mål")
+                            )
+
+                        for model_prob, odds_val, pick_label in outcomes_to_check:
+                            market_prob = 1 / odds_val
+                            edge = round((model_prob - market_prob) * 100, 2)
+                            ev = round((model_prob * odds_val - 1) * 100, 2)
+
+                            if edge < EDGE_MIN:
+                                continue
+
+                            # Confidence score
+                            conf = 50
+                            conf += min(15, max(p_home, p_away) * 20)
+                            if ev > 5:
+                                conf += 15
+                            elif ev > 2:
+                                conf += 8
+                            if num_bk >= 10:
+                                conf += 10
+                            elif num_bk >= 5:
+                                conf += 5
+                            if 12 <= hours <= 48:
+                                conf += 5
+                            conf = min(99, max(45, int(conf)))
+
+                            if conf < CONFIDENCE_HIGH:
+                                continue
+
+                            candidates.append({
+                                "league_key": league["key"],
+                                "league": league["name"],
+                                "league_flag": league["flag"],
+                                "home_team": m["home_team"],
+                                "away_team": m["away_team"],
+                                "commence_time": m["commence_time"],
+                                "hours_to_kickoff": round(hours, 1),
+                                "pick": pick_label,
+                                "odds": odds_val,
+                                "model_prob": round(model_prob * 100, 2),
+                                "market_prob": round(market_prob * 100, 2),
+                                "edge": edge,
+                                "ev": ev,
+                                "confidence": conf,
+                                "num_bookmakers": num_bk,
+                            })
+
+                    except Exception as e:
+                        logger.warning(f"[Scanner] Match-feil i {league['key']}: {e}")
+                        continue
+
+            except Exception as e:
+                logger.warning(f"[Scanner] Liga-feil {league['key']}: {e}")
+                continue
+
+    candidates.sort(key=lambda x: x["ev"], reverse=True)
+    return candidates
+
+
+# ─────────────────────────────────────────────────────────
 # SCHEDULER JOBS
 # ─────────────────────────────────────────────────────────
-async def post_dagens_kamp_telegram():
-    """Kjører kl. 09:00 UTC — analyserer og poster Dagens Kamp til Telegram."""
-    logger.info("[Scheduler] post_dagens_kamp_telegram startet")
-
-    if not dagens_kamp_module:
-        logger.warning("[Scheduler] dagens_kamp_module ikke lastet — hopper over")
-        return
+async def scan_og_lagre_pick():
+    """Kjører kl. 08:45 UTC — scanner alle ligaer og lagrer beste pick i dagens_kamp."""
+    logger.info("[Scheduler] scan_og_lagre_pick startet")
 
     if not cfg.ODDS_API_KEY:
         logger.warning("[Scheduler] ODDS_API_KEY mangler — hopper over")
         return
 
+    try:
+        candidates = await _scan_leagues(cfg.ODDS_API_KEY)
+
+        if not candidates:
+            logger.info("[Scheduler] Ingen kvalifiserte picks (edge >= 8% og confidence >= HIGH) — poster ikke")
+            return
+
+        best = candidates[0]
+        logger.info(
+            f"[Scheduler] Beste pick: {best['pick']} @ {best['odds']} "
+            f"— EV={best['ev']}% Edge={best['edge']}% Conf={best['confidence']}%"
+        )
+
+        if not db_state.connected or not db_state.pool:
+            logger.warning("[Scheduler] DB offline — kan ikke lagre pick")
+            return
+
+        kickoff_dt = datetime.fromisoformat(best["commence_time"].replace("Z", "+00:00"))
+
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO dagens_kamp
+                    (match, league, home_team, away_team, pick, odds, stake, edge, ev, confidence, kickoff)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            """,
+                f"{best['home_team']} vs {best['away_team']}",
+                f"{best['league_flag']} {best['league']}",
+                best["home_team"],
+                best["away_team"],
+                best["pick"],
+                best["odds"],
+                5.0,
+                best["edge"],
+                best["ev"],
+                best["confidence"],
+                kickoff_dt,
+            )
+
+        logger.info("[Scheduler] Beste pick lagret i dagens_kamp tabellen")
+
+    except Exception as e:
+        logger.exception(f"[Scheduler] Uventet feil i scan_og_lagre_pick: {e}")
+
+
+async def post_dagens_kamp_telegram():
+    """Kjører kl. 09:00 UTC — leser beste pick fra dagens_kamp tabellen og poster til Telegram."""
+    logger.info("[Scheduler] post_dagens_kamp_telegram startet")
+
     if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
         logger.warning("[Scheduler] TELEGRAM_TOKEN/CHAT_ID mangler — hopper over")
         return
 
-    try:
-        analysis = await dagens_kamp_module.analyze_dagens_kamp(cfg.ODDS_API_KEY)
+    if not db_state.connected or not db_state.pool:
+        logger.warning("[Scheduler] DB offline — kan ikke lese dagens pick")
+        return
 
-        if "error" in analysis:
-            logger.warning(f"[Scheduler] Analyse feilet: {analysis['error']}")
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT * FROM dagens_kamp
+                WHERE timestamp >= NOW() - INTERVAL '2 hours'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """)
+
+        if not row:
+            logger.info("[Scheduler] Ingen pick funnet i dagens_kamp (siste 2 timer) — poster ikke")
             return
 
-        m = analysis["match"]
-        probs = analysis["probabilities"]
-        rec = analysis["recommendation"]
+        pick_data = dict(row)
 
-        kickoff_parts = m["kickoff_display"].split(" kl. ")
-        dato = kickoff_parts[0] if len(kickoff_parts) > 1 else m["kickoff_display"]
-        tid = kickoff_parts[1] if len(kickoff_parts) > 1 else ""
+        kickoff = pick_data.get("kickoff")
+        if kickoff:
+            cet = kickoff + timedelta(hours=1)
+            dato = cet.strftime("%-d. %b")
+            tid = cet.strftime("%H:%M")
+        else:
+            dato = "–"
+            tid = "–"
 
-        edge = round(rec["ev_pct"] / rec["odds"], 2)
+        league = pick_data.get("league", "–")
+        home_team = pick_data.get("home_team") or pick_data.get("match", "–").split(" vs ")[0]
+        away_team = pick_data.get("away_team") or pick_data.get("match", "–").split(" vs ")[-1]
+        odds_val = float(pick_data.get("odds") or 0)
+        edge_val = float(pick_data.get("edge") or 0)
+        ev_val = float(pick_data.get("ev") or 0)
+        confidence_val = pick_data.get("confidence") or 0
+        pick_label = pick_data.get("pick", "–")
 
         message = (
             "⚡ SESOMNOD ENGINE\n"
             "Football Decision Intelligence\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🏆 {m['league_flag']} {m['league']} · MATCH BRIEF\n\n"
-            f"🏟 {m['home_team']}\n"
+            f"🏆 {league} · MATCH BRIEF\n\n"
+            f"🏟 {home_team}\n"
             "         VS\n"
-            f"       {m['away_team']}\n\n"
+            f"       {away_team}\n\n"
             f"🕒 {dato} · {tid}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "📊 MODEL PROBABILITIES\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Over 2.5 mål   {probs['over25']}%\n"
-            f"Begge scorer   {probs['btts']}%\n"
-            f"Hjemmeseier    {probs['home_win']}%\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "📈 EDGE ANALYSE\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Odds:      {rec['odds']}\n"
-            f"Edge:      +{edge}% ✅\n"
-            f"EV:        +{rec['ev_pct']}% 🔥\n\n"
+            f"Odds:      {odds_val}\n"
+            f"Edge:      +{edge_val}% ✅\n"
+            f"EV:        +{ev_val}% 🔥\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "🎯 MODEL DECISION\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"PICK:        {rec['pick']}\n"
-            f"ODDS:        @ {rec['odds']}\n"
-            f"CONFIDENCE:  {rec['confidence']}%\n\n"
+            f"PICK:        {pick_label}\n"
+            f"ODDS:        @ {odds_val}\n"
+            f"CONFIDENCE:  {confidence_val}%\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
             "You don't get picks. You get control. ⚡\n"
             "SesomNod Engine"
@@ -357,6 +601,13 @@ async def lifespan(app: FastAPI):
     # ── SCHEDULER ──────────────────────────────────────────────
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
+        scan_og_lagre_pick,
+        trigger=CronTrigger(hour=8, minute=45, timezone="UTC"),
+        id="scan_og_lagre_pick",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+    scheduler.add_job(
         post_dagens_kamp_telegram,
         trigger=CronTrigger(hour=9, minute=0, timezone="UTC"),
         id="post_dagens_kamp",
@@ -364,7 +615,7 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("[Scheduler] AsyncIOScheduler startet — Dagens Kamp kjører kl. 09:00 UTC")
+    logger.info("[Scheduler] AsyncIOScheduler startet — Scanner kl. 08:45, Telegram kl. 09:00 UTC")
     # ───────────────────────────────────────────────────────────
 
     if db_state.connected:
@@ -428,7 +679,7 @@ async def root():
         "version": "8.0.0-railway",
         "status": "online",
         "db_connected": db_state.connected,
-        "endpoints": ["/health", "/picks", "/bankroll", "/dagens-kamp", "/docs"],
+        "endpoints": ["/health", "/picks", "/bankroll", "/dagens-kamp", "/scan-alle-kamper", "/docs"],
     }
 
 
@@ -498,6 +749,31 @@ async def get_dagens_kamp():
         }
     except Exception as e:
         logger.error(f"[/dagens-kamp] Feil: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.get("/scan-alle-kamper")
+async def scan_alle_kamper():
+    """Scanner alle ligaer og returnerer kvalifiserte picks (edge >= 8%, confidence >= HIGH)."""
+    if not cfg.ODDS_API_KEY:
+        return JSONResponse(status_code=503, content={
+            "status": "error",
+            "error": "ODDS_API_KEY mangler"
+        })
+    try:
+        candidates = await _scan_leagues(cfg.ODDS_API_KEY)
+        best = candidates[0] if candidates else None
+        return {
+            "status": "ok",
+            "scanned_leagues": [f"{l['flag']} {l['name']}" for l in SCAN_LEAGUES],
+            "filters": {"edge_min_pct": EDGE_MIN, "confidence_min": CONFIDENCE_HIGH},
+            "qualified_picks": len(candidates),
+            "best_pick": best,
+            "all_picks": candidates,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"[/scan-alle-kamper] Feil: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
