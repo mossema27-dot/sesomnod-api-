@@ -497,30 +497,43 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                 outcomes_to_check.append((p_draw, best_draw, "Uavgjort", "h2h", pin_draw))
             if best_away and ODDS_MIN <= best_away <= ODDS_MAX:
                 outcomes_to_check.append((p_away, best_away, f"{m['away_team']} vinner", "h2h", pin_away))
+            # Over 2.5 — bruk Pinnacle no-vig som model_prob (ikke Dixon-Coles formel)
             if over25_list and ODDS_MIN <= max(over25_list) <= ODDS_MAX:
-                p_over25 = min(0.88, max(0.28, 0.35 + (p_home + p_away) * 0.42 - p_draw * 0.15))
-                pin_over25 = None
                 pin_totals = next(
                     (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "totals"),
                     None
                 )
+                pin_over25 = pin_under25 = None
                 if pin_totals:
                     for o in pin_totals.get("outcomes", []):
-                        if abs(o.get("point", 0) - 2.5) < 0.1 and o["name"] == "Over":
-                            pin_over25 = o["price"]
-                outcomes_to_check.append((p_over25, max(over25_list), "Over 2.5 mål", "totals_over25", pin_over25))
+                        if abs(o.get("point", 0) - 2.5) < 0.1:
+                            if o["name"] == "Over":
+                                pin_over25 = o["price"]
+                            elif o["name"] == "Under":
+                                pin_under25 = o["price"]
+                if pin_over25 and pin_under25:
+                    raw_o, raw_u = 1 / pin_over25, 1 / pin_under25
+                    p_over25 = raw_o / (raw_o + raw_u)
+                    outcomes_to_check.append((p_over25, max(over25_list), "Over 2.5 mål", "totals_over25", pin_over25))
+
+            # Over 3.5 — bruk Pinnacle no-vig som model_prob
             if over35_list and ODDS_MIN <= max(over35_list) <= ODDS_MAX:
-                p_over35 = min(0.65, max(0.10, (p_home + p_away) * 0.38 - p_draw * 0.12))
-                pin_over35 = None
                 pin_totals = next(
                     (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "totals"),
                     None
                 )
+                pin_over35 = pin_under35 = None
                 if pin_totals:
                     for o in pin_totals.get("outcomes", []):
-                        if abs(o.get("point", 0) - 3.5) < 0.1 and o["name"] == "Over":
-                            pin_over35 = o["price"]
-                outcomes_to_check.append((p_over35, max(over35_list), "Over 3.5 mål", "totals_over35", pin_over35))
+                        if abs(o.get("point", 0) - 3.5) < 0.1:
+                            if o["name"] == "Over":
+                                pin_over35 = o["price"]
+                            elif o["name"] == "Under":
+                                pin_under35 = o["price"]
+                if pin_over35 and pin_under35:
+                    raw_o, raw_u = 1 / pin_over35, 1 / pin_under35
+                    p_over35 = raw_o / (raw_o + raw_u)
+                    outcomes_to_check.append((p_over35, max(over35_list), "Over 3.5 mål", "totals_over35", pin_over35))
 
             for model_prob, odds_val, pick_label, market_type, pin_odds_ref in outcomes_to_check:
                 if match_pick_count >= MAX_PICKS_PER_MATCH:
