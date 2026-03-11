@@ -1297,16 +1297,197 @@ async def scan_alle_kamper():
 
 @app.post("/fetch-odds")
 async def trigger_fetch_odds():
-    """Manuell trigger for odds-fetching."""
-    asyncio.create_task(fetch_all_odds())
-    return {"status": "triggered", "message": "fetch_all_odds startet i bakgrunnen"}
+    """Manuell trigger for odds-fetching — returnerer faktiske resultater."""
+    if not cfg.ODDS_API_KEY:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "ODDS_API_KEY mangler"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+
+    snap_time = datetime.now(timezone.utc)
+    results = []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for league in SCAN_LEAGUES:
+            try:
+                resp = await client.get(
+                    f"https://api.the-odds-api.com/v4/sports/{league['key']}/odds/",
+                    params={
+                        "apiKey": cfg.ODDS_API_KEY,
+                        "regions": "eu",
+                        "markets": "h2h,totals",
+                        "oddsFormat": "decimal",
+                        "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson",
+                    }
+                )
+                remaining = int(resp.headers.get("x-requests-remaining", -1))
+                used = int(resp.headers.get("x-requests-used", -1))
+
+                if resp.status_code != 200:
+                    results.append({"league": league["name"], "status": f"HTTP {resp.status_code}", "matches": 0})
+                    continue
+
+                data = resp.json()
+                if not isinstance(data, list):
+                    results.append({"league": league["name"], "status": "bad_data", "matches": 0})
+                    continue
+
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO odds_snapshots (league_key, snapshot_time, data)
+                        VALUES ($1, $2, $3)
+                    """, league["key"], snap_time, json.dumps(data))
+
+                results.append({
+                    "league": league["name"],
+                    "status": "ok",
+                    "matches": len(data),
+                    "api_remaining": remaining,
+                    "api_used": used,
+                })
+                logger.info(f"[OddsCache] {league['name']}: {len(data)} kamper — {remaining} req igjen")
+
+            except Exception as e:
+                results.append({"league": league["name"], "status": f"error: {str(e)[:80]}", "matches": 0})
+
+    total_matches = sum(r["matches"] for r in results)
+    api_remaining = next((r["api_remaining"] for r in results if r.get("api_remaining", -1) >= 0), None)
+    api_used = next((r["api_used"] for r in results if r.get("api_used", -1) >= 0), None)
+
+    return {
+        "status": "ok",
+        "snapshot_time": snap_time.isoformat(),
+        "leagues_fetched": sum(1 for r in results if r["status"] == "ok"),
+        "total_matches": total_matches,
+        "api_remaining": api_remaining,
+        "api_used": api_used,
+        "details": results,
+    }
 
 
 @app.post("/run-analysis")
 async def trigger_run_analysis():
-    """Manuell trigger for analyse-jobb."""
-    asyncio.create_task(run_analysis())
-    return {"status": "triggered", "message": "run_analysis startet i bakgrunnen"}
+    """Manuell trigger for analyse — returnerer kvalifiserte picks med SCORE-rangering."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+
+    now = datetime.now(timezone.utc)
+    candidates = []
+    total_scanned = 0
+
+    async with db_state.pool.acquire() as conn:
+        for league in SCAN_LEAGUES:
+            try:
+                row = await conn.fetchrow("""
+                    SELECT data, snapshot_time FROM odds_snapshots
+                    WHERE league_key = $1
+                    ORDER BY snapshot_time DESC LIMIT 1
+                """, league["key"])
+                if not row:
+                    continue
+                matches = json.loads(row["data"])
+                total_scanned += len(matches)
+                picks = await _analyse_snapshot(league, matches, now)
+                candidates.extend(picks)
+            except Exception as e:
+                logger.warning(f"[API/run-analysis] {league['key']}: {e}")
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    formatted = []
+    for i, p in enumerate(candidates, 1):
+        ev = p["ev"]
+        conf_label = "HIGH" if ev >= 12 else ("MEDIUM" if ev >= 9 else "LOW")
+        formatted.append({
+            "rank": i,
+            "match": f"{p['home_team']} vs {p['away_team']}",
+            "league": f"{p['league_flag']} {p['league']}",
+            "market": p["market_type"],
+            "pick": p["pick"],
+            "odds": p["odds"],
+            "ev_pct": p["ev"],
+            "edge_pct": p["edge"],
+            "score": p["score"],
+            "confidence": conf_label,
+            "bookmakers": p["num_bookmakers"],
+            "hours_to_kickoff": p["hours_to_kickoff"],
+            "pinnacle_opening": p.get("pinnacle_opening"),
+        })
+
+    return {
+        "status": "ok",
+        "timestamp": now.isoformat(),
+        "total_matches_scanned": total_scanned,
+        "qualified_picks": len(formatted),
+        "picks": formatted,
+    }
+
+
+@app.post("/post-telegram")
+async def trigger_post_telegram():
+    """Poster beste upostede HIGH/MEDIUM confidence pick til Telegram."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async with db_state.pool.acquire() as conn:
+        daily_posted = await conn.fetchval("""
+            SELECT COUNT(*) FROM dagens_kamp
+            WHERE telegram_posted = TRUE AND timestamp >= $1
+        """, today_start)
+
+        if int(daily_posted) >= DAILY_POST_LIMIT:
+            return {"status": "skipped", "reason": f"Daglig grense ({DAILY_POST_LIMIT}) nådd", "posted_today": int(daily_posted)}
+
+        row = await conn.fetchrow("""
+            SELECT * FROM dagens_kamp
+            WHERE telegram_posted = FALSE AND timestamp >= $1
+            ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
+            LIMIT 1
+        """, today_start)
+
+    if not row:
+        return {"status": "skipped", "reason": "Ingen upostede picks i dag"}
+
+    pick_data = dict(row)
+    already_posted = int(daily_posted)
+    rank = already_posted + 1
+
+    message = _format_pick_message(pick_data, rank=rank)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+            )
+        if resp.status_code == 200:
+            async with db_state.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
+                    pick_data["id"]
+                )
+            logger.info(f"[/post-telegram] Postet pick id={pick_data['id']}: {pick_data.get('pick')}")
+            return {
+                "status": "posted",
+                "pick_id": pick_data["id"],
+                "pick": pick_data.get("pick"),
+                "match": pick_data.get("match"),
+                "odds": float(pick_data.get("odds") or 0),
+                "ev": float(pick_data.get("ev") or 0),
+                "score": float(pick_data.get("score") or 0),
+                "telegram_status": resp.status_code,
+            }
+        else:
+            return JSONResponse(status_code=502, content={
+                "status": "error",
+                "telegram_status": resp.status_code,
+                "detail": resp.text[:200],
+            })
+    except Exception as e:
+        logger.exception(f"[/post-telegram] Feil: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
 @app.get("/db/retry")
