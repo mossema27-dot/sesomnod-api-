@@ -81,6 +81,7 @@ SCAN_LEAGUES = [
 ]
 EDGE_MIN = 8.0
 CONFIDENCE_HIGH = 70
+DAILY_POST_LIMIT = 5
 
 # ─────────────────────────────────────────────────────────
 # KONFIGURASJON
@@ -219,6 +220,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                     ev NUMERIC(6,2),
                     confidence INTEGER,
                     kickoff TIMESTAMPTZ,
+                    telegram_posted BOOLEAN DEFAULT FALSE,
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 );
 
@@ -247,6 +249,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS ev NUMERIC(6,2);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS confidence INTEGER;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS kickoff TIMESTAMPTZ;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS telegram_posted BOOLEAN DEFAULT FALSE;
             """)
 
         logger.info("[DB] ✅ Tabeller OK")
@@ -440,6 +443,64 @@ async def _scan_leagues(odds_api_key: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────
+# TELEGRAM MESSAGE FORMATTER
+# ─────────────────────────────────────────────────────────
+def _format_pick_message(pick: dict) -> str:
+    """Bygger Telegram-melding fra pick-dict (DB-rad eller scanner-resultat)."""
+    kickoff = pick.get("kickoff")
+    if kickoff:
+        cet = kickoff + timedelta(hours=1)
+        dato = cet.strftime("%-d. %b")
+        tid = cet.strftime("%H:%M")
+    elif pick.get("commence_time"):
+        kickoff_dt = datetime.fromisoformat(pick["commence_time"].replace("Z", "+00:00"))
+        cet = kickoff_dt + timedelta(hours=1)
+        dato = cet.strftime("%-d. %b")
+        tid = cet.strftime("%H:%M")
+    else:
+        dato, tid = "–", "–"
+
+    if pick.get("league_flag") and pick.get("league"):
+        league = f"{pick['league_flag']} {pick['league']}"
+    else:
+        league = pick.get("league", "–")
+
+    home_team = pick.get("home_team") or pick.get("match", "–").split(" vs ")[0]
+    away_team = pick.get("away_team") or pick.get("match", "–").split(" vs ")[-1]
+    odds_val = float(pick.get("odds") or 0)
+    edge_val = float(pick.get("edge") or 0)
+    ev_val = float(pick.get("ev") or 0)
+    confidence_val = pick.get("confidence") or 0
+    pick_label = pick.get("pick", "–")
+
+    return (
+        "⚡ SESOMNOD ENGINE\n"
+        "Football Decision Intelligence\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏆 {league} · MATCH BRIEF\n\n"
+        f"🏟 {home_team}\n"
+        "         VS\n"
+        f"       {away_team}\n\n"
+        f"🕒 {dato} · {tid}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📈 EDGE ANALYSE\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Odds:      {odds_val}\n"
+        f"Edge:      +{edge_val}% ✅\n"
+        f"EV:        +{ev_val}% 🔥\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 MODEL DECISION\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"PICK:        {pick_label}\n"
+        f"ODDS:        @ {odds_val}\n"
+        f"CONFIDENCE:  {confidence_val}%\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "You don't get picks. You get control. ⚡\n"
+        "SesomNod Engine"
+    )
+
+
+# ─────────────────────────────────────────────────────────
 # SCHEDULER JOBS
 # ─────────────────────────────────────────────────────────
 async def scan_og_lagre_pick():
@@ -494,8 +555,111 @@ async def scan_og_lagre_pick():
         logger.exception(f"[Scheduler] Uventet feil i scan_og_lagre_pick: {e}")
 
 
+async def scan_lagre_og_post_alle():
+    """
+    Kjører kl 07, 09, 11, 13, 15, 17, 19 UTC.
+    Lagrer ALLE kvalifiserte picks med deduplication og poster nye til Telegram.
+    Maks DAILY_POST_LIMIT posts per dag.
+    """
+    logger.info("[Scheduler] scan_lagre_og_post_alle startet")
+
+    if not cfg.ODDS_API_KEY:
+        logger.warning("[Scheduler] ODDS_API_KEY mangler — hopper over")
+        return
+
+    if not db_state.connected or not db_state.pool:
+        logger.warning("[Scheduler] DB offline — hopper over")
+        return
+
+    try:
+        candidates = await _scan_leagues(cfg.ODDS_API_KEY)
+        if not candidates:
+            logger.info("[Scheduler] Ingen kvalifiserte picks denne runden")
+            return
+
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        newly_inserted = []
+
+        async with db_state.pool.acquire() as conn:
+            daily_posted = await conn.fetchval("""
+                SELECT COUNT(*) FROM dagens_kamp
+                WHERE telegram_posted = TRUE AND timestamp >= $1
+            """, today_start)
+
+            for pick in candidates:
+                kickoff_dt = datetime.fromisoformat(pick["commence_time"].replace("Z", "+00:00"))
+
+                # Deduplication: hopp over hvis pick allerede finnes
+                exists = await conn.fetchval("""
+                    SELECT 1 FROM dagens_kamp
+                    WHERE home_team = $1 AND away_team = $2 AND kickoff = $3
+                    LIMIT 1
+                """, pick["home_team"], pick["away_team"], kickoff_dt)
+
+                if exists:
+                    continue
+
+                row_id = await conn.fetchval("""
+                    INSERT INTO dagens_kamp
+                        (match, league, home_team, away_team, pick, odds, stake,
+                         edge, ev, confidence, kickoff, telegram_posted)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, FALSE)
+                    RETURNING id
+                """,
+                    f"{pick['home_team']} vs {pick['away_team']}",
+                    f"{pick['league_flag']} {pick['league']}",
+                    pick["home_team"],
+                    pick["away_team"],
+                    pick["pick"],
+                    pick["odds"],
+                    5.0,
+                    pick["edge"],
+                    pick["ev"],
+                    pick["confidence"],
+                    kickoff_dt,
+                )
+                newly_inserted.append({"id": row_id, **pick})
+                logger.info(f"[Scheduler] Ny pick lagret (id={row_id}): {pick['pick']} — {pick['home_team']} vs {pick['away_team']}")
+
+        if not newly_inserted:
+            logger.info("[Scheduler] Ingen nye picks å lagre (alle allerede i DB)")
+            return
+
+        if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+            logger.warning("[Scheduler] TELEGRAM_TOKEN/CHAT_ID mangler — lagret men ikke postet")
+            return
+
+        posts_left = max(0, DAILY_POST_LIMIT - int(daily_posted))
+        for pick in newly_inserted[:posts_left]:
+            try:
+                message = _format_pick_message(pick)
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+                    )
+                if resp.status_code == 200:
+                    async with db_state.pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
+                            pick["id"]
+                        )
+                    logger.info(f"[Scheduler] Postet til Telegram: {pick['pick']} — {pick['home_team']} vs {pick['away_team']}")
+                else:
+                    logger.error(f"[Scheduler] Telegram feil {resp.status_code}: {resp.text[:200]}")
+            except Exception as e:
+                logger.exception(f"[Scheduler] Feil ved posting av pick id={pick['id']}: {e}")
+
+        skipped = len(newly_inserted) - posts_left
+        if skipped > 0:
+            logger.info(f"[Scheduler] {skipped} pick(s) lagret men ikke postet — daglig grense ({DAILY_POST_LIMIT}) nådd")
+
+    except Exception as e:
+        logger.exception(f"[Scheduler] Uventet feil i scan_lagre_og_post_alle: {e}")
+
+
 async def post_dagens_kamp_telegram():
-    """Kjører kl. 09:00 UTC — leser beste pick fra dagens_kamp tabellen og poster til Telegram."""
+    """Kjører kl. 09:00 UTC — poster upostede picks fra dagens_kamp (maks DAILY_POST_LIMIT per dag)."""
     logger.info("[Scheduler] post_dagens_kamp_telegram startet")
 
     if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
@@ -507,77 +671,50 @@ async def post_dagens_kamp_telegram():
         return
 
     try:
-        async with db_state.pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT * FROM dagens_kamp
-                WHERE timestamp >= NOW() - INTERVAL '2 hours'
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """)
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-        if not row:
-            logger.info("[Scheduler] Ingen pick funnet i dagens_kamp (siste 2 timer) — poster ikke")
+        async with db_state.pool.acquire() as conn:
+            daily_posted = await conn.fetchval("""
+                SELECT COUNT(*) FROM dagens_kamp
+                WHERE telegram_posted = TRUE AND timestamp >= $1
+            """, today_start)
+
+            posts_left = max(0, DAILY_POST_LIMIT - int(daily_posted))
+            if posts_left == 0:
+                logger.info(f"[Scheduler] Daglig grense ({DAILY_POST_LIMIT}) nådd — poster ikke")
+                return
+
+            rows = await conn.fetch("""
+                SELECT * FROM dagens_kamp
+                WHERE telegram_posted = FALSE AND timestamp >= $1
+                ORDER BY ev DESC NULLS LAST
+                LIMIT $2
+            """, today_start, posts_left)
+
+        if not rows:
+            logger.info("[Scheduler] Ingen upostede picks i dag — poster ikke")
             return
 
-        pick_data = dict(row)
-
-        kickoff = pick_data.get("kickoff")
-        if kickoff:
-            cet = kickoff + timedelta(hours=1)
-            dato = cet.strftime("%-d. %b")
-            tid = cet.strftime("%H:%M")
-        else:
-            dato = "–"
-            tid = "–"
-
-        league = pick_data.get("league", "–")
-        home_team = pick_data.get("home_team") or pick_data.get("match", "–").split(" vs ")[0]
-        away_team = pick_data.get("away_team") or pick_data.get("match", "–").split(" vs ")[-1]
-        odds_val = float(pick_data.get("odds") or 0)
-        edge_val = float(pick_data.get("edge") or 0)
-        ev_val = float(pick_data.get("ev") or 0)
-        confidence_val = pick_data.get("confidence") or 0
-        pick_label = pick_data.get("pick", "–")
-
-        message = (
-            "⚡ SESOMNOD ENGINE\n"
-            "Football Decision Intelligence\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🏆 {league} · MATCH BRIEF\n\n"
-            f"🏟 {home_team}\n"
-            "         VS\n"
-            f"       {away_team}\n\n"
-            f"🕒 {dato} · {tid}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "📈 EDGE ANALYSE\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Odds:      {odds_val}\n"
-            f"Edge:      +{edge_val}% ✅\n"
-            f"EV:        +{ev_val}% 🔥\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "🎯 MODEL DECISION\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"PICK:        {pick_label}\n"
-            f"ODDS:        @ {odds_val}\n"
-            f"CONFIDENCE:  {confidence_val}%\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "You don't get picks. You get control. ⚡\n"
-            "SesomNod Engine"
-        )
-
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": cfg.TELEGRAM_CHAT_ID,
-                    "text": message,
-                },
-            )
-
-        if resp.status_code == 200:
-            logger.info("[Scheduler] Dagens Kamp postet til Telegram OK")
-        else:
-            logger.error(f"[Scheduler] Telegram feil {resp.status_code}: {resp.text[:200]}")
+        for row in rows:
+            pick_data = dict(row)
+            try:
+                message = _format_pick_message(pick_data)
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+                    )
+                if resp.status_code == 200:
+                    async with db_state.pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
+                            pick_data["id"]
+                        )
+                    logger.info(f"[Scheduler] Postet til Telegram (09:00): {pick_data.get('pick')} — {pick_data.get('match')}")
+                else:
+                    logger.error(f"[Scheduler] Telegram feil {resp.status_code}: {resp.text[:200]}")
+            except Exception as e:
+                logger.exception(f"[Scheduler] Feil ved posting av pick id={pick_data.get('id')}: {e}")
 
     except Exception as e:
         logger.exception(f"[Scheduler] Uventet feil: {e}")
@@ -614,8 +751,19 @@ async def lifespan(app: FastAPI):
         misfire_grace_time=300,
         replace_existing=True,
     )
+    scheduler.add_job(
+        scan_lagre_og_post_alle,
+        trigger=CronTrigger(hour="7,9,11,13,15,17,19", minute=0, timezone="UTC"),
+        id="scan_lagre_og_post_alle",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("[Scheduler] AsyncIOScheduler startet — Scanner kl. 08:45, Telegram kl. 09:00 UTC")
+    logger.info(
+        "[Scheduler] AsyncIOScheduler startet — "
+        "Scanner kl. 08:45 UTC | Telegram kl. 09:00 UTC | "
+        "Full scanner kl. 07,09,11,13,15,17,19 UTC"
+    )
     # ───────────────────────────────────────────────────────────
 
     if db_state.connected:
