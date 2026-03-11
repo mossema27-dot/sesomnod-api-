@@ -287,6 +287,8 @@ async def post_dagens_kamp_telegram():
         dato = kickoff_parts[0] if len(kickoff_parts) > 1 else m["kickoff_display"]
         tid = kickoff_parts[1] if len(kickoff_parts) > 1 else ""
 
+        edge = round(rec["ev_pct"] / rec["odds"], 2)
+
         message = (
             "⚡ SESOMNOD ENGINE\n"
             "Football Decision Intelligence\n"
@@ -306,7 +308,7 @@ async def post_dagens_kamp_telegram():
             "📈 EDGE ANALYSE\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Odds:      {rec['odds']}\n"
-            f"Edge:      +{rec['ev_pct']}% ✅\n"
+            f"Edge:      +{edge}% ✅\n"
             f"EV:        +{rec['ev_pct']}% 🔥\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "🎯 MODEL DECISION\n"
