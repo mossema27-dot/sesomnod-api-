@@ -72,8 +72,8 @@ SCAN_LEAGUES = [
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
 
-EV_MIN              = 8.0    # Min EV% for å kvalifisere
-PINNACLE_EDGE_MIN   = 5.0    # Min edge mot Pinnacle
+EV_MIN              = 3.0    # Min EV% mot Pinnacle fair odds (realistisk grense)
+PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
 PINNACLE_MARGIN_MAX = 4.0    # Max Pinnacle margin%
 ODDS_MIN            = 1.40
 ODDS_MAX            = 6.00
@@ -457,12 +457,14 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
             if pin_margin > PINNACLE_MARGIN_MAX:
                 continue
 
-            # Consensus bookmaker odds (alle utenom Pinnacle)
+            # Soft book odds — Pinnacle EKSKLUDERT (vi bruker Pinnacle kun som referanse)
             num_bk = len(bookmakers)
             home_list, draw_list, away_list = [], [], []
             over25_list, over35_list = [], []
 
             for bk in bookmakers:
+                if bk.get("key") == "pinnacle":
+                    continue  # Pinnacle er referanse, ikke betting-target
                 for mkt in bk.get("markets", []):
                     if mkt["key"] == "h2h":
                         outcomes_map = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
@@ -540,19 +542,14 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     break
 
                 market_prob = 1 / odds_val
+                # EV: model_prob (Pinnacle no-vig) vs beste soft book odds
                 ev_pct = round((model_prob * odds_val - 1) * 100, 2)
+                # Edge: prosentpoeng over soft book implied probability
                 edge_pct = round((model_prob - market_prob) * 100, 2)
-
-                # Pinnacle-basert edge
-                if pin_odds_ref:
-                    pin_prob = 1 / pin_odds_ref
-                    pin_edge = round((model_prob - pin_prob) * 100, 2)
-                else:
-                    pin_edge = edge_pct
+                # Pin fair odds (for logging/CLV — ikke som filter)
+                pin_fair_odds = round(1 / model_prob, 3) if model_prob > 0 else None
 
                 if ev_pct < EV_MIN:
-                    continue
-                if pin_edge < PINNACLE_EDGE_MIN:
                     continue
 
                 score = round(ev_pct * math.log(num_bk + 1), 4)
@@ -571,11 +568,11 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     "model_prob": round(model_prob * 100, 2),
                     "market_prob": round(market_prob * 100, 2),
                     "edge": edge_pct,
-                    "pin_edge": pin_edge,
                     "ev": ev_pct,
                     "score": score,
                     "num_bookmakers": num_bk,
                     "pinnacle_opening": round(pin_odds_ref, 2) if pin_odds_ref else None,
+                    "pinnacle_fair_odds": pin_fair_odds,
                     "pinnacle_margin": round(pin_margin, 2),
                 })
                 match_pick_count += 1
