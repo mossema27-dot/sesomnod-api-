@@ -759,8 +759,13 @@ async def _log_notion_pick(pick: dict):
                 json={
                     "parent": {"database_id": cfg.NOTION_DB_ID},
                     "properties": {
+                        # Only properties that exist in the schema (verified 2026-03-12):
+                        # Name(title), Liga(select→[La Liga,Serie A]), Hjemmelag/Bortelag(rich_text),
+                        # Kickoff(date), Pick(rich_text), Odds(number), Edge(rich_text),
+                        # EV(rich_text), Confidence(number), Stake(rich_text),
+                        # Status(select→[PENDING, NO BET])
                         "Name":       {"title": [{"text": {"content": f"{pick.get('home_team')} vs {pick.get('away_team')}"}}]},
-                        "Liga":       {"select": {"name": league_name or "Unknown"}},
+                        "Liga":       {"select": {"name": league_name}} if league_name else {},
                         "Hjemmelag":  {"rich_text": [{"text": {"content": pick.get("home_team", "")}}]},
                         "Bortelag":   {"rich_text": [{"text": {"content": pick.get("away_team", "")}}]},
                         "Kickoff":    {"date": {"start": kickoff_str}},
@@ -770,7 +775,9 @@ async def _log_notion_pick(pick: dict):
                         "EV":         {"rich_text": [{"text": {"content": f"+{pick.get('ev', 0):.2f}%"}}]},
                         "Confidence": {"number": float(pick.get("confidence") or 0)},
                         "Stake":      {"rich_text": [{"text": {"content": "5.0"}}]},
-                        "Status":     {"select": {"name": "QUALIFIED"}},
+                        "Status":     {"select": {"name": "PENDING"}},
+                        # NOTE: "QUALIFIED" is not a valid Status option.
+                        # NOTE: "Market" and "Reason" properties do not exist in schema — omitted.
                     },
                 },
             )
