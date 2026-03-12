@@ -94,13 +94,15 @@ def _clean(key: str) -> str:
 
 
 class Config:
-    DATABASE_URL: str  = _clean("DATABASE_URL")
-    TELEGRAM_TOKEN: str = _clean("TELEGRAM_TOKEN")
+    DATABASE_URL: str    = _clean("DATABASE_URL")
+    TELEGRAM_TOKEN: str  = _clean("TELEGRAM_TOKEN")
     TELEGRAM_CHAT_ID: str = _clean("TELEGRAM_CHAT_ID")
-    ODDS_API_KEY: str  = _clean("ODDS_API_KEY")
-    PORT: int          = int(os.getenv("PORT", "8000"))
-    ENVIRONMENT: str   = os.getenv("RAILWAY_ENVIRONMENT", "development")
-    SERVICE_NAME: str  = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
+    ODDS_API_KEY: str    = _clean("ODDS_API_KEY")
+    NOTION_TOKEN: str    = _clean("NOTION_TOKEN")
+    NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
+    PORT: int            = int(os.getenv("PORT", "8000"))
+    ENVIRONMENT: str     = os.getenv("RAILWAY_ENVIRONMENT", "development")
+    SERVICE_NAME: str    = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
 
 cfg = Config()
 
@@ -225,9 +227,13 @@ async def ensure_tables(pool: asyncpg.Pool):
 
                 CREATE TABLE IF NOT EXISTS daily_summaries (
                     id SERIAL PRIMARY KEY,
-                    date DATE UNIQUE,
+                    date DATE,
                     profit NUMERIC(10,2),
                     num_picks INTEGER,
+                    trigger_type VARCHAR(50) DEFAULT 'scheduled',
+                    match_id TEXT,
+                    result TEXT,
+                    reason TEXT,
                     timestamp TIMESTAMPTZ DEFAULT NOW()
                 );
 
@@ -276,6 +282,11 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS pinnacle_closing NUMERIC(5,2);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS clv_pct NUMERIC(6,2);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS total_scanned INTEGER;
+
+                ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS trigger_type VARCHAR(50) DEFAULT 'scheduled';
+                ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS match_id TEXT;
+                ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS result TEXT;
+                ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS reason TEXT;
             """)
 
             # Indeks for snapshot-oppslag
@@ -719,12 +730,245 @@ async def run_analysis():
 # ─────────────────────────────────────────────────────────
 # CLV TRACKING
 # ─────────────────────────────────────────────────────────
+async def _log_notion_pick(pick: dict):
+    """Logger en kvalifisert pick til Notion MATCH_PREDICTIONS database."""
+    if not cfg.NOTION_TOKEN or not cfg.NOTION_DB_ID:
+        logger.warning("[Notion] NOTION_TOKEN eller NOTION_DATABASE_ID mangler")
+        return
+    try:
+        kickoff = pick.get("kickoff") or pick.get("commence_time", "")
+        if hasattr(kickoff, "isoformat"):
+            kickoff_str = kickoff.date().isoformat()
+        elif isinstance(kickoff, str):
+            kickoff_str = kickoff[:10]
+        else:
+            kickoff_str = datetime.now(timezone.utc).date().isoformat()
+
+        league_name = pick.get("league", "")
+        if pick.get("league_flag"):
+            league_name = league_name.replace(pick["league_flag"], "").strip()
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "parent": {"database_id": cfg.NOTION_DB_ID},
+                    "properties": {
+                        "Name":       {"title": [{"text": {"content": f"{pick.get('home_team')} vs {pick.get('away_team')}"}}]},
+                        "Liga":       {"select": {"name": league_name or "Unknown"}},
+                        "Hjemmelag":  {"rich_text": [{"text": {"content": pick.get("home_team", "")}}]},
+                        "Bortelag":   {"rich_text": [{"text": {"content": pick.get("away_team", "")}}]},
+                        "Kickoff":    {"date": {"start": kickoff_str}},
+                        "Pick":       {"rich_text": [{"text": {"content": pick.get("pick", "")}}]},
+                        "Odds":       {"number": float(pick.get("odds") or 0)},
+                        "Edge":       {"rich_text": [{"text": {"content": f"+{pick.get('edge', 0):.2f}%"}}]},
+                        "EV":         {"rich_text": [{"text": {"content": f"+{pick.get('ev', 0):.2f}%"}}]},
+                        "Confidence": {"number": float(pick.get("confidence") or 0)},
+                        "Stake":      {"rich_text": [{"text": {"content": "5.0"}}]},
+                        "Status":     {"select": {"name": "QUALIFIED"}},
+                    },
+                },
+            )
+        if resp.status_code == 200:
+            notion_id = resp.json().get("id", "?")
+            logger.info(f"[Notion] Pick logget OK: {notion_id}")
+        else:
+            logger.warning(f"[Notion] Feil {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[Notion] Exception: {e}")
+
+
+async def pre_kickoff_check():
+    """
+    Kjøres inne i track_clv-jobben (hvert 30. minutt).
+    Finner kamper med kickoff 60-150 min fremover, analyserer fra cache,
+    logger alle resultater til daily_summaries og poster kvalifiserte picks.
+    Kaller ALDRI Odds API — leser kun fra odds_snapshots.
+    """
+    try:
+        if not db_state.connected or not db_state.pool:
+            return
+
+        now = datetime.now(timezone.utc)
+        window_start = now + timedelta(minutes=60)
+        window_end   = now + timedelta(minutes=150)
+        stale_cutoff = now - timedelta(hours=3)
+        today_date   = now.date()
+
+        # Finn ferske snapshots innenfor tidsvinduet
+        eligible_matches = []
+
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT league_key, data, snapshot_time
+                FROM odds_snapshots
+                WHERE snapshot_time >= $1
+                ORDER BY league_key, snapshot_time DESC
+            """, stale_cutoff)
+
+        # Grupper: siste snapshot per liga
+        latest_by_league = {}
+        for row in rows:
+            if row["league_key"] not in latest_by_league:
+                latest_by_league[row["league_key"]] = row
+
+        for league_key, row in latest_by_league.items():
+            league = next((l for l in SCAN_LEAGUES if l["key"] == league_key), None)
+            if not league:
+                continue
+            try:
+                matches = json.loads(row["data"])
+            except Exception:
+                continue
+            for m in matches:
+                try:
+                    commence = datetime.fromisoformat(
+                        m["commence_time"].replace("Z", "+00:00")
+                    )
+                    if window_start <= commence <= window_end:
+                        match_id = f"{m['home_team']}|{m['away_team']}|{m['commence_time'][:10]}"
+                        eligible_matches.append({
+                            "league": league,
+                            "match": m,
+                            "match_id": match_id,
+                            "snapshot_time": row["snapshot_time"],
+                        })
+                except Exception:
+                    continue
+
+        if not eligible_matches:
+            return
+
+        logger.info(f"[PreKickoff] {len(eligible_matches)} kamper i 60-150 min vindu")
+
+        # Sjekk deduplication: hvilke match_ids er allerede behandlet i dag
+        async with db_state.pool.acquire() as conn:
+            existing = await conn.fetch("""
+                SELECT match_id FROM daily_summaries
+                WHERE trigger_type = 'pre_kickoff'
+                  AND date = $1
+            """, today_date)
+        already_done = {r["match_id"] for r in existing}
+
+        to_process = [e for e in eligible_matches if e["match_id"] not in already_done]
+
+        if not to_process:
+            logger.info("[PreKickoff] Alle kamper allerede behandlet i dag")
+            return
+
+        logger.info(f"[PreKickoff] Analyserer {len(to_process)} nye kamper")
+
+        for entry in to_process:
+            league  = entry["league"]
+            m       = entry["match"]
+            match_id = entry["match_id"]
+            result_label = "NO_BET"
+            reason_text  = "Ingen picks kvalifiserte (EV < 3%)"
+
+            try:
+                picks = await _analyse_snapshot(league, [m], now)
+
+                if picks:
+                    best = picks[0]
+                    result_label = "QUALIFIED"
+                    reason_text  = f"EV={best['ev']}% Edge={best['edge']}% SCORE={best['score']:.2f}"
+
+                    # Lagre i dagens_kamp
+                    kickoff_dt = datetime.fromisoformat(
+                        m["commence_time"].replace("Z", "+00:00")
+                    )
+                    async with db_state.pool.acquire() as conn:
+                        row_id = await conn.fetchval("""
+                            INSERT INTO dagens_kamp
+                                (match, league, home_team, away_team, pick, odds, stake,
+                                 edge, ev, confidence, kickoff, telegram_posted,
+                                 market_type, score, bookmaker_count, pinnacle_opening)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15)
+                            ON CONFLICT DO NOTHING
+                            RETURNING id
+                        """,
+                            f"{m['home_team']} vs {m['away_team']}",
+                            f"{league['flag']} {league['name']}",
+                            m["home_team"], m["away_team"],
+                            best["pick"], best["odds"], 5.0,
+                            best["edge"], best["ev"], 75, kickoff_dt,
+                            best["market_type"], best["score"],
+                            best["num_bookmakers"],
+                            best.get("pinnacle_opening"),
+                        )
+
+                    if row_id:
+                        best["id"] = row_id
+                        # Notion
+                        best_with_kickoff = {**best, "kickoff": kickoff_dt}
+                        await _log_notion_pick(best_with_kickoff)
+
+                        # Telegram
+                        if cfg.TELEGRAM_TOKEN and cfg.TELEGRAM_CHAT_ID:
+                            msg = _format_pick_message(best_with_kickoff, rank=1)
+                            async with httpx.AsyncClient(timeout=15) as client:
+                                tresp = await client.post(
+                                    f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                                    json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": msg},
+                                )
+                            if tresp.status_code == 200:
+                                async with db_state.pool.acquire() as conn:
+                                    await conn.execute(
+                                        "UPDATE dagens_kamp SET telegram_posted=TRUE WHERE id=$1",
+                                        row_id
+                                    )
+                                logger.info(f"[PreKickoff] Postet til Telegram: {best['pick']} — {m['home_team']} vs {m['away_team']}")
+                else:
+                    picks_ev = []
+                    all_raw = await _analyse_snapshot(league, [m], now)
+                    reason_text = "EV < 3% mot Pinnacle fair odds for alle outcomes"
+
+            except Exception as e:
+                result_label = "ERROR"
+                reason_text  = str(e)[:200]
+                logger.warning(f"[PreKickoff] Feil for {match_id}: {e}")
+
+            # Logg alltid til daily_summaries
+            try:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO daily_summaries
+                            (date, trigger_type, match_id, result, reason, num_picks, profit)
+                        VALUES ($1, 'pre_kickoff', $2, $3, $4, $5, 0)
+                    """, today_date, match_id, result_label, reason_text,
+                        1 if result_label == "QUALIFIED" else 0)
+            except Exception as e:
+                logger.warning(f"[PreKickoff] daily_summaries insert feil: {e}")
+
+        logger.info(f"[PreKickoff] Ferdig — {len(to_process)} kamper behandlet")
+
+    except Exception as e:
+        logger.error(f"[PreKickoff] Kritisk feil (CLV-tracker upåvirket): {e}")
+        try:
+            if db_state.connected and db_state.pool:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO daily_summaries
+                            (date, trigger_type, match_id, result, reason, num_picks, profit)
+                        VALUES ($1, 'pre_kickoff_error', 'SYSTEM', 'ERROR', $2, 0, 0)
+                    """, datetime.now(timezone.utc).date(), str(e)[:200])
+        except Exception:
+            pass
+
+
 async def track_clv():
     """
     Kjører hvert 30. minutt.
     For picks der kickoff er passert (kamp ferdig), henter Pinnacle-sluttodds
     og beregner CLV = (odds_taken / pinnacle_closing - 1) × 100.
     """
+    await pre_kickoff_check()
+
     if not db_state.connected or not db_state.pool:
         return
 
