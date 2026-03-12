@@ -1767,6 +1767,8 @@ async def status():
             "database_url_set": bool(cfg.DATABASE_URL),
             "telegram_set": bool(cfg.TELEGRAM_TOKEN),
             "odds_api_set": bool(cfg.ODDS_API_KEY),
+            "notion_token_set": bool(cfg.NOTION_TOKEN),
+            "notion_db_set": bool(cfg.NOTION_DB_ID),
             "port": cfg.PORT,
             "environment": cfg.ENVIRONMENT,
         },
