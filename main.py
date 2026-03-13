@@ -1683,6 +1683,33 @@ async def trigger_run_analysis():
     }
 
 
+@app.post("/test-telegram")
+async def test_telegram():
+    """Sender en diagnostisk testmelding til Telegram. Bekrefter at bot-token og chat_id fungerer."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    message = (
+        "SesomNod diagnostics — bot alive\n"
+        f"Datetime: {now_str}\n"
+        "Telegram pipeline: ACTIVE\n"
+        "Status: All systems operational"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+            )
+        return {
+            "status": "sent" if resp.status_code == 200 else "failed",
+            "telegram_http": resp.status_code,
+            "message": message,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
 @app.post("/post-telegram")
 async def trigger_post_telegram():
     """Poster beste upostede HIGH/MEDIUM confidence pick til Telegram."""
