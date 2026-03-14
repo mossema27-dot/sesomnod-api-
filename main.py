@@ -365,7 +365,7 @@ async def fetch_all_odds():
                         "regions": "eu",
                         "markets": "h2h,totals",
                         "oddsFormat": "decimal",
-                        "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson",
+                        "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson,betfair_ex_eu,sport888",
                     }
                 )
                 if resp.status_code != 200:
@@ -1577,7 +1577,7 @@ async def trigger_fetch_odds():
                         "regions": "eu",
                         "markets": "h2h,totals",
                         "oddsFormat": "decimal",
-                        "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson",
+                        "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson,betfair_ex_eu,sport888",
                     }
                 )
                 remaining = int(resp.headers.get("x-requests-remaining", -1))
@@ -1776,6 +1776,46 @@ async def trigger_post_telegram():
     except Exception as e:
         logger.exception(f"[/post-telegram] Feil: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.post("/add-pick")
+async def add_pick(payload: dict):
+    """Inserter en pick direkte i dagens_kamp og logger til Notion."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+    try:
+        kickoff_dt = datetime.fromisoformat(payload["kickoff"])
+        async with db_state.pool.acquire() as conn:
+            row_id = await conn.fetchval("""
+                INSERT INTO dagens_kamp
+                    (match, league, home_team, away_team, pick, odds, stake,
+                     edge, ev, confidence, kickoff, telegram_posted,
+                     market_type, score, bookmaker_count, pinnacle_opening)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15)
+                RETURNING id
+            """,
+                f"{payload['home_team']} vs {payload['away_team']}",
+                payload.get("league", ""),
+                payload["home_team"],
+                payload["away_team"],
+                payload.get("pick", payload["home_team"] + " vinner"),
+                float(payload["odds"]),
+                5.0,
+                float(payload.get("edge", 0)),
+                float(payload.get("ev_pct", 0)),
+                int(payload.get("confidence", 0)),
+                kickoff_dt,
+                payload.get("market_type", "h2h"),
+                float(payload.get("score", 0)) if payload.get("score") else None,
+                int(payload.get("bookmaker_count", 0)) if payload.get("bookmaker_count") else None,
+                float(payload.get("pinnacle_opening", 0)) if payload.get("pinnacle_opening") else None,
+            )
+        pick_data = {**payload, "id": row_id, "kickoff": kickoff_dt}
+        await _log_notion_pick(pick_data)
+        return {"status": "ok", "id": row_id, "match": f"{payload['home_team']} vs {payload['away_team']}"}
+    except Exception as e:
+        logger.exception(f"[/add-pick] Feil: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
 
 
 @app.get("/db/retry")
