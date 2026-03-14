@@ -1778,6 +1778,48 @@ async def trigger_post_telegram():
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
+@app.post("/notion-update")
+async def notion_update(payload: dict):
+    """Finn en side i Notion MATCH_PREDICTIONS og oppdater status."""
+    if not cfg.NOTION_TOKEN or not cfg.NOTION_DB_ID:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "Notion ikke konfigurert"})
+    match_name = payload.get("match")
+    new_status = payload.get("status", "NO BET")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Søk etter siden i databasen
+            search_resp = await client.post(
+                f"https://api.notion.com/v1/databases/{cfg.NOTION_DB_ID}/query",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"filter": {"property": "Name", "title": {"equals": match_name}}},
+            )
+            if search_resp.status_code != 200:
+                return JSONResponse(status_code=502, content={"status": "error", "notion_error": search_resp.text[:200]})
+            results = search_resp.json().get("results", [])
+            if not results:
+                return {"status": "not_found", "match": match_name}
+            page_id = results[0]["id"]
+            # Oppdater status
+            update_resp = await client.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"properties": {"Status": {"select": {"name": new_status}}}},
+            )
+            if update_resp.status_code == 200:
+                return {"status": "updated", "page_id": page_id, "match": match_name, "new_status": new_status}
+            return JSONResponse(status_code=502, content={"status": "error", "notion_error": update_resp.text[:200]})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
 @app.post("/add-pick")
 async def add_pick(payload: dict):
     """Inserter en pick direkte i dagens_kamp og logger til Notion."""
