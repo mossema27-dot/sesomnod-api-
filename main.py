@@ -72,7 +72,7 @@ SCAN_LEAGUES = [
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
 
-EV_MIN              = 3.0    # Min EV% mot Pinnacle fair odds (realistisk grense)
+EV_MIN              = float(os.getenv("EV_MIN", "2.0"))  # Konfigurerbar via Railway env
 PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
 PINNACLE_MARGIN_MAX = 4.0    # Max Pinnacle margin%
 ODDS_MIN            = 1.40
@@ -1809,6 +1809,7 @@ async def status():
         "scanner": {
             "leagues": len(SCAN_LEAGUES),
             "ev_min": EV_MIN,
+            "ev_min_source": "env" if os.getenv("EV_MIN") else "default",
             "pinnacle_edge_min": PINNACLE_EDGE_MIN,
             "daily_post_limit": DAILY_POST_LIMIT,
             "api_fetches_per_day": 2,
