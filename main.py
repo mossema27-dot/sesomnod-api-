@@ -77,7 +77,7 @@ EDGE_MIN            = float(os.getenv("EDGE_MIN", "1.5"))       # Fase 0: min ed
 CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "65"))    # Fase 0: min confidence
 MIN_BOOKMAKERS      = int(os.getenv("MIN_BOOKMAKERS", "3"))     # Fase 0: min antall bookmakers
 PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
-PINNACLE_MARGIN_MAX = 4.0    # Max Pinnacle margin%
+PINNACLE_MARGIN_MAX = float(os.getenv("PINNACLE_MARGIN_MAX", "8.0"))  # Max Pinnacle margin%
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
 ODDS_MAX            = float(os.getenv("ODDS_MAX", "4.50"))      # Fase 0: over 4.50 = for høy varians
 MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "96"))
@@ -1974,6 +1974,7 @@ async def status():
             "odds_min": ODDS_MIN,
             "odds_max": ODDS_MAX,
             "pinnacle_edge_min": PINNACLE_EDGE_MIN,
+            "pinnacle_margin_max": PINNACLE_MARGIN_MAX,
             "daily_post_limit": DAILY_POST_LIMIT,
             "api_fetches_per_day": 2,
             "estimated_api_calls_per_month": len(SCAN_LEAGUES) * 2 * 30,
