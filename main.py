@@ -72,10 +72,10 @@ SCAN_LEAGUES = [
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
 
-EV_MIN              = float(os.getenv("EV_MIN", "2.0"))        # Konfigurerbar via Railway env
-EDGE_MIN            = float(os.getenv("EDGE_MIN", "2.0"))       # Fase 0: min edge mot Pinnacle
-CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "70"))    # Fase 0: min confidence
-MIN_BOOKMAKERS      = int(os.getenv("MIN_BOOKMAKERS", "4"))     # Fase 0: min antall bookmakers
+EV_MIN              = float(os.getenv("EV_MIN", "1.5"))        # Konfigurerbar via Railway env
+EDGE_MIN            = float(os.getenv("EDGE_MIN", "1.5"))       # Fase 0: min edge mot Pinnacle
+CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "65"))    # Fase 0: min confidence
+MIN_BOOKMAKERS      = int(os.getenv("MIN_BOOKMAKERS", "3"))     # Fase 0: min antall bookmakers
 PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
 PINNACLE_MARGIN_MAX = 4.0    # Max Pinnacle margin%
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
@@ -366,7 +366,7 @@ async def fetch_all_odds():
                     params={
                         "apiKey": cfg.ODDS_API_KEY,
                         "regions": "eu",
-                        "markets": "h2h,totals",
+                        "markets": "totals,spreads,h2h",
                         "oddsFormat": "decimal",
                         "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson,betfair_ex_eu,sport888",
                     }
@@ -1588,7 +1588,7 @@ async def trigger_fetch_odds():
                     params={
                         "apiKey": cfg.ODDS_API_KEY,
                         "regions": "eu",
-                        "markets": "h2h,totals",
+                        "markets": "totals,spreads,h2h",
                         "oddsFormat": "decimal",
                         "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson,betfair_ex_eu,sport888",
                     }
