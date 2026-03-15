@@ -72,11 +72,14 @@ SCAN_LEAGUES = [
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
 
-EV_MIN              = float(os.getenv("EV_MIN", "2.0"))  # Konfigurerbar via Railway env
+EV_MIN              = float(os.getenv("EV_MIN", "2.0"))        # Konfigurerbar via Railway env
+EDGE_MIN            = float(os.getenv("EDGE_MIN", "2.0"))       # Fase 0: min edge mot Pinnacle
+CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "70"))    # Fase 0: min confidence
+MIN_BOOKMAKERS      = int(os.getenv("MIN_BOOKMAKERS", "4"))     # Fase 0: min antall bookmakers
 PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
 PINNACLE_MARGIN_MAX = 4.0    # Max Pinnacle margin%
-ODDS_MIN            = 1.40
-ODDS_MAX            = 6.00
+ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
+ODDS_MAX            = float(os.getenv("ODDS_MAX", "4.50"))      # Fase 0: over 4.50 = for høy varians
 MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "96"))
 DAILY_POST_LIMIT    = 10
 MAX_PICKS_PER_MATCH = 2
@@ -496,6 +499,10 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
             if not home_list:
                 continue
 
+            # Fase 0: minimum antall bookmakers (Pinnacle inkludert i num_bk)
+            if num_bk < MIN_BOOKMAKERS:
+                continue
+
             # Best consensus odds (highest = softest book)
             best_home = max(home_list)
             best_draw = max(draw_list) if draw_list else None
@@ -561,6 +568,12 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                 pin_fair_odds = round(1 / model_prob, 3) if model_prob > 0 else None
 
                 if ev_pct < EV_MIN:
+                    continue
+
+                # Fase 0 gate: edge og confidence
+                if edge_pct < EDGE_MIN:
+                    continue
+                if 75 < CONFIDENCE_MIN:
                     continue
 
                 score = round(ev_pct * math.log(num_bk + 1), 4)
@@ -1892,6 +1905,12 @@ async def status():
             "leagues": len(SCAN_LEAGUES),
             "ev_min": EV_MIN,
             "ev_min_source": "env" if os.getenv("EV_MIN") else "default",
+            "edge_min": EDGE_MIN,
+            "edge_min_source": "env" if os.getenv("EDGE_MIN") else "default",
+            "confidence_min": CONFIDENCE_MIN,
+            "min_bookmakers": MIN_BOOKMAKERS,
+            "odds_min": ODDS_MIN,
+            "odds_max": ODDS_MAX,
             "pinnacle_edge_min": PINNACLE_EDGE_MIN,
             "daily_post_limit": DAILY_POST_LIMIT,
             "api_fetches_per_day": 2,
