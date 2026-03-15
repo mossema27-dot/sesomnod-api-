@@ -475,6 +475,9 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
             num_bk = len(bookmakers)
             home_list, draw_list, away_list = [], [], []
             over25_list, over35_list = [], []
+            # spreads: {point: [home_price, ...]} og {point: [away_price, ...]}
+            spreads_home: dict = {}
+            spreads_away: dict = {}
 
             for bk in bookmakers:
                 if bk.get("key") == "pinnacle":
@@ -495,6 +498,17 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                                 over25_list.append(o["price"])
                             elif abs(pt - 3.5) < 0.1 and o["name"] == "Over":
                                 over35_list.append(o["price"])
+                    elif mkt["key"] == "spreads":
+                        for o in mkt.get("outcomes", []):
+                            pt  = round(o.get("point", 0), 1)
+                            nm  = o.get("name", "")
+                            prc = o.get("price")
+                            if not prc:
+                                continue
+                            if nm == m["home_team"]:
+                                spreads_home.setdefault(pt, []).append(prc)
+                            elif nm == m["away_team"]:
+                                spreads_away.setdefault(pt, []).append(prc)
 
             if not home_list:
                 continue
@@ -554,6 +568,54 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     raw_o, raw_u = 1 / pin_over35, 1 / pin_under35
                     p_over35 = raw_o / (raw_o + raw_u)
                     outcomes_to_check.append((p_over35, max(over35_list), "Over 3.5 mål", "totals_over35", pin_over35))
+
+            # Spreads / Asian Handicap — samme EV-formel som totals
+            pin_spreads = next(
+                (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "spreads"),
+                None
+            )
+            if pin_spreads and (spreads_home or spreads_away):
+                pin_sp_map: dict = {}  # {point: {"home": price, "away": price}}
+                for o in pin_spreads.get("outcomes", []):
+                    pt  = round(o.get("point", 0), 1)
+                    nm  = o.get("name", "")
+                    prc = o.get("price")
+                    if not prc:
+                        continue
+                    pin_sp_map.setdefault(pt, {})
+                    if nm == m["home_team"]:
+                        pin_sp_map[pt]["home"] = prc
+                    elif nm == m["away_team"]:
+                        pin_sp_map[pt]["away"] = prc
+
+                for pt, pin_sides in pin_sp_map.items():
+                    pin_sp_home = pin_sides.get("home")
+                    pin_sp_away = pin_sides.get("away")
+                    if not pin_sp_home or not pin_sp_away:
+                        continue
+                    # Pinnacle no-vig probability for hver side
+                    raw_h = 1 / pin_sp_home
+                    raw_a = 1 / pin_sp_away
+                    total = raw_h + raw_a
+                    p_sp_home = raw_h / total
+                    p_sp_away = raw_a / total
+
+                    best_sp_home = max(spreads_home[pt]) if pt in spreads_home else None
+                    best_sp_away = max(spreads_away.get(-pt, [])) if -pt in spreads_away else None
+
+                    label_pt = f"+{pt}" if pt > 0 else str(pt)
+                    if best_sp_home and ODDS_MIN <= best_sp_home <= ODDS_MAX:
+                        outcomes_to_check.append((
+                            p_sp_home, best_sp_home,
+                            f"{m['home_team']} handicap {label_pt}", "spreads", pin_sp_home
+                        ))
+                    neg_pt = -pt
+                    neg_label = f"+{neg_pt}" if neg_pt > 0 else str(neg_pt)
+                    if best_sp_away and ODDS_MIN <= best_sp_away <= ODDS_MAX:
+                        outcomes_to_check.append((
+                            p_sp_away, best_sp_away,
+                            f"{m['away_team']} handicap {neg_label}", "spreads", pin_sp_away
+                        ))
 
             for model_prob, odds_val, pick_label, market_type, pin_odds_ref in outcomes_to_check:
                 if match_pick_count >= MAX_PICKS_PER_MATCH:
