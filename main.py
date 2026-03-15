@@ -72,10 +72,14 @@ SCAN_LEAGUES = [
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
 
-EV_MIN              = float(os.getenv("EV_MIN", "1.5"))        # Konfigurerbar via Railway env
-EDGE_MIN            = float(os.getenv("EDGE_MIN", "1.5"))       # Fase 0: min edge mot Pinnacle
+EV_MIN              = float(os.getenv("EV_MIN", "1.5"))        # Legacy — erstattet av BET365_EV_MIN
+EDGE_MIN            = float(os.getenv("EDGE_MIN", "1.5"))       # Legacy — erstattet av BET365_EDGE_MIN
 CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "65"))    # Fase 0: min confidence
 MIN_BOOKMAKERS      = int(os.getenv("MIN_BOOKMAKERS", "3"))     # Fase 0: min antall bookmakers
+BET365_EDGE_MIN     = float(os.getenv("BET365_EDGE_MIN", "3.0"))  # Dual Benchmark: min edge mot Bet365
+BET365_EV_MIN       = float(os.getenv("BET365_EV_MIN", "3.0"))    # Dual Benchmark: min EV mot Bet365
+BENCHMARK           = os.getenv("BENCHMARK", "bet365")             # Primær benchmark-bok
+PINNACLE_CLV_TRACK  = os.getenv("PINNACLE_CLV_TRACK", "true").lower() == "true"
 PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
 PINNACLE_MARGIN_MAX = float(os.getenv("PINNACLE_MARGIN_MAX", "8.0"))  # Max Pinnacle margin%
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
@@ -292,6 +296,16 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS reason TEXT;
             """)
 
+            # Migrer picks-tabell med Dual Benchmark-kolonner
+            await conn.execute("""
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS bet365_edge FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS bet365_ev FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS pinnacle_clv FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS benchmark_book VARCHAR(50) DEFAULT 'bet365';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS clv_reference_book VARCHAR(50) DEFAULT 'pinnacle';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS clv_missing BOOLEAN DEFAULT false;
+            """)
+
             # Indeks for snapshot-oppslag
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_odds_snapshots_league_time
@@ -442,46 +456,62 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
             if not bookmakers:
                 continue
 
-            # Finn Pinnacle
+            # ── Bet365: PRIMÆR BENCHMARK ─────────────────────────────────────
+            bet365_bk = next(
+                (bk for bk in bookmakers if bk.get("key") == "bet365"),
+                None
+            )
+            if not bet365_bk:
+                continue  # FALLBACK: ingen Bet365-linje = ingen pick
+
+            bet365_h2h = next(
+                (mkt for mkt in bet365_bk.get("markets", []) if mkt["key"] == "h2h"),
+                None
+            )
+            if not bet365_h2h:
+                continue  # Ingen Bet365 h2h = ingen pick
+
+            b365_out = {o["name"]: o["price"] for o in bet365_h2h.get("outcomes", [])}
+            b365_home = b365_out.get(m["home_team"])
+            b365_away = b365_out.get(m["away_team"])
+            b365_draw = b365_out.get("Draw")
+
+            if not b365_home or not b365_away or not b365_draw:
+                continue  # Bet365 mangler outcome = ingen pick
+
+            p_home, p_draw, p_away, b365_margin = _pinnacle_no_vig(b365_home, b365_draw, b365_away)
+
+            # ── Pinnacle: KUN CLV-referanse ──────────────────────────────────
             pinnacle_bk = next(
                 (bk for bk in bookmakers if bk.get("key") == "pinnacle"),
                 None
             )
-            if not pinnacle_bk:
-                continue
+            clv_missing = pinnacle_bk is None
+            pin_home = pin_draw = pin_away = None
+            pin_margin = None
+            if pinnacle_bk:
+                pin_h2h = next(
+                    (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "h2h"),
+                    None
+                )
+                if pin_h2h:
+                    pin_out = {o["name"]: o["price"] for o in pin_h2h.get("outcomes", [])}
+                    pin_home = pin_out.get(m["home_team"])
+                    pin_away = pin_out.get(m["away_team"])
+                    pin_draw = pin_out.get("Draw")
+                    if pin_home and pin_away and pin_draw:
+                        _, _, _, pin_margin = _pinnacle_no_vig(pin_home, pin_draw, pin_away)
 
-            # Pinnacle h2h odds
-            pin_h2h = next(
-                (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "h2h"),
-                None
-            )
-            if not pin_h2h:
-                continue
-
-            pin_outcomes = {o["name"]: o["price"] for o in pin_h2h.get("outcomes", [])}
-            pin_home = pin_outcomes.get(m["home_team"])
-            pin_away = pin_outcomes.get(m["away_team"])
-            pin_draw = pin_outcomes.get("Draw")
-
-            if not pin_home or not pin_away or not pin_draw:
-                continue
-
-            p_home, p_draw, p_away, pin_margin = _pinnacle_no_vig(pin_home, pin_draw, pin_away)
-
-            if pin_margin > PINNACLE_MARGIN_MAX:
-                continue
-
-            # Soft book odds — Pinnacle EKSKLUDERT (vi bruker Pinnacle kun som referanse)
+            # Soft book odds — Bet365 OG Pinnacle ekskludert
             num_bk = len(bookmakers)
             home_list, draw_list, away_list = [], [], []
             over25_list, over35_list = [], []
-            # spreads: {point: [home_price, ...]} og {point: [away_price, ...]}
             spreads_home: dict = {}
             spreads_away: dict = {}
 
             for bk in bookmakers:
-                if bk.get("key") == "pinnacle":
-                    continue  # Pinnacle er referanse, ikke betting-target
+                if bk.get("key") in ("pinnacle", "bet365"):
+                    continue  # Begge er referanser, ikke betting-targets
                 for mkt in bk.get("markets", []):
                     if mkt["key"] == "h2h":
                         outcomes_map = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
@@ -524,81 +554,130 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
 
             match_pick_count = 0
 
+            # ── outcomes_to_check: (b365_prob, soft_odds, label, market, pin_ref_odds) ──
+            # b365_prob = Bet365 no-vig probability (benchmark)
+            # pin_ref_odds = Pinnacle odds same outcome (CLV reference, may be None)
             outcomes_to_check = []
+
+            # H2H — Bet365 no-vig prob som model (p_home/draw/away allerede beregnet)
             if best_home and ODDS_MIN <= best_home <= ODDS_MAX:
                 outcomes_to_check.append((p_home, best_home, f"{m['home_team']} vinner", "h2h", pin_home))
             if best_draw and ODDS_MIN <= best_draw <= ODDS_MAX:
                 outcomes_to_check.append((p_draw, best_draw, "Uavgjort", "h2h", pin_draw))
             if best_away and ODDS_MIN <= best_away <= ODDS_MAX:
                 outcomes_to_check.append((p_away, best_away, f"{m['away_team']} vinner", "h2h", pin_away))
-            # Over 2.5 — bruk Pinnacle no-vig som model_prob (ikke Dixon-Coles formel)
+
+            # Over 2.5 — Bet365 totals no-vig som model_prob
             if over25_list and ODDS_MIN <= max(over25_list) <= ODDS_MAX:
-                pin_totals = next(
-                    (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "totals"),
+                b365_totals = next(
+                    (mkt for mkt in bet365_bk.get("markets", []) if mkt["key"] == "totals"),
                     None
                 )
-                pin_over25 = pin_under25 = None
-                if pin_totals:
-                    for o in pin_totals.get("outcomes", []):
+                b365_over25 = b365_under25 = None
+                pin_over25_ref = None
+                if b365_totals:
+                    for o in b365_totals.get("outcomes", []):
                         if abs(o.get("point", 0) - 2.5) < 0.1:
                             if o["name"] == "Over":
-                                pin_over25 = o["price"]
+                                b365_over25 = o["price"]
                             elif o["name"] == "Under":
-                                pin_under25 = o["price"]
-                if pin_over25 and pin_under25:
-                    raw_o, raw_u = 1 / pin_over25, 1 / pin_under25
+                                b365_under25 = o["price"]
+                if b365_over25 and b365_under25:
+                    raw_o, raw_u = 1 / b365_over25, 1 / b365_under25
                     p_over25 = raw_o / (raw_o + raw_u)
-                    outcomes_to_check.append((p_over25, max(over25_list), "Over 2.5 mål", "totals_over25", pin_over25))
+                    # Pinnacle totals CLV reference
+                    if pinnacle_bk:
+                        pin_totals = next(
+                            (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "totals"),
+                            None
+                        )
+                        if pin_totals:
+                            for o in pin_totals.get("outcomes", []):
+                                if abs(o.get("point", 0) - 2.5) < 0.1 and o["name"] == "Over":
+                                    pin_over25_ref = o["price"]
+                    outcomes_to_check.append((p_over25, max(over25_list), "Over 2.5 mål", "totals_over25", pin_over25_ref))
 
-            # Over 3.5 — bruk Pinnacle no-vig som model_prob
+            # Over 3.5 — Bet365 totals no-vig som model_prob
             if over35_list and ODDS_MIN <= max(over35_list) <= ODDS_MAX:
-                pin_totals = next(
-                    (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "totals"),
+                b365_totals = next(
+                    (mkt for mkt in bet365_bk.get("markets", []) if mkt["key"] == "totals"),
                     None
                 )
-                pin_over35 = pin_under35 = None
-                if pin_totals:
-                    for o in pin_totals.get("outcomes", []):
+                b365_over35 = b365_under35 = None
+                pin_over35_ref = None
+                if b365_totals:
+                    for o in b365_totals.get("outcomes", []):
                         if abs(o.get("point", 0) - 3.5) < 0.1:
                             if o["name"] == "Over":
-                                pin_over35 = o["price"]
+                                b365_over35 = o["price"]
                             elif o["name"] == "Under":
-                                pin_under35 = o["price"]
-                if pin_over35 and pin_under35:
-                    raw_o, raw_u = 1 / pin_over35, 1 / pin_under35
+                                b365_under35 = o["price"]
+                if b365_over35 and b365_under35:
+                    raw_o, raw_u = 1 / b365_over35, 1 / b365_under35
                     p_over35 = raw_o / (raw_o + raw_u)
-                    outcomes_to_check.append((p_over35, max(over35_list), "Over 3.5 mål", "totals_over35", pin_over35))
+                    if pinnacle_bk:
+                        pin_totals = next(
+                            (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "totals"),
+                            None
+                        )
+                        if pin_totals:
+                            for o in pin_totals.get("outcomes", []):
+                                if abs(o.get("point", 0) - 3.5) < 0.1 and o["name"] == "Over":
+                                    pin_over35_ref = o["price"]
+                    outcomes_to_check.append((p_over35, max(over35_list), "Over 3.5 mål", "totals_over35", pin_over35_ref))
 
-            # Spreads / Asian Handicap — samme EV-formel som totals
+            # Spreads — Bet365 spreads no-vig som model_prob
+            b365_spreads = next(
+                (mkt for mkt in bet365_bk.get("markets", []) if mkt["key"] == "spreads"),
+                None
+            )
             pin_spreads = next(
                 (mkt for mkt in pinnacle_bk.get("markets", []) if mkt["key"] == "spreads"),
                 None
-            )
-            if pin_spreads and (spreads_home or spreads_away):
-                pin_sp_map: dict = {}  # {point: {"home": price, "away": price}}
-                for o in pin_spreads.get("outcomes", []):
+            ) if pinnacle_bk else None
+
+            if b365_spreads and (spreads_home or spreads_away):
+                b365_sp_map: dict = {}
+                for o in b365_spreads.get("outcomes", []):
                     pt  = round(o.get("point", 0), 1)
                     nm  = o.get("name", "")
                     prc = o.get("price")
                     if not prc:
                         continue
-                    pin_sp_map.setdefault(pt, {})
+                    b365_sp_map.setdefault(pt, {})
                     if nm == m["home_team"]:
-                        pin_sp_map[pt]["home"] = prc
+                        b365_sp_map[pt]["home"] = prc
                     elif nm == m["away_team"]:
-                        pin_sp_map[pt]["away"] = prc
+                        b365_sp_map[pt]["away"] = prc
 
-                for pt, pin_sides in pin_sp_map.items():
-                    pin_sp_home = pin_sides.get("home")
-                    pin_sp_away = pin_sides.get("away")
-                    if not pin_sp_home or not pin_sp_away:
+                # Pinnacle spreads CLV reference map
+                pin_sp_ref_map: dict = {}
+                if pin_spreads:
+                    for o in pin_spreads.get("outcomes", []):
+                        pt  = round(o.get("point", 0), 1)
+                        nm  = o.get("name", "")
+                        prc = o.get("price")
+                        if not prc:
+                            continue
+                        pin_sp_ref_map.setdefault(pt, {})
+                        if nm == m["home_team"]:
+                            pin_sp_ref_map[pt]["home"] = prc
+                        elif nm == m["away_team"]:
+                            pin_sp_ref_map[pt]["away"] = prc
+
+                for pt, b365_sides in b365_sp_map.items():
+                    b365_sp_home = b365_sides.get("home")
+                    b365_sp_away = b365_sides.get("away")
+                    if not b365_sp_home or not b365_sp_away:
                         continue
-                    # Pinnacle no-vig probability for hver side
-                    raw_h = 1 / pin_sp_home
-                    raw_a = 1 / pin_sp_away
+                    raw_h = 1 / b365_sp_home
+                    raw_a = 1 / b365_sp_away
                     total = raw_h + raw_a
                     p_sp_home = raw_h / total
                     p_sp_away = raw_a / total
+
+                    pin_sp_h = pin_sp_ref_map.get(pt, {}).get("home")
+                    pin_sp_a = pin_sp_ref_map.get(-pt, {}).get("away")
 
                     best_sp_home = max(spreads_home[pt]) if pt in spreads_home else None
                     best_sp_away = max(spreads_away.get(-pt, [])) if -pt in spreads_away else None
@@ -607,38 +686,44 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     if best_sp_home and ODDS_MIN <= best_sp_home <= ODDS_MAX:
                         outcomes_to_check.append((
                             p_sp_home, best_sp_home,
-                            f"{m['home_team']} handicap {label_pt}", "spreads", pin_sp_home
+                            f"{m['home_team']} handicap {label_pt}", "spreads", pin_sp_h
                         ))
                     neg_pt = -pt
                     neg_label = f"+{neg_pt}" if neg_pt > 0 else str(neg_pt)
                     if best_sp_away and ODDS_MIN <= best_sp_away <= ODDS_MAX:
                         outcomes_to_check.append((
                             p_sp_away, best_sp_away,
-                            f"{m['away_team']} handicap {neg_label}", "spreads", pin_sp_away
+                            f"{m['away_team']} handicap {neg_label}", "spreads", pin_sp_a
                         ))
 
-            for model_prob, odds_val, pick_label, market_type, pin_odds_ref in outcomes_to_check:
+            # ── Evaluerings-loop: Bet365 som EV/edge-benchmark ───────────────
+            for b365_prob, soft_odds, pick_label, market_type, pin_ref_odds in outcomes_to_check:
                 if match_pick_count >= MAX_PICKS_PER_MATCH:
                     break
 
-                market_prob = 1 / odds_val
-                # EV: model_prob (Pinnacle no-vig) vs beste soft book odds
-                ev_pct = round((model_prob * odds_val - 1) * 100, 2)
-                # Edge: prosentpoeng over soft book implied probability
-                edge_pct = round((model_prob - market_prob) * 100, 2)
-                # Pin fair odds (for logging/CLV — ikke som filter)
-                pin_fair_odds = round(1 / model_prob, 3) if model_prob > 0 else None
+                soft_prob = 1 / soft_odds
+                # EV: Bet365 no-vig prob × beste soft-book odds
+                bet365_ev  = round((b365_prob * soft_odds - 1) * 100, 2)
+                # Edge: Bet365 no-vig prob − soft implied prob
+                bet365_edge = round((b365_prob - soft_prob) * 100, 2)
+                # Bet365 fair odds (for logging)
+                b365_fair_odds = round(1 / b365_prob, 3) if b365_prob > 0 else None
 
-                if ev_pct < EV_MIN:
+                # Dual Benchmark gate
+                if bet365_ev < BET365_EV_MIN:
                     continue
-
-                # Fase 0 gate: edge og confidence
-                if edge_pct < EDGE_MIN:
+                if bet365_edge < BET365_EDGE_MIN:
                     continue
                 if 75 < CONFIDENCE_MIN:
                     continue
 
-                score = round(ev_pct * math.log(num_bk + 1), 4)
+                # Pinnacle CLV referanse
+                pin_fair = round(1 / (1 / pin_ref_odds), 3) if pin_ref_odds else None
+                pinnacle_clv = None
+                if pin_ref_odds and b365_prob > 0:
+                    pinnacle_clv = round((b365_prob - 1 / pin_ref_odds) * 100, 2)
+
+                score = round(bet365_ev * math.log(num_bk + 1), 4)
 
                 candidates.append({
                     "league_key": league["key"],
@@ -649,17 +734,23 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     "commence_time": m["commence_time"],
                     "hours_to_kickoff": round(hours, 1),
                     "pick": pick_label,
-                    "odds": odds_val,
+                    "odds": soft_odds,
                     "market_type": market_type,
-                    "model_prob": round(model_prob * 100, 2),
-                    "market_prob": round(market_prob * 100, 2),
-                    "edge": edge_pct,
-                    "ev": ev_pct,
+                    "model_prob": round(b365_prob * 100, 2),
+                    "market_prob": round(soft_prob * 100, 2),
+                    "edge": bet365_edge,
+                    "ev": bet365_ev,
+                    "bet365_edge": bet365_edge,
+                    "bet365_ev": bet365_ev,
+                    "pinnacle_clv": pinnacle_clv,
+                    "clv_missing": clv_missing or pin_ref_odds is None,
+                    "benchmark_book": "bet365",
+                    "clv_reference_book": "pinnacle",
                     "score": score,
                     "num_bookmakers": num_bk,
-                    "pinnacle_opening": round(pin_odds_ref, 2) if pin_odds_ref else None,
-                    "pinnacle_fair_odds": pin_fair_odds,
-                    "pinnacle_margin": round(pin_margin, 2),
+                    "pinnacle_opening": round(pin_ref_odds, 2) if pin_ref_odds else None,
+                    "pinnacle_fair_odds": pin_fair,
+                    "pinnacle_margin": round(pin_margin, 2) if pin_margin else None,
                 })
                 match_pick_count += 1
                 league_pick_count += 1
@@ -1895,9 +1986,77 @@ async def notion_update(payload: dict):
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
 
 
+@app.get("/snapshot-bookmakers")
+async def snapshot_bookmakers(league: str = "soccer_epl"):
+    """Viser bookmaker-nøkler i siste snapshot for en liga — brukes til å bekrefte bet365-tilstedeværelse."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data, snapshot_time FROM odds_snapshots WHERE league_key=$1 ORDER BY snapshot_time DESC LIMIT 1",
+                league
+            )
+        if not row:
+            return {"status": "no_data", "league": league}
+        matches = json.loads(row["data"])
+        result = []
+        for m in matches[:3]:
+            bk_keys = [bk.get("key") for bk in m.get("bookmakers", [])]
+            result.append({
+                "match": f"{m.get('home_team')} vs {m.get('away_team')}",
+                "bookmakers": bk_keys,
+                "bet365_present": "bet365" in bk_keys,
+                "pinnacle_present": "pinnacle" in bk_keys,
+                "count": len(bk_keys),
+            })
+        return {"status": "ok", "league": league, "snapshot_time": str(row["snapshot_time"]), "sample": result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
+@app.post("/send-welcome")
+async def send_welcome():
+    """Sender og pinner SesomNod Engine-velkomstmelding i Telegram-kanalen."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
+    welcome_text = (
+        "Welcome to SesomNod Engine.\n\n"
+        "We do not guess. We calculate.\n\n"
+        "You will receive statistically verified picks with documented edge against "
+        "market benchmarks. Quality over quantity — three validated opportunities "
+        "outperform thirty forced guesses.\n\n"
+        "Every pick includes pre-match odds, EV calculations, and post-result CLV "
+        "analysis. We post only when mathematics demands it. Expect discipline, not "
+        "daily noise.\n\n"
+        "— SesomNod Engine"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            send_resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": welcome_text, "parse_mode": "HTML"},
+            )
+            if send_resp.status_code != 200:
+                return JSONResponse(status_code=502, content={"status": "error", "detail": send_resp.text[:200]})
+            msg_id = send_resp.json().get("result", {}).get("message_id")
+            pin_resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/pinChatMessage",
+                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "message_id": msg_id, "disable_notification": True},
+            )
+        return {
+            "status": "ok",
+            "message_id": msg_id,
+            "pinned": pin_resp.status_code == 200,
+            "pin_detail": pin_resp.json() if pin_resp.status_code != 200 else "ok",
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
 @app.post("/add-pick")
 async def add_pick(payload: dict):
-    """Inserter en pick direkte i dagens_kamp og logger til Notion."""
+    """Inserter en pick direkte i dagens_kamp og logger til Notion. Inkluderer Dual Benchmark-felt."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
     try:
@@ -1918,9 +2077,9 @@ async def add_pick(payload: dict):
                 payload.get("pick", payload["home_team"] + " vinner"),
                 float(payload["odds"]),
                 5.0,
-                float(payload.get("edge", 0)),
-                float(payload.get("ev_pct", 0)),
-                int(payload.get("confidence", 0)),
+                float(payload.get("bet365_edge", payload.get("edge", 0))),
+                float(payload.get("bet365_ev", payload.get("ev_pct", 0))),
+                int(payload.get("confidence", 75)),
                 kickoff_dt,
                 payload.get("market_type", "h2h"),
                 float(payload.get("score", 0)) if payload.get("score") else None,
@@ -1929,7 +2088,15 @@ async def add_pick(payload: dict):
             )
         pick_data = {**payload, "id": row_id, "kickoff": kickoff_dt}
         await _log_notion_pick(pick_data)
-        return {"status": "ok", "id": row_id, "match": f"{payload['home_team']} vs {payload['away_team']}"}
+        return {
+            "status": "ok", "id": row_id,
+            "match": f"{payload['home_team']} vs {payload['away_team']}",
+            "bet365_edge": payload.get("bet365_edge"),
+            "bet365_ev": payload.get("bet365_ev"),
+            "pinnacle_clv": payload.get("pinnacle_clv"),
+            "clv_missing": payload.get("clv_missing", False),
+            "benchmark_book": "bet365",
+        }
     except Exception as e:
         logger.exception(f"[/add-pick] Feil: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
@@ -1973,6 +2140,10 @@ async def status():
             "min_bookmakers": MIN_BOOKMAKERS,
             "odds_min": ODDS_MIN,
             "odds_max": ODDS_MAX,
+            "benchmark": BENCHMARK,
+            "bet365_edge_min": BET365_EDGE_MIN,
+            "bet365_ev_min": BET365_EV_MIN,
+            "pinnacle_clv_track": PINNACLE_CLV_TRACK,
             "pinnacle_edge_min": PINNACLE_EDGE_MIN,
             "pinnacle_margin_max": PINNACLE_MARGIN_MAX,
             "daily_post_limit": DAILY_POST_LIMIT,
