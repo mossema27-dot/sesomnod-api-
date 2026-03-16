@@ -119,6 +119,7 @@ class Config:
     ODDS_API_KEY: str    = _clean("ODDS_API_KEY_NEW") or "6241bf29534eb1374817ce0f22463607"
     NOTION_TOKEN: str    = _clean("NOTION_TOKEN")
     NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
+    NOTION_CHANGELOG_DB_ID: str = _clean("NOTION_CHANGELOG_DB_ID") or "fd23588f-5099-41c4-8292-ddf45b429d34"
     PORT: int            = int(os.getenv("PORT", "8000"))
     ENVIRONMENT: str     = os.getenv("RAILWAY_ENVIRONMENT", "development")
     SERVICE_NAME: str    = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
