@@ -2095,6 +2095,126 @@ async def notion_update(payload: dict):
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
 
 
+@app.get("/notion-list-dbs")
+async def notion_list_dbs():
+    """Lister alle Notion-databaser tilgjengelig med NOTION_TOKEN — brukes for å finne MODEL_CHANGELOG ID."""
+    if not cfg.NOTION_TOKEN:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "NOTION_TOKEN mangler"})
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.notion.com/v1/search",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"filter": {"value": "database", "property": "object"}},
+            )
+            if resp.status_code != 200:
+                return JSONResponse(status_code=502, content={"status": "error", "notion_error": resp.text[:300]})
+            results = resp.json().get("results", [])
+            databases = []
+            for db in results:
+                title = ""
+                title_list = db.get("title", [])
+                if title_list:
+                    title = title_list[0].get("plain_text", "")
+                databases.append({"id": db.get("id"), "title": title})
+            return {"status": "ok", "count": len(databases), "databases": databases}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
+@app.post("/notion-changelog")
+async def notion_changelog(payload: dict):
+    """
+    Logger en endring til Notion MODEL_CHANGELOG database.
+    Payload: { "db_id": "...", "dato": "...", "versjon": "...", "endring": "...", "begrunnelse": "..." }
+    Hvis db_id mangler, søker automatisk etter databasen med navn 'MODEL_CHANGELOG'.
+    """
+    if not cfg.NOTION_TOKEN:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "NOTION_TOKEN mangler"})
+
+    db_id = payload.get("db_id") or os.getenv("NOTION_CHANGELOG_DB_ID", "")
+    dato = payload.get("dato", "")
+    versjon = payload.get("versjon", "")
+    endring = payload.get("endring", "")
+    begrunnelse = payload.get("begrunnelse", "")
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Finn db_id automatisk hvis ikke oppgitt
+            if not db_id:
+                search_resp = await client.post(
+                    "https://api.notion.com/v1/search",
+                    headers={
+                        "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                        "Notion-Version": "2022-06-28",
+                        "Content-Type": "application/json",
+                    },
+                    json={"query": "MODEL_CHANGELOG", "filter": {"value": "database", "property": "object"}},
+                )
+                if search_resp.status_code != 200:
+                    return JSONResponse(status_code=502, content={"status": "error", "search_error": search_resp.text[:300]})
+                results = search_resp.json().get("results", [])
+                for db in results:
+                    title_list = db.get("title", [])
+                    title = title_list[0].get("plain_text", "") if title_list else ""
+                    if "MODEL_CHANGELOG" in title.upper() or "CHANGELOG" in title.upper():
+                        db_id = db.get("id")
+                        break
+                if not db_id:
+                    return {"status": "db_not_found", "message": "Fant ikke MODEL_CHANGELOG database — oppgi db_id manuelt", "databases_searched": [db.get("title", [{}])[0].get("plain_text","") for db in results if db.get("title")]}
+
+            # Lag ny side i databasen
+            page_resp = await client.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "parent": {"database_id": db_id},
+                    "properties": {
+                        "Name": {"title": [{"text": {"content": f"{versjon} — {endring}"}}]},
+                        "Dato": {"date": {"start": dato}} if dato else {},
+                        "Versjon": {"rich_text": [{"text": {"content": versjon}}]},
+                        "Endring": {"rich_text": [{"text": {"content": endring}}]},
+                        "Begrunnelse": {"rich_text": [{"text": {"content": begrunnelse}}]},
+                    },
+                },
+            )
+            if page_resp.status_code == 200:
+                page_id = page_resp.json().get("id", "?")
+                return {"status": "logged", "db_id": db_id, "page_id": page_id, "versjon": versjon}
+            # Fallback: prøv med kun Name-property (ukjent schema)
+            page_resp2 = await client.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "parent": {"database_id": db_id},
+                    "properties": {
+                        "Name": {"title": [{"text": {"content": f"{versjon} | {dato} | {endring}"}}]},
+                    },
+                    "children": [
+                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"Versjon: {versjon}\nDato: {dato}\nEndring: {endring}\nBegrunnelse: {begrunnelse}"}}]}}
+                    ],
+                },
+            )
+            if page_resp2.status_code == 200:
+                page_id = page_resp2.json().get("id", "?")
+                return {"status": "logged_fallback", "db_id": db_id, "page_id": page_id}
+            return JSONResponse(status_code=502, content={"status": "error", "notion_error": page_resp.text[:400], "db_id": db_id})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
 @app.get("/snapshot-bookmakers")
 async def snapshot_bookmakers(league: str = "soccer_epl"):
     """Viser bookmaker-nøkler i siste snapshot for en liga — brukes til å bekrefte bet365-tilstedeværelse."""
