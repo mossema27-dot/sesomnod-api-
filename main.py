@@ -72,6 +72,17 @@ SCAN_LEAGUES = [
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
 
+# Topp-4 ligaer for kveldsscan (Vindu 2 — 18:00 UTC)
+TOP4_LEAGUES = [
+    {"key": "soccer_epl",                    "name": "Premier League",   "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+    {"key": "soccer_spain_la_liga",           "name": "La Liga",          "flag": "🇪🇸"},
+    {"key": "soccer_germany_bundesliga",      "name": "Bundesliga",       "flag": "🇩🇪"},
+    {"key": "soccer_uefa_champions_league",   "name": "Champions League", "flag": "🏆"},
+]
+
+# API-budsjett: 500 credits/mnd — 3-vindu plan: 8+4 calls/dag × 30 = 360/mnd
+API_MONTHLY_BUDGET = int(os.getenv("API_MONTHLY_BUDGET", "480"))  # Maks calls/mnd (buffer mot 500)
+
 EV_MIN              = float(os.getenv("EV_MIN", "1.5"))        # Legacy
 EDGE_MIN            = float(os.getenv("EDGE_MIN", "1.5"))       # Legacy
 CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "65"))    # Fase 0: min confidence
@@ -259,6 +270,15 @@ async def ensure_tables(pool: asyncpg.Pool):
                     data JSONB NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS api_calls (
+                    id SERIAL PRIMARY KEY,
+                    call_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    window_name TEXT NOT NULL,
+                    league_key TEXT NOT NULL,
+                    status_code INTEGER,
+                    called_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
                 CREATE TABLE IF NOT EXISTS clv_records (
                     id SERIAL PRIMARY KEY,
                     pick_id INTEGER REFERENCES dagens_kamp(id),
@@ -359,15 +379,61 @@ async def reconnect_loop():
 
 
 # ─────────────────────────────────────────────────────────
-# ODDS CACHING (fetch 2x/day only)
+# API BUDSJETT-GUARD
 # ─────────────────────────────────────────────────────────
-async def fetch_all_odds():
+async def _check_api_budget(conn, window_name: str, leagues: list) -> bool:
     """
-    Kjører kl. 07:00 og 14:00 UTC.
-    Henter odds fra The Odds API for alle ligaer og lagrer som snapshots i DB.
-    Estimert API-forbruk: 8 ligaer × 2/dag × 30 dager = 480 req/mnd.
+    Sjekker om vi har nok API-credits igjen denne måneden.
+    Returnerer True hvis vi kan fortsette, False hvis over budsjett.
     """
-    logger.info("[OddsCache] fetch_all_odds startet")
+    try:
+        row = await conn.fetchrow("""
+            SELECT COUNT(*) as calls_this_month
+            FROM api_calls
+            WHERE call_date >= DATE_TRUNC('month', CURRENT_DATE)
+              AND status_code = 200
+        """)
+        calls_this_month = row["calls_this_month"] if row else 0
+        calls_needed = len(leagues)
+        if calls_this_month + calls_needed > API_MONTHLY_BUDGET:
+            logger.warning(
+                f"[BudsjettGuard] {window_name}: {calls_this_month} brukt + "
+                f"{calls_needed} nødvendig > {API_MONTHLY_BUDGET} budsjett — hopper over"
+            )
+            return False
+        logger.info(
+            f"[BudsjettGuard] {window_name}: {calls_this_month}/{API_MONTHLY_BUDGET} "
+            f"brukt — {calls_needed} calls planlagt"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"[BudsjettGuard] Feil ved budsjettsjekk: {e} — fortsetter")
+        return True
+
+
+async def _log_api_call(conn, window_name: str, league_key: str, status_code: int):
+    """Logger et API-kall til api_calls-tabellen."""
+    try:
+        await conn.execute("""
+            INSERT INTO api_calls (window_name, league_key, status_code)
+            VALUES ($1, $2, $3)
+        """, window_name, league_key, status_code)
+    except Exception as e:
+        logger.warning(f"[BudsjettGuard] Klarte ikke logge API-kall: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# ODDS CACHING (3-vindu plan)
+# ─────────────────────────────────────────────────────────
+async def fetch_all_odds(leagues: list = None, window_name: str = "early"):
+    """
+    3-vindu scan:
+      Vindu 1 (Early 07:00 UTC): alle 8 ligaer (8 calls)
+      Vindu 2 (Evening 18:00 UTC): topp-4 ligaer (4 calls)
+    Totalt: 12 calls/dag × 30 dager = 360 req/mnd (buffer mot 500-limit).
+    """
+    target_leagues = leagues if leagues is not None else SCAN_LEAGUES
+    logger.info(f"[OddsCache] fetch_all_odds startet — vindu={window_name}, ligaer={len(target_leagues)}")
 
     if not cfg.ODDS_API_KEY:
         logger.warning("[OddsCache] ODDS_API_KEY mangler")
@@ -380,8 +446,13 @@ async def fetch_all_odds():
     snap_time = datetime.now(timezone.utc)
     saved = 0
 
+    async with db_state.pool.acquire() as conn:
+        ok = await _check_api_budget(conn, window_name, target_leagues)
+        if not ok:
+            return
+
     async with httpx.AsyncClient(timeout=30) as client:
-        for league in SCAN_LEAGUES:
+        for league in target_leagues:
             try:
                 resp = await client.get(
                     f"https://api.the-odds-api.com/v4/sports/{league['key']}/odds/",
@@ -393,6 +464,10 @@ async def fetch_all_odds():
                         "bookmakers": "pinnacle,bet365,betway,unibet,williamhill,bwin,nordicbet,betsson,betfair_ex_eu,sport888",
                     }
                 )
+
+                async with db_state.pool.acquire() as conn:
+                    await _log_api_call(conn, window_name, league["key"], resp.status_code)
+
                 if resp.status_code != 200:
                     logger.warning(f"[OddsCache] {league['key']}: HTTP {resp.status_code}")
                     continue
@@ -414,7 +489,12 @@ async def fetch_all_odds():
                 logger.warning(f"[OddsCache] Feil for {league['key']}: {e}")
                 continue
 
-    logger.info(f"[OddsCache] Ferdig — {saved}/{len(SCAN_LEAGUES)} ligaer cachet kl. {snap_time.strftime('%H:%M')} UTC")
+    logger.info(f"[OddsCache] Ferdig — {saved}/{len(target_leagues)} ligaer cachet kl. {snap_time.strftime('%H:%M')} UTC")
+
+
+async def fetch_top4_odds():
+    """Vindu 2 — 18:00 UTC: henter kun topp-4 ligaer (EPL, La Liga, Bundesliga, CL)."""
+    await fetch_all_odds(leagues=TOP4_LEAGUES, window_name="evening")
 
 
 # ─────────────────────────────────────────────────────────
@@ -1489,32 +1569,53 @@ async def lifespan(app: FastAPI):
 
     scheduler = AsyncIOScheduler()
 
-    # Hent odds 2x/dag (07:00 + 14:00 UTC)
+    # ── 3-VINDU SCAN ──────────────────────────────────────────────
+    # Vindu 1 (Early 07:00 UTC): alle 8 ligaer — 8 API calls
     scheduler.add_job(
         fetch_all_odds,
-        trigger=CronTrigger(hour="7,14", minute=0, timezone="UTC"),
-        id="fetch_all_odds",
+        trigger=CronTrigger(hour=7, minute=0, timezone="UTC"),
+        id="fetch_early_all",
+        kwargs={"leagues": None, "window_name": "early"},
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+    # Vindu 1 analyse — 07:05 UTC
+    scheduler.add_job(
+        run_analysis,
+        trigger=CronTrigger(hour=7, minute=5, timezone="UTC"),
+        id="run_analysis_early",
         misfire_grace_time=300,
         replace_existing=True,
     )
 
-    # Analyser 3x/dag (07:05 + 14:05 + 20:00 UTC)
+    # Vindu 2 (Evening 18:00 UTC): topp-4 ligaer — 4 API calls
     scheduler.add_job(
-        run_analysis,
-        trigger=CronTrigger(hour="7,14", minute=5, timezone="UTC"),
-        id="run_analysis_morning_afternoon",
+        fetch_top4_odds,
+        trigger=CronTrigger(hour=18, minute=0, timezone="UTC"),
+        id="fetch_evening_top4",
         misfire_grace_time=300,
         replace_existing=True,
     )
+    # Vindu 2 analyse — 18:05 UTC
     scheduler.add_job(
         run_analysis,
-        trigger=CronTrigger(hour=20, minute=0, timezone="UTC"),
+        trigger=CronTrigger(hour=18, minute=5, timezone="UTC"),
         id="run_analysis_evening",
         misfire_grace_time=300,
         replace_existing=True,
     )
 
-    # Post 09:00 UTC (legacy-jobb)
+    # Vindu 3 (Pre-kickoff 20:00 UTC): analyse fra eksisterende cache — 0 API calls
+    scheduler.add_job(
+        run_analysis,
+        trigger=CronTrigger(hour=20, minute=0, timezone="UTC"),
+        id="run_analysis_prekickoff",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+    # ──────────────────────────────────────────────────────────────
+
+    # Post 09:00 UTC
     scheduler.add_job(
         post_dagens_kamp_telegram,
         trigger=CronTrigger(hour=9, minute=0, timezone="UTC"),
@@ -1544,8 +1645,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info(
         "[Scheduler] Startet — "
-        "Odds: 07:00+14:00 | Analyse: 07:05+14:05+20:00 | "
-        "CLV: hvert 30min | CLV-rapport: man 08:00 UTC"
+        "3-vindu: Early 07:00 (8L) | Evening 18:00 (4L) | Pre-KO 20:00 (cache) | "
+        "Post: 09:00 | CLV: 30min | CLV-rapport: man 08:00 UTC"
     )
 
     if db_state.connected:
@@ -1572,7 +1673,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────
 app = FastAPI(
     title="SesomNod Engine API",
-    version="9.0.0",
+    version="9.1.0",
     lifespan=lifespan,
 )
 
@@ -1590,7 +1691,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "9.0.0-clv",
+            "version": "9.1.0-clv",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1603,7 +1704,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "9.0.0-clv",
+        "version": "9.1.0-clv",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -2128,7 +2229,7 @@ async def db_retry():
 async def status():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "9.0.0-clv",
+        "version": "9.1.0-clv",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
