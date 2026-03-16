@@ -104,7 +104,8 @@ class Config:
     DATABASE_URL: str    = _clean("DATABASE_URL")
     TELEGRAM_TOKEN: str  = _clean("TELEGRAM_TOKEN")
     TELEGRAM_CHAT_ID: str = _clean("TELEGRAM_CHAT_ID")
-    ODDS_API_KEY: str    = _clean("ODDS_API_KEY") or "6241bf29534eb1374817ce0f22463607"
+    # TODO: once Railway ODDS_API_KEY env var is updated, revert to: _clean("ODDS_API_KEY")
+    ODDS_API_KEY: str    = _clean("ODDS_API_KEY_NEW") or "6241bf29534eb1374817ce0f22463607"
     NOTION_TOKEN: str    = _clean("NOTION_TOKEN")
     NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
     PORT: int            = int(os.getenv("PORT", "8000"))
