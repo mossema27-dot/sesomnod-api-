@@ -121,11 +121,23 @@ class Config:
     NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
     NOTION_CHANGELOG_DB_ID: str = _clean("NOTION_CHANGELOG_DB_ID") or "fd23588f-5099-41c4-8292-ddf45b429d34"
     FOOTBALL_DATA_API_KEY: str = _clean("FOOTBALL_DATA_API_KEY") or "4583e0ae11fa4b64b836fd64c8819d95"
+    OPENWEATHER_API_KEY: str   = _clean("OPENWEATHER_API_KEY") or "3610c10d23b33d9a2a7b4bc49eb6ea1a"
     PORT: int            = int(os.getenv("PORT", "8000"))
     ENVIRONMENT: str     = os.getenv("RAILWAY_ENVIRONMENT", "development")
     SERVICE_NAME: str    = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
 
 cfg = Config()
+
+# Signal-klasser — aldri blokkerende ved import-feil
+try:
+    from signals.weather_signal import WeatherSignal
+    from signals.referee_signal import RefereeSignal
+    _SIGNALS_AVAILABLE = True
+except Exception as _sig_err:
+    logger.warning(f"[Signals] Import feilet: {_sig_err} — legacy gate brukes")
+    WeatherSignal = None
+    RefereeSignal = None
+    _SIGNALS_AVAILABLE = False
 
 
 # ─────────────────────────────────────────────────────────
@@ -399,6 +411,14 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS xg_divergence_home FLOAT;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS xg_divergence_away FLOAT;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS signals_triggered JSONB DEFAULT '[]';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_weather VARCHAR(30);
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_referee VARCHAR(30);
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS referee_name VARCHAR(100);
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS wind_speed FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS temperature FLOAT;
+                CREATE INDEX IF NOT EXISTS idx_picks_atomic ON picks(atomic_score DESC);
+                CREATE INDEX IF NOT EXISTS idx_picks_weather ON picks(signal_weather);
+                CREATE INDEX IF NOT EXISTS idx_picks_created ON picks(created_at DESC);
 
                 ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS prev_odds FLOAT;
                 ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS odds_delta FLOAT;
@@ -808,26 +828,47 @@ def calculate_atomic_score(
     velocity_result: dict,
     xg_result: dict,
     soft_edge: float,
-    soft_ev: float
+    soft_ev: float,
+    weather_result: dict = None,
+    referee_result: dict = None,
 ) -> dict:
     """
-    Kombinerer alle atomic signals.
+    Kombinerer alle 4 atomic signals (velocity, xG, weather, referee).
     ALDRI blokkerende — alltid additivt.
     Gammel gate (SOFT_EDGE_MIN) er alltid siste fallback.
+    Maks score: velocity(2) + xG(2) + edge(2) + EV(1) + weather(1) + referee(0) = 8
     """
+    weather_result  = weather_result  or {"signal": "WEATHER_UNAVAILABLE", "atomic_points": 0}
+    referee_result  = referee_result  or {"signal": "REFEREE_UNAVAILABLE", "atomic_points": 0}
+
     atomic_score = 0
     signals_triggered = []
 
+    # Signal 1 — Velocity
     v_points = velocity_result.get("atomic_points", 0)
     atomic_score += v_points
     if v_points > 0:
         signals_triggered.append(velocity_result.get("velocity_type", "VELOCITY"))
 
+    # Signal 2 — xG
     xg_points = xg_result.get("atomic_points", 0)
     atomic_score += xg_points
     if xg_points > 0:
         signals_triggered.append(xg_result.get("signal", "XG"))
 
+    # Signal 3 — Weather
+    w_points = weather_result.get("atomic_points", 0)
+    atomic_score += w_points
+    if w_points > 0:
+        signals_triggered.append(weather_result.get("signal", "WEATHER"))
+
+    # Signal 4 — Referee (data-innsamling i v10.1.0 — 0 poeng)
+    r_points = referee_result.get("atomic_points", 0)
+    atomic_score += r_points
+    if r_points > 0:
+        signals_triggered.append(referee_result.get("signal", "REFEREE"))
+
+    # Edge-bonus
     if soft_edge >= 3.5:
         atomic_score += 2
         signals_triggered.append("STRONG_EDGE_35PCT")
@@ -835,6 +876,7 @@ def calculate_atomic_score(
         atomic_score += 1
         signals_triggered.append("EDGE_25PCT")
 
+    # EV-bonus
     if soft_ev >= 5.0:
         atomic_score += 1
         signals_triggered.append("STRONG_EV_5PCT")
@@ -843,17 +885,21 @@ def calculate_atomic_score(
         "XG_UNAVAILABLE", "XG_API_ERROR", "XG_TIMEOUT", "XG_ERROR", "XG_LEAGUE_UNKNOWN"
     ]
     velocity_available = velocity_result.get("velocity_type") not in ["NO_HISTORY", "ERROR"]
+    weather_available  = weather_result.get("signal") not in [
+        "WEATHER_UNAVAILABLE", "WEATHER_API_ERROR", "WEATHER_TIMEOUT", "WEATHER_ERROR",
+        "WEATHER_AUTH_FAIL", "WEATHER_CITY_UNKNOWN",
+    ]
 
     if not xg_available and not velocity_available:
         verdict = "LEGACY_GATE"
         gate_passed = soft_edge >= float(os.getenv("SOFT_EDGE_MIN", "2.0"))
-    elif atomic_score >= 5:
+    elif atomic_score >= 6:
         verdict = "ATOMIC_CONFIRMED"
         gate_passed = True
-    elif atomic_score >= 3:
+    elif atomic_score >= 4:
         verdict = "ATOMIC_PROBABLE"
         gate_passed = soft_edge >= 2.5
-    elif atomic_score >= 1:
+    elif atomic_score >= 2:
         verdict = "WEAK_SIGNAL"
         gate_passed = soft_edge >= 3.5
     else:
@@ -867,6 +913,7 @@ def calculate_atomic_score(
         "signals_triggered": signals_triggered,
         "xg_available": xg_available,
         "velocity_available": velocity_available,
+        "weather_available": weather_available,
     }
 
 
@@ -1290,8 +1337,33 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     conn=conn,
                     match_id=match_id,
                 )
+                # Signal 3 — Weather
+                weather_result = {"signal": "WEATHER_UNAVAILABLE", "atomic_points": 0}
+                if WeatherSignal and cfg.OPENWEATHER_API_KEY:
+                    try:
+                        kickoff_dt = datetime.fromisoformat(
+                            m["commence_time"].replace("Z", "+00:00")
+                        )
+                        async with WeatherSignal(cfg.OPENWEATHER_API_KEY) as ws:
+                            weather_result = await ws.get_signal(m["home_team"], kickoff_dt)
+                    except Exception as _we:
+                        logger.warning(f"[WeatherSignal] Exception: {_we}")
+
+                # Signal 4 — Referee
+                referee_result = {"signal": "REFEREE_UNAVAILABLE", "atomic_points": 0}
+                if RefereeSignal and cfg.FOOTBALL_DATA_API_KEY:
+                    try:
+                        async with RefereeSignal(cfg.FOOTBALL_DATA_API_KEY) as rs:
+                            referee_result = await rs.get_signal(
+                                m["home_team"], m["away_team"], league["name"]
+                            )
+                    except Exception as _re:
+                        logger.warning(f"[RefereeSignal] Exception: {_re}")
+
                 atomic_result = calculate_atomic_score(
-                    velocity_result, xg_result, soft_edge, soft_ev
+                    velocity_result, xg_result, soft_edge, soft_ev,
+                    weather_result=weather_result,
+                    referee_result=referee_result,
                 )
                 # ────────────────────────────────────────────────────────────
 
@@ -1340,6 +1412,11 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     "signal_xg": xg_result.get("signal"),
                     "xg_divergence_home": xg_result.get("home_divergence"),
                     "xg_divergence_away": xg_result.get("away_divergence"),
+                    "signal_weather": weather_result.get("signal"),
+                    "signal_referee": referee_result.get("signal"),
+                    "referee_name": referee_result.get("referee_name"),
+                    "wind_speed": weather_result.get("wind_ms"),
+                    "temperature": weather_result.get("temperature_c"),
                 })
                 match_pick_count += 1
                 league_pick_count += 1
@@ -2192,7 +2269,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "10.0.1-atomic",
+            "version": "10.1.0-atomic",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2205,7 +2282,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.0.1-atomic",
+        "version": "10.1.0-atomic",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -2924,7 +3001,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.0.1-atomic",
+        "version": "10.1.0-atomic",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
@@ -2968,8 +3045,12 @@ async def status():
             "velocity_sharp_delta": VELOCITY_SHARP_DELTA,
             "velocity_sharp_minutes": VELOCITY_SHARP_MINUTES,
             "football_data_api_set": bool(cfg.FOOTBALL_DATA_API_KEY),
+            "openweather_api_set": bool(cfg.OPENWEATHER_API_KEY),
+            "signals_available": _SIGNALS_AVAILABLE,
             "xg_status": "XG_PENDING_API_KEY" if not cfg.FOOTBALL_DATA_API_KEY else "XG_ACTIVE",
             "velocity_status": "VELOCITY_LOGGING_MODE",
+            "weather_status": "WEATHER_UNAVAILABLE" if not cfg.OPENWEATHER_API_KEY else ("WEATHER_ACTIVE" if _SIGNALS_AVAILABLE else "WEATHER_IMPORT_FAIL"),
+            "referee_status": "REFEREE_DATA_COLLECTION_v10.1.0",
         },
         "last_fetch": {
             "snapshot_time": last_snapshot_iso,
