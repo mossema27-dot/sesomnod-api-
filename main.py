@@ -120,7 +120,7 @@ class Config:
     NOTION_TOKEN: str    = _clean("NOTION_TOKEN")
     NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
     NOTION_CHANGELOG_DB_ID: str = _clean("NOTION_CHANGELOG_DB_ID") or "fd23588f-5099-41c4-8292-ddf45b429d34"
-    FOOTBALL_DATA_API_KEY: str = _clean("FOOTBALL_DATA_API_KEY")
+    FOOTBALL_DATA_API_KEY: str = _clean("FOOTBALL_DATA_API_KEY") or "4583e0ae11fa4b64b836fd64c8819d95"
     PORT: int            = int(os.getenv("PORT", "8000"))
     ENVIRONMENT: str     = os.getenv("RAILWAY_ENVIRONMENT", "development")
     SERVICE_NAME: str    = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
@@ -325,6 +325,17 @@ async def ensure_tables(pool: asyncpg.Pool):
                 CREATE INDEX IF NOT EXISTS idx_match_odds_hist
                     ON match_odds_history(match_id, market_type, bookmaker, snapshot_time DESC);
 
+                CREATE TABLE IF NOT EXISTS xg_cache (
+                    id SERIAL PRIMARY KEY,
+                    match_id TEXT NOT NULL UNIQUE,
+                    home_team TEXT,
+                    away_team TEXT,
+                    league_name TEXT,
+                    xg_data JSONB,
+                    cached_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_xg_cache_match ON xg_cache(match_id, cached_at DESC);
+
                 CREATE TABLE IF NOT EXISTS clv_records (
                     id SERIAL PRIMARY KEY,
                     pick_id INTEGER REFERENCES dagens_kamp(id),
@@ -393,6 +404,8 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS odds_delta FLOAT;
                 ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS delta_minutes INTEGER;
                 ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS velocity_type VARCHAR(20) DEFAULT 'UNKNOWN';
+                ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS xg_data JSONB;
+                ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS xg_cached_at TIMESTAMPTZ;
             """)
 
             # Indeks for snapshot-oppslag
@@ -581,62 +594,145 @@ async def calculate_odds_velocity(
 
 
 # ─────────────────────────────────────────────────────────
-# SIGNAL 2: xG DIVERGENS
+# SIGNAL 2: xG DIVERGENS — med fuzzy matching, cache, rate limit
 # ─────────────────────────────────────────────────────────
+
+# Rate limiter: maks 10 kall/minutt = 1 per 6s
+_xg_rate_lock = asyncio.Lock()
+_xg_last_call_time: float = 0.0
+
+# Ligaer tilgjengelig på gratis plan
+_XG_LEAGUE_MAP = {
+    "Premier League": "PL",
+    "La Liga": "PD",
+    "Bundesliga": "BL1",
+    "Serie A": "SA",
+    "Ligue 1": "FL1",
+    "Eredivisie": "DED",
+    "Champions League": "CL",
+}
+# Ligaer IKKE tilgjengelig på gratis plan → legacy gate
+_XG_LEAGUE_UNAVAILABLE = {"Europa League"}
+
+
+_TEAM_ALIASES: dict = {
+    # Bundesliga — engelsk → tysk
+    "bayern munich": "bayern münchen",
+    "cologne": "köln",
+    "borussia monchengladbach": "borussia mönchengladbach",
+    "monchengladbach": "mönchengladbach",
+    "mainz": "mainz",
+    "leverkusen": "leverkusen",
+    # Serie A
+    "ac milan": "milan",
+    "inter milan": "inter",
+    # La Liga
+    "athletic bilbao": "athletic club",
+    "atletico madrid": "atlético de madrid",
+    "betis": "real betis",
+    # EPL
+    "spurs": "tottenham",
+    "man city": "manchester city",
+    "man united": "manchester united",
+}
+
+
+def _normalize_name(name: str) -> str:
+    """Normaliserer teamnavn: lowercase, fjerner suffikser, normaliserer umlauts."""
+    name = name.lower().strip()
+    # Umlaut-normalisering (tysk/norsk)
+    name = name.replace("ü", "u").replace("ö", "o").replace("ä", "a").replace("é", "e").replace("ó", "o")
+    name = name.replace("münchen", "munich").replace("köln", "cologne")
+    # Fjern vanlige suffikser/prefikser
+    for token in [" fc", " cf", " afc", " sc", " ac", " bc", " fk", " sk",
+                  "fc ", "afc ", "as ", "fk ", "1. ", "sv ", "bv ", "vfl ", "vfb ",
+                  " 1910", " 04", " 05", " 1846", " 1899", " 1846"]:
+        name = name.replace(token, " ")
+    return " ".join(name.split())  # Fjern doble spaces
+
+
+def _fuzzy_team_match(search: str, api_name: str) -> bool:
+    """Fuzzy team name matching — normaliserer navn, sjekker aliases, håndterer umlauts."""
+    s = _normalize_name(_TEAM_ALIASES.get(search.lower().strip(), search))
+    a = _normalize_name(api_name)
+    return s in a or a in s or s[:6] == a[:6]
+
+
 async def get_xg_divergence(
     home_team: str,
     away_team: str,
     league_name: str,
-    api_key: str = None
+    api_key: str = None,
+    conn=None,
+    match_id: str = None,
 ) -> dict:
     """
     Henter xG-proxy data fra football-data.org.
     Returnerer alltid — feiler aldri stille.
-    Bruker httpx (ikke aiohttp).
+    Sjekker xg_cache FØR API-kall (6 timers TTL).
+    Rate limit: 10 kall/minutt = sleep(6) mellom kall.
+    Bruker httpx + fuzzy team matching.
     """
+    global _xg_last_call_time
+
     if not api_key:
         return {
-            "home_xg_avg": None,
-            "away_xg_avg": None,
-            "home_divergence": 0.0,
-            "away_divergence": 0.0,
             "atomic_points": 0,
             "signal": "XG_UNAVAILABLE",
-            "reason": "Mangler FOOTBALL_DATA_API_KEY"
+            "reason": "Mangler FOOTBALL_DATA_API_KEY",
         }
 
-    league_map = {
-        "Premier League": "PL",
-        "La Liga": "PD",
-        "Bundesliga": "BL1",
-        "Serie A": "SA",
-        "Ligue 1": "FL1",
-        "Eredivisie": "DED",
-        "Champions League": "CL",
-        "Europa League": "EL",
-    }
-    fd_league = league_map.get(league_name)
+    if league_name in _XG_LEAGUE_UNAVAILABLE:
+        return {"atomic_points": 0, "signal": "XG_LEAGUE_UNAVAILABLE"}
+
+    fd_league = _XG_LEAGUE_MAP.get(league_name)
     if not fd_league:
         return {"atomic_points": 0, "signal": "XG_LEAGUE_UNKNOWN"}
 
+    # ── Cache-sjekk ──────────────────────────────────────────
+    if conn and match_id:
+        try:
+            cached = await conn.fetchrow("""
+                SELECT xg_data FROM xg_cache
+                WHERE match_id = $1
+                  AND cached_at > NOW() - INTERVAL '6 hours'
+            """, match_id)
+            if cached and cached["xg_data"]:
+                result = dict(json.loads(cached["xg_data"]))
+                result["from_cache"] = True
+                return result
+        except Exception:
+            pass  # Cache miss — fortsett til API
+
+    # ── Rate limit guard ─────────────────────────────────────
+    async with _xg_rate_lock:
+        now_ts = time.time()
+        elapsed = now_ts - _xg_last_call_time
+        if elapsed < 6.0:
+            await asyncio.sleep(6.0 - elapsed)
+        _xg_last_call_time = time.time()
+
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(
                 f"https://api.football-data.org/v4/competitions/{fd_league}/matches",
-                params={"status": "FINISHED", "limit": 10},
+                params={"status": "FINISHED", "limit": 15},
                 headers={"X-Auth-Token": api_key},
             )
+            if resp.status_code == 429:
+                return {"atomic_points": 0, "signal": "XG_RATE_LIMITED"}
             if resp.status_code != 200:
                 return {"atomic_points": 0, "signal": "XG_API_ERROR", "http_status": resp.status_code}
 
             matches = resp.json().get("matches", [])
+
             home_matches = [
                 m for m in matches
-                if home_team.lower() in m.get("homeTeam", {}).get("name", "").lower()
+                if _fuzzy_team_match(home_team, m.get("homeTeam", {}).get("name", ""))
             ]
             away_matches = [
                 m for m in matches
-                if away_team.lower() in m.get("awayTeam", {}).get("name", "").lower()
+                if _fuzzy_team_match(away_team, m.get("awayTeam", {}).get("name", ""))
             ]
 
             if len(home_matches) < 3 or len(away_matches) < 3:
@@ -650,12 +746,12 @@ async def get_xg_divergence(
             home_goals = [
                 m["score"]["fullTime"]["home"]
                 for m in home_matches[:6]
-                if m["score"]["fullTime"]["home"] is not None
+                if m.get("score", {}).get("fullTime", {}).get("home") is not None
             ]
             away_goals = [
                 m["score"]["fullTime"]["away"]
                 for m in away_matches[:6]
-                if m["score"]["fullTime"]["away"] is not None
+                if m.get("score", {}).get("fullTime", {}).get("away") is not None
             ]
 
             if not home_goals or not away_goals:
@@ -673,7 +769,7 @@ async def get_xg_divergence(
                 atomic_points = 0
                 signal = "XG_NEUTRAL"
 
-            return {
+            result = {
                 "home_goals_avg": round(home_avg, 2),
                 "away_goals_avg": round(away_avg, 2),
                 "home_divergence": round(home_div, 2),
@@ -681,7 +777,23 @@ async def get_xg_divergence(
                 "atomic_points": atomic_points,
                 "signal": signal,
                 "matches_used": min(len(home_goals), len(away_goals)),
+                "from_cache": False,
             }
+
+            # ── Lagre i cache ─────────────────────────────────
+            if conn and match_id:
+                try:
+                    await conn.execute("""
+                        INSERT INTO xg_cache (match_id, home_team, away_team, league_name, xg_data)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (match_id) DO UPDATE
+                          SET xg_data = EXCLUDED.xg_data,
+                              cached_at = NOW()
+                    """, match_id, home_team, away_team, league_name, json.dumps(result))
+                except Exception:
+                    pass
+
+            return result
 
     except httpx.TimeoutException:
         return {"atomic_points": 0, "signal": "XG_TIMEOUT", "reason": "football-data.org timeout"}
@@ -1174,7 +1286,9 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                 )
                 xg_result = await get_xg_divergence(
                     m["home_team"], m["away_team"], league["name"],
-                    cfg.FOOTBALL_DATA_API_KEY
+                    cfg.FOOTBALL_DATA_API_KEY,
+                    conn=conn,
+                    match_id=match_id,
                 )
                 atomic_result = calculate_atomic_score(
                     velocity_result, xg_result, soft_edge, soft_ev
@@ -2060,7 +2174,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────
 app = FastAPI(
     title="SesomNod Engine API",
-    version="10.0.0",
+    version="10.0.1",
     lifespan=lifespan,
 )
 
@@ -2078,7 +2192,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "10.0.0-atomic",
+            "version": "10.0.1-atomic",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2091,7 +2205,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.0.0-atomic",
+        "version": "10.0.1-atomic",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -2810,7 +2924,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.0.0-atomic",
+        "version": "10.0.1-atomic",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
