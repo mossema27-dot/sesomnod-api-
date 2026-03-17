@@ -2348,6 +2348,30 @@ async def db_retry():
 
 @app.get("/status")
 async def status():
+    now = datetime.now(timezone.utc)
+
+    # API-kall og siste snapshot fra DB
+    api_calls_month = 0
+    last_snapshot_iso = None
+    last_fetch_ago_sec = None
+    try:
+        if db_state.connected and db_state.pool:
+            async with db_state.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT COUNT(*) AS cnt FROM api_calls "
+                    "WHERE call_date >= DATE_TRUNC('month', CURRENT_DATE)"
+                )
+                api_calls_month = row["cnt"] if row else 0
+
+                snap_row = await conn.fetchrow(
+                    "SELECT MAX(snapshot_time) AS last_snap FROM odds_snapshots"
+                )
+                if snap_row and snap_row["last_snap"]:
+                    last_snapshot_iso = snap_row["last_snap"].isoformat()
+                    last_fetch_ago_sec = round((now - snap_row["last_snap"]).total_seconds())
+    except Exception:
+        pass
+
     return {
         "service": cfg.SERVICE_NAME,
         "version": "9.1.0-clv",
@@ -2363,10 +2387,9 @@ async def status():
         },
         "scanner": {
             "leagues": len(SCAN_LEAGUES),
+            "top4_leagues": len(TOP4_LEAGUES),
             "ev_min": EV_MIN,
-            "ev_min_source": "env" if os.getenv("EV_MIN") else "default",
             "edge_min": EDGE_MIN,
-            "edge_min_source": "env" if os.getenv("EDGE_MIN") else "default",
             "confidence_min": CONFIDENCE_MIN,
             "min_bookmakers": MIN_BOOKMAKERS,
             "odds_min": ODDS_MIN,
@@ -2375,13 +2398,24 @@ async def status():
             "soft_edge_min": SOFT_EDGE_MIN,
             "soft_ev_min": SOFT_EV_MIN,
             "pinnacle_clv_track": PINNACLE_CLV_TRACK,
-            "pinnacle_edge_min": PINNACLE_EDGE_MIN,
             "pinnacle_margin_max": PINNACLE_MARGIN_MAX,
             "daily_post_limit": DAILY_POST_LIMIT,
-            "api_fetches_per_day": 2,
-            "estimated_api_calls_per_month": len(SCAN_LEAGUES) * 2 * 30,
         },
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scheduler": {
+            "windows": [
+                {"name": "early",    "trigger": "07:00 UTC", "leagues": len(SCAN_LEAGUES),  "type": "fetch+analyse"},
+                {"name": "evening",  "trigger": "18:00 UTC", "leagues": len(TOP4_LEAGUES),  "type": "fetch+analyse"},
+                {"name": "prekickoff", "trigger": "20:00 UTC", "leagues": 0, "type": "analyse_cache"},
+            ],
+            "api_budget_monthly": API_MONTHLY_BUDGET,
+            "api_calls_this_month": api_calls_month,
+            "api_calls_remaining": API_MONTHLY_BUDGET - api_calls_month,
+        },
+        "last_fetch": {
+            "snapshot_time": last_snapshot_iso,
+            "last_fetch_ago_sec": last_fetch_ago_sec,
+        },
+        "timestamp": now.isoformat(),
     }
 
 
