@@ -120,6 +120,7 @@ class Config:
     NOTION_TOKEN: str    = _clean("NOTION_TOKEN")
     NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
     NOTION_CHANGELOG_DB_ID: str = _clean("NOTION_CHANGELOG_DB_ID") or "fd23588f-5099-41c4-8292-ddf45b429d34"
+    FOOTBALL_DATA_API_KEY: str = _clean("FOOTBALL_DATA_API_KEY")
     PORT: int            = int(os.getenv("PORT", "8000"))
     ENVIRONMENT: str     = os.getenv("RAILWAY_ENVIRONMENT", "development")
     SERVICE_NAME: str    = os.getenv("RAILWAY_SERVICE_NAME", "sesomnod-api")
@@ -310,6 +311,20 @@ async def ensure_tables(pool: asyncpg.Pool):
                     called_at TIMESTAMPTZ DEFAULT NOW()
                 );
 
+                CREATE TABLE IF NOT EXISTS match_odds_history (
+                    id SERIAL PRIMARY KEY,
+                    match_id TEXT NOT NULL,
+                    league_key TEXT NOT NULL,
+                    home_team TEXT,
+                    away_team TEXT,
+                    market_type VARCHAR(30),
+                    bookmaker VARCHAR(50),
+                    odds FLOAT NOT NULL,
+                    snapshot_time TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_match_odds_hist
+                    ON match_odds_history(match_id, market_type, bookmaker, snapshot_time DESC);
+
                 CREATE TABLE IF NOT EXISTS clv_records (
                     id SERIAL PRIMARY KEY,
                     pick_id INTEGER REFERENCES dagens_kamp(id),
@@ -366,6 +381,18 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS telegram_posted BOOLEAN DEFAULT FALSE;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS scan_session VARCHAR(20);
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS atomic_score INTEGER DEFAULT 0;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_velocity VARCHAR(20);
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_xg_home FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_xg_away FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS xg_divergence_home FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS xg_divergence_away FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signals_triggered JSONB DEFAULT '[]';
+
+                ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS prev_odds FLOAT;
+                ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS odds_delta FLOAT;
+                ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS delta_minutes INTEGER;
+                ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS velocity_type VARCHAR(20) DEFAULT 'UNKNOWN';
             """)
 
             # Indeks for snapshot-oppslag
@@ -457,6 +484,281 @@ async def _log_api_call(conn, window_name: str, league_key: str, status_code: in
 
 
 # ─────────────────────────────────────────────────────────
+# ATOMIC SIGNAL ARCHITECTURE — konstanter
+# ─────────────────────────────────────────────────────────
+ATOMIC_SCORE_MIN         = int(os.getenv("ATOMIC_SCORE_MIN", "3"))
+XG_DIVERGENCE_THRESHOLD  = float(os.getenv("XG_DIVERGENCE_THRESHOLD", "0.6"))
+VELOCITY_SHARP_DELTA     = float(os.getenv("VELOCITY_SHARP_DELTA", "0.10"))
+VELOCITY_SHARP_MINUTES   = int(os.getenv("VELOCITY_SHARP_MINUTES", "60"))
+ATOMIC_MODE              = os.getenv("ATOMIC_MODE", "enabled")
+LEAGUE_AVERAGE_GOALS     = 1.35
+
+
+# ─────────────────────────────────────────────────────────
+# SIGNAL 1: ODDS VELOCITY
+# ─────────────────────────────────────────────────────────
+async def calculate_odds_velocity(
+    conn,
+    match_id: str,
+    current_odds: float,
+    market_type: str,
+    bookmaker: str
+) -> dict:
+    """
+    Beregner odds-bevegelseshastighet fra match_odds_history.
+    Returnerer alltid et resultat — feiler aldri stille.
+    """
+    try:
+        if not conn or not match_id:
+            return {
+                "velocity_type": "NO_HISTORY",
+                "odds_delta": 0.0,
+                "delta_minutes": 0,
+                "atomic_points": 0,
+                "reason": "Ingen conn eller match_id"
+            }
+
+        row = await conn.fetchrow("""
+            SELECT odds, snapshot_time
+            FROM match_odds_history
+            WHERE match_id = $1
+              AND market_type = $2
+              AND bookmaker = $3
+            ORDER BY snapshot_time DESC
+            LIMIT 1
+        """, match_id, market_type, bookmaker)
+
+        if row is None:
+            return {
+                "velocity_type": "NO_HISTORY",
+                "odds_delta": 0.0,
+                "delta_minutes": 0,
+                "atomic_points": 0,
+                "reason": "Første snapshot for denne kampen"
+            }
+
+        prev_odds = float(row["odds"])
+        prev_time = row["snapshot_time"]
+        now_utc = datetime.now(timezone.utc)
+
+        odds_delta = abs(current_odds - prev_odds)
+        delta_seconds = (now_utc - prev_time).total_seconds()
+        delta_minutes = max(1, int(delta_seconds / 60))
+
+        if odds_delta >= VELOCITY_SHARP_DELTA and delta_minutes <= VELOCITY_SHARP_MINUTES:
+            velocity_type = "SHARP_MONEY"
+            atomic_points = 2
+        elif odds_delta >= 0.15 and delta_minutes <= 180:
+            velocity_type = "SHARP_MONEY"
+            atomic_points = 2
+        elif odds_delta >= 0.05 and delta_minutes > 180:
+            velocity_type = "PUBLIC_MONEY"
+            atomic_points = 0
+        elif odds_delta < 0.05:
+            velocity_type = "STABLE"
+            atomic_points = 0
+        else:
+            velocity_type = "NEUTRAL"
+            atomic_points = 0
+
+        return {
+            "velocity_type": velocity_type,
+            "odds_delta": round(odds_delta, 4),
+            "delta_minutes": delta_minutes,
+            "atomic_points": atomic_points,
+            "prev_odds": prev_odds,
+            "current_odds": current_odds
+        }
+
+    except Exception as e:
+        return {
+            "velocity_type": "ERROR",
+            "odds_delta": 0.0,
+            "delta_minutes": 0,
+            "atomic_points": 0,
+            "error": str(e)[:100]
+        }
+
+
+# ─────────────────────────────────────────────────────────
+# SIGNAL 2: xG DIVERGENS
+# ─────────────────────────────────────────────────────────
+async def get_xg_divergence(
+    home_team: str,
+    away_team: str,
+    league_name: str,
+    api_key: str = None
+) -> dict:
+    """
+    Henter xG-proxy data fra football-data.org.
+    Returnerer alltid — feiler aldri stille.
+    Bruker httpx (ikke aiohttp).
+    """
+    if not api_key:
+        return {
+            "home_xg_avg": None,
+            "away_xg_avg": None,
+            "home_divergence": 0.0,
+            "away_divergence": 0.0,
+            "atomic_points": 0,
+            "signal": "XG_UNAVAILABLE",
+            "reason": "Mangler FOOTBALL_DATA_API_KEY"
+        }
+
+    league_map = {
+        "Premier League": "PL",
+        "La Liga": "PD",
+        "Bundesliga": "BL1",
+        "Serie A": "SA",
+        "Ligue 1": "FL1",
+        "Eredivisie": "DED",
+        "Champions League": "CL",
+        "Europa League": "EL",
+    }
+    fd_league = league_map.get(league_name)
+    if not fd_league:
+        return {"atomic_points": 0, "signal": "XG_LEAGUE_UNKNOWN"}
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"https://api.football-data.org/v4/competitions/{fd_league}/matches",
+                params={"status": "FINISHED", "limit": 10},
+                headers={"X-Auth-Token": api_key},
+            )
+            if resp.status_code != 200:
+                return {"atomic_points": 0, "signal": "XG_API_ERROR", "http_status": resp.status_code}
+
+            matches = resp.json().get("matches", [])
+            home_matches = [
+                m for m in matches
+                if home_team.lower() in m.get("homeTeam", {}).get("name", "").lower()
+            ]
+            away_matches = [
+                m for m in matches
+                if away_team.lower() in m.get("awayTeam", {}).get("name", "").lower()
+            ]
+
+            if len(home_matches) < 3 or len(away_matches) < 3:
+                return {
+                    "atomic_points": 0,
+                    "signal": "XG_INSUFFICIENT_DATA",
+                    "home_matches_found": len(home_matches),
+                    "away_matches_found": len(away_matches),
+                }
+
+            home_goals = [
+                m["score"]["fullTime"]["home"]
+                for m in home_matches[:6]
+                if m["score"]["fullTime"]["home"] is not None
+            ]
+            away_goals = [
+                m["score"]["fullTime"]["away"]
+                for m in away_matches[:6]
+                if m["score"]["fullTime"]["away"] is not None
+            ]
+
+            if not home_goals or not away_goals:
+                return {"atomic_points": 0, "signal": "XG_NO_SCORES"}
+
+            home_avg = sum(home_goals) / len(home_goals)
+            away_avg = sum(away_goals) / len(away_goals)
+            home_div = home_avg - LEAGUE_AVERAGE_GOALS
+            away_div = away_avg - LEAGUE_AVERAGE_GOALS
+
+            if abs(home_div) > XG_DIVERGENCE_THRESHOLD or abs(away_div) > XG_DIVERGENCE_THRESHOLD:
+                atomic_points = 2
+                signal = "XG_DIVERGENCE_FOUND"
+            else:
+                atomic_points = 0
+                signal = "XG_NEUTRAL"
+
+            return {
+                "home_goals_avg": round(home_avg, 2),
+                "away_goals_avg": round(away_avg, 2),
+                "home_divergence": round(home_div, 2),
+                "away_divergence": round(away_div, 2),
+                "atomic_points": atomic_points,
+                "signal": signal,
+                "matches_used": min(len(home_goals), len(away_goals)),
+            }
+
+    except httpx.TimeoutException:
+        return {"atomic_points": 0, "signal": "XG_TIMEOUT", "reason": "football-data.org timeout"}
+    except Exception as e:
+        return {"atomic_points": 0, "signal": "XG_ERROR", "error": str(e)[:100]}
+
+
+# ─────────────────────────────────────────────────────────
+# SIGNAL 3: ATOMIC SCORE GATE
+# ─────────────────────────────────────────────────────────
+def calculate_atomic_score(
+    velocity_result: dict,
+    xg_result: dict,
+    soft_edge: float,
+    soft_ev: float
+) -> dict:
+    """
+    Kombinerer alle atomic signals.
+    ALDRI blokkerende — alltid additivt.
+    Gammel gate (SOFT_EDGE_MIN) er alltid siste fallback.
+    """
+    atomic_score = 0
+    signals_triggered = []
+
+    v_points = velocity_result.get("atomic_points", 0)
+    atomic_score += v_points
+    if v_points > 0:
+        signals_triggered.append(velocity_result.get("velocity_type", "VELOCITY"))
+
+    xg_points = xg_result.get("atomic_points", 0)
+    atomic_score += xg_points
+    if xg_points > 0:
+        signals_triggered.append(xg_result.get("signal", "XG"))
+
+    if soft_edge >= 3.5:
+        atomic_score += 2
+        signals_triggered.append("STRONG_EDGE_35PCT")
+    elif soft_edge >= 2.5:
+        atomic_score += 1
+        signals_triggered.append("EDGE_25PCT")
+
+    if soft_ev >= 5.0:
+        atomic_score += 1
+        signals_triggered.append("STRONG_EV_5PCT")
+
+    xg_available = xg_result.get("signal") not in [
+        "XG_UNAVAILABLE", "XG_API_ERROR", "XG_TIMEOUT", "XG_ERROR", "XG_LEAGUE_UNKNOWN"
+    ]
+    velocity_available = velocity_result.get("velocity_type") not in ["NO_HISTORY", "ERROR"]
+
+    if not xg_available and not velocity_available:
+        verdict = "LEGACY_GATE"
+        gate_passed = soft_edge >= float(os.getenv("SOFT_EDGE_MIN", "2.0"))
+    elif atomic_score >= 5:
+        verdict = "ATOMIC_CONFIRMED"
+        gate_passed = True
+    elif atomic_score >= 3:
+        verdict = "ATOMIC_PROBABLE"
+        gate_passed = soft_edge >= 2.5
+    elif atomic_score >= 1:
+        verdict = "WEAK_SIGNAL"
+        gate_passed = soft_edge >= 3.5
+    else:
+        verdict = "NO_SIGNAL"
+        gate_passed = False
+
+    return {
+        "atomic_score": atomic_score,
+        "verdict": verdict,
+        "gate_passed": gate_passed,
+        "signals_triggered": signals_triggered,
+        "xg_available": xg_available,
+        "velocity_available": velocity_available,
+    }
+
+
+# ─────────────────────────────────────────────────────────
 # ODDS CACHING (3-vindu plan)
 # ─────────────────────────────────────────────────────────
 async def fetch_all_odds(leagues: list = None, window_name: str = "early"):
@@ -516,6 +818,34 @@ async def fetch_all_odds(leagues: list = None, window_name: str = "early"):
                         VALUES ($1, $2, $3)
                     """, league["key"], snap_time, json.dumps(data))
 
+                    # Populer match_odds_history for velocity-beregning
+                    for m in data:
+                        match_id = m.get("id", "")
+                        if not match_id:
+                            continue
+                        for bk in m.get("bookmakers", []):
+                            bk_key = bk.get("key", "")
+                            for mkt in bk.get("markets", []):
+                                mkt_key = mkt.get("key", "")
+                                if mkt_key not in ("h2h", "totals"):
+                                    continue
+                                for outcome in mkt.get("outcomes", []):
+                                    price = outcome.get("price")
+                                    if not price:
+                                        continue
+                                    label = outcome.get("name", "")
+                                    point = outcome.get("point")
+                                    market_label = mkt_key if not point else f"{mkt_key}_{point}"
+                                    await conn.execute("""
+                                        INSERT INTO match_odds_history
+                                            (match_id, league_key, home_team, away_team,
+                                             market_type, bookmaker, odds, snapshot_time)
+                                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                                    """, match_id, league["key"],
+                                        m.get("home_team"), m.get("away_team"),
+                                        f"{market_label}_{label}", bk_key,
+                                        float(price), snap_time)
+
                 saved += 1
                 logger.info(f"[OddsCache] {league['name']}: {len(data)} kamper lagret")
 
@@ -553,11 +883,12 @@ def _pinnacle_no_vig(h_odds: float, d_odds: float, a_odds: float):
     return p_h, p_d, p_a, margin_pct
 
 
-async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
+async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=None) -> list:
     """
     Analyserer en liste med kamper fra snapshot.
     Bruker Pinnacle som sharp reference.
     SCORE = EV_pct × log(bookmaker_count + 1)
+    Atomic signals (velocity + xG) er ADDITIVE — aldri blokkerende.
     """
     candidates = []
     league_pick_count = 0
@@ -818,25 +1149,37 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                         ))
 
             # ── Evaluerings-loop: BENCHMARK (soft book) som EV/edge-referanse ─
+            match_id = m.get("id", "")
+
             for soft_model_prob, target_odds, pick_label, market_type, pin_ref_odds in outcomes_to_check:
                 if match_pick_count >= MAX_PICKS_PER_MATCH:
                     break
 
                 target_prob = 1 / target_odds
-                # EV: benchmark no-vig prob × beste andre soft-book odds
                 soft_ev   = round((soft_model_prob * target_odds - 1) * 100, 2)
-                # Edge: benchmark no-vig prob − target implied prob
                 soft_edge = round((soft_model_prob - target_prob) * 100, 2)
-                # Benchmark fair odds (for logging)
                 soft_fair = round(1 / soft_model_prob, 3) if soft_model_prob > 0 else None
 
-                # Dual Benchmark gate
+                # Dual Benchmark gate (legacy — alltid aktiv)
                 if soft_ev < SOFT_EV_MIN:
                     continue
                 if soft_edge < SOFT_EDGE_MIN:
                     continue
                 if 75 < CONFIDENCE_MIN:
                     continue
+
+                # ── Atomic Signals (ADDITIVE — aldri blokkerende) ────────────
+                velocity_result = await calculate_odds_velocity(
+                    conn, match_id, target_odds, market_type, BENCHMARK
+                )
+                xg_result = await get_xg_divergence(
+                    m["home_team"], m["away_team"], league["name"],
+                    cfg.FOOTBALL_DATA_API_KEY
+                )
+                atomic_result = calculate_atomic_score(
+                    velocity_result, xg_result, soft_edge, soft_ev
+                )
+                # ────────────────────────────────────────────────────────────
 
                 # Pinnacle CLV referanse
                 pinnacle_clv = None
@@ -852,6 +1195,7 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     "league_flag": league["flag"],
                     "home_team": m["home_team"],
                     "away_team": m["away_team"],
+                    "match_id": match_id,
                     "commence_time": m["commence_time"],
                     "hours_to_kickoff": round(hours, 1),
                     "pick": pick_label,
@@ -873,6 +1217,15 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime) -> list:
                     "pinnacle_opening": round(pin_ref_odds, 2) if pin_ref_odds else None,
                     "pinnacle_fair_odds": soft_fair,
                     "pinnacle_margin": round(pin_margin, 2) if pin_margin else None,
+                    # Atomic Signal fields
+                    "atomic_score": atomic_result["atomic_score"],
+                    "atomic_verdict": atomic_result["verdict"],
+                    "atomic_gate_passed": atomic_result["gate_passed"],
+                    "signals_triggered": atomic_result["signals_triggered"],
+                    "signal_velocity": velocity_result.get("velocity_type"),
+                    "signal_xg": xg_result.get("signal"),
+                    "xg_divergence_home": xg_result.get("home_divergence"),
+                    "xg_divergence_away": xg_result.get("away_divergence"),
                 })
                 match_pick_count += 1
                 league_pick_count += 1
@@ -915,7 +1268,7 @@ async def run_analysis():
 
                 matches = json.loads(row["data"])
                 total_scanned += len(matches)
-                picks = await _analyse_snapshot(league, matches, now)
+                picks = await _analyse_snapshot(league, matches, now, conn=conn)
                 candidates.extend(picks)
 
             except Exception as e:
@@ -1166,7 +1519,7 @@ async def pre_kickoff_check():
             reason_text  = "Ingen picks kvalifiserte (EV < 3%)"
 
             try:
-                picks = await _analyse_snapshot(league, [m], now)
+                picks = await _analyse_snapshot(league, [m], now, conn=None)
 
                 if picks:
                     best = picks[0]
@@ -1220,7 +1573,7 @@ async def pre_kickoff_check():
                                 logger.info(f"[PreKickoff] Postet til Telegram: {best['pick']} — {m['home_team']} vs {m['away_team']}")
                 else:
                     picks_ev = []
-                    all_raw = await _analyse_snapshot(league, [m], now)
+                    all_raw = await _analyse_snapshot(league, [m], now, conn=None)
                     reason_text = "EV < 3% mot Pinnacle fair odds for alle outcomes"
 
             except Exception as e:
@@ -1707,7 +2060,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────
 app = FastAPI(
     title="SesomNod Engine API",
-    version="9.1.1",
+    version="10.0.0",
     lifespan=lifespan,
 )
 
@@ -1725,7 +2078,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "9.1.1-clv",
+            "version": "10.0.0-atomic",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1738,7 +2091,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "9.1.1-clv",
+        "version": "10.0.0-atomic",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -1840,7 +2193,7 @@ async def scan_alle_kamper():
                     continue
                 matches = json.loads(row["data"])
                 total_scanned += len(matches)
-                picks = await _analyse_snapshot(league, matches, now)
+                picks = await _analyse_snapshot(league, matches, now, conn=conn)
                 candidates.extend(picks)
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -1956,7 +2309,7 @@ async def trigger_run_analysis():
                     continue
                 matches = json.loads(row["data"])
                 total_scanned += len(matches)
-                picks = await _analyse_snapshot(league, matches, now)
+                picks = await _analyse_snapshot(league, matches, now, conn=conn)
                 candidates.extend(picks)
             except Exception as e:
                 logger.warning(f"[API/run-analysis] {league['key']}: {e}")
@@ -2457,7 +2810,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "9.1.1-clv",
+        "version": "10.0.0-atomic",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
@@ -2493,6 +2846,16 @@ async def status():
             "api_budget_monthly": API_MONTHLY_BUDGET,
             "api_calls_this_month": api_calls_month,
             "api_calls_remaining": API_MONTHLY_BUDGET - api_calls_month,
+        },
+        "atomic": {
+            "mode": ATOMIC_MODE,
+            "atomic_score_min": ATOMIC_SCORE_MIN,
+            "xg_divergence_threshold": XG_DIVERGENCE_THRESHOLD,
+            "velocity_sharp_delta": VELOCITY_SHARP_DELTA,
+            "velocity_sharp_minutes": VELOCITY_SHARP_MINUTES,
+            "football_data_api_set": bool(cfg.FOOTBALL_DATA_API_KEY),
+            "xg_status": "XG_PENDING_API_KEY" if not cfg.FOOTBALL_DATA_API_KEY else "XG_ACTIVE",
+            "velocity_status": "VELOCITY_LOGGING_MODE",
         },
         "last_fetch": {
             "snapshot_time": last_snapshot_iso,
