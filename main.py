@@ -128,6 +128,36 @@ cfg = Config()
 
 
 # ─────────────────────────────────────────────────────────
+# NO-BET MELDINGER (Operational Order #001)
+# ─────────────────────────────────────────────────────────
+NO_BET_MARKET_MOVED = (
+    "No pick. "
+    "Pinnacle 2.10→1.95. Unibet 2.10 (lagging). "
+    "Edge removed by market movement. "
+    "No advantage remains. "
+    "Discipline = profit. Next scan: 18:00"
+)
+
+NO_BET_LOW_EDGE = (
+    "No pick. "
+    "Model probability: 52%. "
+    "Required threshold: 55%. "
+    "No positive EV detected. "
+    "Capital preserved. "
+    "Waiting for qualified opportunity."
+)
+
+NO_BET_HIGH_VARIANCE = (
+    "No pick. "
+    "Key variables unresolved. "
+    "Lineups not confirmed. "
+    "Variance exceeds acceptable risk. "
+    "Kelly discipline enforced. "
+    "Standby for next signal."
+)
+
+
+# ─────────────────────────────────────────────────────────
 # DATABASE STATE
 # ─────────────────────────────────────────────────────────
 class DBState:
@@ -333,6 +363,9 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS benchmark_book VARCHAR(50) DEFAULT 'unibet';
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS clv_reference_book VARCHAR(50) DEFAULT 'pinnacle';
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS clv_missing BOOLEAN DEFAULT false;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS telegram_posted BOOLEAN DEFAULT FALSE;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS scan_session VARCHAR(20);
             """)
 
             # Indeks for snapshot-oppslag
@@ -1674,7 +1707,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────
 app = FastAPI(
     title="SesomNod Engine API",
-    version="9.1.0",
+    version="9.1.1",
     lifespan=lifespan,
 )
 
@@ -1692,7 +1725,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "9.1.0-clv",
+            "version": "9.1.1-clv",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1705,7 +1738,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "9.1.0-clv",
+        "version": "9.1.1-clv",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -2333,6 +2366,56 @@ async def add_pick(payload: dict):
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
 
 
+@app.get("/db-schema")
+async def db_schema(table: str = "picks"):
+    """Viser alle kolonner i en tabell — brukes til å verifisere migrasjoner."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT column_name, data_type, column_default, is_nullable
+                FROM information_schema.columns
+                WHERE table_name = $1
+                ORDER BY column_name
+            """, table)
+            cols = [dict(r) for r in rows]
+            names = [r["column_name"] for r in cols]
+
+            # Picks-spesifikk sjekk
+            check = {}
+            if table == "picks":
+                check = {
+                    "telegram_posted": "telegram_posted" in names,
+                    "posted_at": "posted_at" in names,
+                    "scan_session": "scan_session" in names,
+                    "soft_edge": "soft_edge" in names,
+                    "soft_ev": "soft_ev" in names,
+                }
+
+            # Teller poster
+            count_row = await conn.fetchrow(f"SELECT COUNT(*) AS total FROM {table}")
+            total = count_row["total"] if count_row else 0
+
+            posted_count = None
+            if table == "picks" and "telegram_posted" in names:
+                p = await conn.fetchrow(
+                    "SELECT SUM(CASE WHEN telegram_posted THEN 1 ELSE 0 END) AS posted FROM picks"
+                )
+                posted_count = p["posted"] if p else 0
+
+        return {
+            "table": table,
+            "column_count": len(cols),
+            "columns": cols,
+            "check": check,
+            "total_rows": total,
+            "telegram_posted_rows": posted_count,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
 @app.get("/db/retry")
 async def db_retry():
     logger.info("[DB] Manuell retry...")
@@ -2374,7 +2457,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "9.1.0-clv",
+        "version": "9.1.1-clv",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
