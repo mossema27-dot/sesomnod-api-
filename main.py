@@ -67,7 +67,7 @@ SCAN_LEAGUES = [
     {"key": "soccer_germany_bundesliga",      "name": "Bundesliga",       "flag": "🇩🇪"},
     {"key": "soccer_italy_serie_a",           "name": "Serie A",          "flag": "🇮🇹"},
     {"key": "soccer_france_ligue_one",        "name": "Ligue 1",          "flag": "🇫🇷"},
-    {"key": "soccer_uefa_champions_league",   "name": "Champions League", "flag": "🏆"},
+    {"key": "soccer_uefa_champs_league",   "name": "Champions League", "flag": "🏆"},
     {"key": "soccer_uefa_europa_league",      "name": "Europa League",    "flag": "🇪🇺"},
     {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
 ]
@@ -77,7 +77,7 @@ TOP4_LEAGUES = [
     {"key": "soccer_epl",                    "name": "Premier League",   "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
     {"key": "soccer_spain_la_liga",           "name": "La Liga",          "flag": "🇪🇸"},
     {"key": "soccer_germany_bundesliga",      "name": "Bundesliga",       "flag": "🇩🇪"},
-    {"key": "soccer_uefa_champions_league",   "name": "Champions League", "flag": "🏆"},
+    {"key": "soccer_uefa_champs_league",   "name": "Champions League", "flag": "🏆"},
 ]
 
 # API-budsjett: 500 credits/mnd — 3-vindu plan: 8+4 calls/dag × 30 = 360/mnd
@@ -1130,6 +1130,58 @@ async def get_scoring_streak(
     except Exception as e:
         logger.warning(f"[StreakSignal] Feil: {e}")
         return {"streak_signal": "ERROR", "atomic_points": 0, "error": str(e)[:100]}
+
+
+# ─────────────────────────────────────────────────────────
+# UCL FIXTURE FALLBACK (football-data.org)
+# ─────────────────────────────────────────────────────────
+async def fetch_ucl_fixtures_football_data() -> list:
+    """
+    Henter UCL-kamper fra football-data.org (fixture-data, ingen odds).
+    Brukes som supplement til Odds API for metadata og xG-enrichment.
+    Returnerer liste kompatibel med _analyse_snapshot-format.
+    """
+    from datetime import timedelta
+    fd_key = cfg.FOOTBALL_DATA_API_KEY if cfg else os.getenv("FOOTBALL_DATA_API_KEY", "")
+    if not fd_key:
+        logger.warning("[UCL-Fixture] FOOTBALL_DATA_API_KEY mangler")
+        return []
+    today = datetime.now(timezone.utc).date()
+    date_from = today.strftime("%Y-%m-%d")
+    date_to = (today + timedelta(days=4)).strftime("%Y-%m-%d")
+    try:
+        if football_limiter:
+            await football_limiter.acquire()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.football-data.org/v4/competitions/CL/matches",
+                params={"dateFrom": date_from, "dateTo": date_to, "status": "SCHEDULED"},
+                headers={"X-Auth-Token": fd_key},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"[UCL-Fixture] football-data.org feilet: {resp.status_code}")
+            return []
+        matches = resp.json().get("matches", [])
+        logger.info(f"[UCL-Fixture] {len(matches)} UCL-kamper fra football-data.org")
+        result = []
+        for m in matches:
+            home = m.get("homeTeam", {}).get("name")
+            away = m.get("awayTeam", {}).get("name")
+            if not home or not away:
+                continue
+            result.append({
+                "id": f"fd_{m.get('id')}",
+                "home_team": home,
+                "away_team": away,
+                "commence_time": m.get("utcDate", ""),
+                "bookmakers": [],  # Ingen odds fra fd.org
+                "fd_match_id": m.get("id"),
+                "source": "football-data.org",
+            })
+        return result
+    except Exception as e:
+        logger.error(f"[UCL-Fixture] Exception: {e}")
+        return []
 
 
 # ─────────────────────────────────────────────────────────
