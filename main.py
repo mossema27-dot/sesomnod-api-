@@ -3447,6 +3447,50 @@ async def admin_backfill_picks_v2():
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.post("/admin/picks-rollback")
+async def admin_picks_rollback():
+    """
+    Rollback: picks → picks_v2_failed, picks_v1_backup → picks.
+    Brukes hvis picks-switch brøt eksisterende endpoints.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Sjekk at backup eksisterer
+            has_backup = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM information_schema.tables "
+                "WHERE table_name = 'picks_v1_backup')"
+            )
+            if not has_backup:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "picks_v1_backup finnes ikke — rollback ikke mulig"}
+                )
+
+            count_before = await conn.fetchval("SELECT COUNT(*) FROM picks")
+            backup_count = await conn.fetchval("SELECT COUNT(*) FROM picks_v1_backup")
+
+            await conn.execute("""
+                ALTER TABLE picks RENAME TO picks_v2_failed;
+                ALTER TABLE picks_v1_backup RENAME TO picks;
+            """)
+
+            count_after = await conn.fetchval("SELECT COUNT(*) FROM picks")
+
+        logger.info(f"[Admin] Rollback fullført: picks_v1_backup → picks ({count_after} rader)")
+        return {
+            "status": "ROLLBACK_OK",
+            "picks_count_after": count_after,
+            "picks_v2_failed": "bevart for analyse",
+            "backup_count": backup_count,
+        }
+    except Exception as e:
+        logger.error(f"[Admin] picks-rollback feilet: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/picks-switch")
 async def admin_picks_switch():
     """
