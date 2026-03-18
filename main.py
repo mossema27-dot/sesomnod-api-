@@ -597,6 +597,12 @@ async def ensure_tables(pool: asyncpg.Pool):
                 EXECUTE FUNCTION sync_picks_to_v2();
             """)
 
+            # FASE A-2b: Legg til timestamp hvis mangler (idempotent)
+            await conn.execute("""
+                ALTER TABLE picks_v2
+                ADD COLUMN IF NOT EXISTS timestamp TIMESTAMPTZ DEFAULT NOW();
+            """)
+
         # FASE A-4: Indexes CONCURRENTLY (utenfor transaksjon)
         async with pool.acquire() as conn:
             await conn.execute(
@@ -2637,7 +2643,7 @@ async def get_picks():
     try:
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM picks ORDER BY COALESCE(created_at, timestamp) DESC LIMIT 100"
+                "SELECT * FROM picks ORDER BY id DESC LIMIT 100"
             )
         return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
@@ -3387,6 +3393,26 @@ async def status():
         },
         "timestamp": now.isoformat(),
     }
+
+
+@app.post("/admin/fix-picks-v2-schema")
+async def admin_fix_picks_v2_schema():
+    """Legger til manglende kolonner i picks_v2 (idempotent)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                ALTER TABLE picks_v2
+                ADD COLUMN IF NOT EXISTS timestamp TIMESTAMPTZ DEFAULT NOW();
+            """)
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'picks_v2' ORDER BY column_name"
+            )
+        return {"status": "OK", "picks_v2_columns": [r["column_name"] for r in cols]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
 @app.post("/admin/backfill-picks-v2")
