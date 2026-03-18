@@ -139,6 +139,21 @@ except Exception as _sig_err:
     RefereeSignal = None
     _SIGNALS_AVAILABLE = False
 
+# Core-moduler — aldri blokkerende ved import-feil
+try:
+    from core.kelly_engine import kelly_engine as _kelly_engine
+    from core.rate_limiter import football_limiter, weather_limiter
+    from core.circuit_breaker import referee_breaker, weather_breaker
+    _CORE_AVAILABLE = True
+except Exception as _core_err:
+    logger.warning(f"[Core] Import feilet: {_core_err} — fallback brukes")
+    _kelly_engine = None
+    football_limiter = None
+    weather_limiter = None
+    referee_breaker = None
+    weather_breaker = None
+    _CORE_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────
 # NO-BET MELDINGER (Operational Order #001)
@@ -441,7 +456,167 @@ async def ensure_tables(pool: asyncpg.Pool):
                 CREATE INDEX IF NOT EXISTS idx_dagens_kamp_kickoff ON dagens_kamp(kickoff);
             """)
 
-        logger.info("[DB] Tabeller OK")
+            # ── FASE A: Zero-downtime picks_v2 shadow table ───────────────
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS picks_v2 (
+                    id BIGSERIAL PRIMARY KEY,
+                    match_name VARCHAR(255),
+                    home_team VARCHAR(100),
+                    away_team VARCHAR(100),
+                    league VARCHAR(50),
+                    kickoff_time TIMESTAMPTZ,
+                    odds DECIMAL(5,2),
+                    soft_edge DECIMAL(5,2),
+                    soft_ev DECIMAL(5,2),
+                    soft_book VARCHAR(50),
+                    pinnacle_clv DECIMAL(5,2),
+                    atomic_score INTEGER DEFAULT 0,
+                    signals_triggered JSONB DEFAULT '[]',
+                    signal_velocity VARCHAR(20),
+                    signal_xg_home FLOAT,
+                    signal_xg_away FLOAT,
+                    signal_weather VARCHAR(20),
+                    weather_market_impact VARCHAR(30),
+                    wind_speed FLOAT,
+                    temperature FLOAT,
+                    signal_referee VARCHAR(30),
+                    referee_name VARCHAR(100),
+                    referee_cards_avg FLOAT,
+                    referee_home_bias FLOAT,
+                    referee_matches_count INTEGER DEFAULT 0,
+                    result VARCHAR(10),
+                    telegram_posted BOOLEAN DEFAULT FALSE,
+                    posted_at TIMESTAMPTZ,
+                    scan_session VARCHAR(20),
+                    benchmark_book VARCHAR(50),
+                    clv_reference_book VARCHAR(50),
+                    clv_missing BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    tier VARCHAR(20) NOT NULL DEFAULT 'MONITORED',
+                    tier_label VARCHAR(50) NOT NULL DEFAULT '📊 MONITORED',
+                    kelly_multiplier DECIMAL(3,2) NOT NULL DEFAULT 0.00,
+                    kelly_stake DECIMAL(6,2) NOT NULL DEFAULT 0.00,
+                    CONSTRAINT chk_tier_values
+                        CHECK (tier IN ('ATOMIC', 'EDGE', 'MONITORED')),
+                    CONSTRAINT chk_kelly_positive
+                        CHECK (kelly_stake >= 0),
+                    CONSTRAINT chk_kelly_max
+                        CHECK (kelly_stake <= 5.00),
+                    CONSTRAINT chk_atomic_score
+                        CHECK (atomic_score BETWEEN 0 AND 9)
+                );
+            """)
+
+            # FASE A-2: Backfill historiske data (idempotent via ON CONFLICT)
+            await conn.execute("""
+                INSERT INTO picks_v2 (
+                    id, match_name, home_team, away_team, league,
+                    kickoff_time, odds, soft_edge, soft_ev, soft_book,
+                    pinnacle_clv, atomic_score, signals_triggered,
+                    result, telegram_posted, posted_at, scan_session,
+                    benchmark_book, clv_reference_book, clv_missing,
+                    created_at, tier, tier_label, kelly_multiplier, kelly_stake
+                )
+                SELECT
+                    id,
+                    COALESCE(match, ''),
+                    COALESCE(home_team, ''),
+                    COALESCE(away_team, ''),
+                    COALESCE(league, ''),
+                    NULL,
+                    odds,
+                    soft_edge,
+                    soft_ev,
+                    soft_book,
+                    pinnacle_clv,
+                    COALESCE(atomic_score, 0),
+                    COALESCE(signals_triggered, '[]'),
+                    result,
+                    COALESCE(telegram_posted, FALSE),
+                    posted_at,
+                    scan_session,
+                    benchmark_book,
+                    clv_reference_book,
+                    COALESCE(clv_missing, FALSE),
+                    COALESCE(timestamp, NOW()),
+                    'MONITORED',
+                    '📊 MONITORED',
+                    0.00,
+                    0.00
+                FROM picks
+                ORDER BY id
+                ON CONFLICT (id) DO NOTHING;
+            """)
+
+            # FASE A-3: Sync trigger (ny picks → picks_v2 automatisk)
+            await conn.execute("""
+                CREATE OR REPLACE FUNCTION sync_picks_to_v2()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    INSERT INTO picks_v2 (
+                        id, match_name, home_team, away_team, league,
+                        odds, soft_edge, soft_ev, soft_book, pinnacle_clv,
+                        atomic_score, signals_triggered,
+                        result, telegram_posted, posted_at, created_at,
+                        tier, tier_label, kelly_multiplier, kelly_stake
+                    ) VALUES (
+                        NEW.id,
+                        COALESCE(NEW.match, ''),
+                        COALESCE(NEW.home_team, ''),
+                        COALESCE(NEW.away_team, ''),
+                        COALESCE(NEW.league, ''),
+                        NEW.odds,
+                        NEW.soft_edge,
+                        NEW.soft_ev,
+                        NEW.soft_book,
+                        NEW.pinnacle_clv,
+                        COALESCE(NEW.atomic_score, 0),
+                        COALESCE(NEW.signals_triggered, '[]'),
+                        NEW.result,
+                        COALESCE(NEW.telegram_posted, FALSE),
+                        NEW.posted_at,
+                        COALESCE(NEW.timestamp, NOW()),
+                        COALESCE(NEW.tier, 'MONITORED'),
+                        COALESCE(NEW.tier_label, '📊 MONITORED'),
+                        0.00,
+                        COALESCE(NEW.kelly_stake, 0.00)
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        result = EXCLUDED.result,
+                        telegram_posted = EXCLUDED.telegram_posted,
+                        updated_at = NOW();
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                DROP TRIGGER IF EXISTS picks_sync_trigger ON picks;
+                CREATE TRIGGER picks_sync_trigger
+                AFTER INSERT OR UPDATE ON picks
+                FOR EACH ROW
+                EXECUTE FUNCTION sync_picks_to_v2();
+            """)
+
+        # FASE A-4: Indexes CONCURRENTLY (utenfor transaksjon)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_picks_v2_tier "
+                "ON picks_v2(tier)"
+            )
+            await conn.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_picks_v2_created "
+                "ON picks_v2(created_at DESC)"
+            )
+            await conn.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_picks_v2_telegram "
+                "ON picks_v2(telegram_posted) WHERE telegram_posted = TRUE"
+            )
+            await conn.execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_picks_v2_atomic "
+                "ON picks_v2(atomic_score) WHERE atomic_score >= 3"
+            )
+
+        logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
         logger.warning(f"[DB] Tabell-feil: {e}")
 
@@ -1397,16 +1572,21 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                 velocity_result = await calculate_odds_velocity(
                     conn, match_id, target_odds, market_type, BENCHMARK
                 )
+                # xG — rate-limited (football_limiter)
+                if football_limiter:
+                    await football_limiter.acquire()
                 xg_result = await get_xg_divergence(
                     m["home_team"], m["away_team"], league["name"],
                     cfg.FOOTBALL_DATA_API_KEY,
                     conn=conn,
                     match_id=match_id,
                 )
-                # Signal 3 — Weather
+                # Signal 3 — Weather (rate-limited + circuit breaker)
                 weather_result = {"signal": "WEATHER_UNAVAILABLE", "atomic_points": 0}
                 if WeatherSignal and cfg.OPENWEATHER_API_KEY:
                     try:
+                        if weather_limiter:
+                            await weather_limiter.acquire()
                         kickoff_dt = datetime.fromisoformat(
                             m["commence_time"].replace("Z", "+00:00")
                         )
@@ -1415,14 +1595,26 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     except Exception as _we:
                         logger.warning(f"[WeatherSignal] Exception: {_we}")
 
-                # Signal 4 — Referee
+                # Signal 4 — Referee (rate-limited + circuit breaker)
                 referee_result = {"signal": "REFEREE_UNAVAILABLE", "atomic_points": 0}
                 if RefereeSignal and cfg.FOOTBALL_DATA_API_KEY:
                     try:
-                        async with RefereeSignal(cfg.FOOTBALL_DATA_API_KEY) as rs:
-                            referee_result = await rs.get_signal(
-                                m["home_team"], m["away_team"], league["name"]
-                            )
+                        if football_limiter:
+                            await football_limiter.acquire()
+                        _ref_fallback = {"signal": "REFEREE_UNAVAILABLE", "atomic_points": 0}
+                        if referee_breaker:
+                            @referee_breaker.protect(fallback=_ref_fallback)
+                            async def _get_referee():
+                                async with RefereeSignal(cfg.FOOTBALL_DATA_API_KEY) as rs:
+                                    return await rs.get_signal(
+                                        m["home_team"], m["away_team"], league["name"]
+                                    )
+                            referee_result = await _get_referee()
+                        else:
+                            async with RefereeSignal(cfg.FOOTBALL_DATA_API_KEY) as rs:
+                                referee_result = await rs.get_signal(
+                                    m["home_team"], m["away_team"], league["name"]
+                                )
                     except Exception as _re:
                         logger.warning(f"[RefereeSignal] Exception: {_re}")
 
@@ -1483,11 +1675,13 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     "referee_name": referee_result.get("referee_name"),
                     "wind_speed": weather_result.get("wind_ms"),
                     "temperature": weather_result.get("temperature_c"),
-                    # Tier + Kelly
+                    # Tier + Kelly (Decimal engine hvis tilgjengelig)
                     "tier": atomic_result["tier"],
                     "tier_label": atomic_result["tier_label"],
                     "kelly_multiplier": atomic_result["kelly_multiplier"],
-                    "kelly_stake": calculate_kelly_stake(
+                    "kelly_stake": float(
+                        _kelly_engine.calculate(soft_edge, target_odds, atomic_result["tier"]).stake_units
+                    ) if _kelly_engine else calculate_kelly_stake(
                         soft_edge, target_odds, tier=atomic_result["tier"]
                     ),
                     "post_telegram": atomic_result["post_telegram"],
@@ -2146,41 +2340,56 @@ def _format_pick_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> s
 
 
 # ─────────────────────────────────────────────────────────
-# TIER TELEGRAM FORMATTER
+# TIER TELEGRAM FORMATTER (UTF-16 safe, zoneinfo CET/CEST)
 # ─────────────────────────────────────────────────────────
 def format_telegram_pick(pick: dict) -> str:
     """
     Formaterer Telegram-melding.
-    Garantert ≤200 tegn.
+    Telegram teller Unicode codepoints, ikke bytes.
+    Garantert ≤200 codepoints.
     Trunkerer lagnavn til 12 tegn.
     """
-    home = pick["home_team"][:12]
-    away = pick["away_team"][:12]
-    edge = round(float(pick["soft_edge"]), 1)
-    score = pick["atomic_score"]
-    odds = pick["odds"]
-    kelly = pick["kelly_stake"]
-    kickoff_raw = pick.get("kickoff_time") or pick.get("commence_time", "")
-    time_str = kickoff_raw[:5] if kickoff_raw else "--:--"
-    tier_label = pick["tier_label"]
+    home = str(pick.get("home_team", ""))[:12]
+    away = str(pick.get("away_team", ""))[:12]
+    edge = round(float(pick.get("soft_edge", 0)), 1)
+    score = pick.get("atomic_score", 0)
+    odds = pick.get("odds", 0)
+    kelly = pick.get("kelly_stake", 0)
+    tier = pick.get("tier", "MONITORED")
 
-    if pick["tier"] == "ATOMIC":
+    # Timezone-korrekt CET/CEST
+    try:
+        import zoneinfo
+        kickoff_raw = pick.get("kickoff_time") or pick.get("commence_time", "")
+        tz = zoneinfo.ZoneInfo("Europe/Oslo")
+        dt = datetime.fromisoformat(str(kickoff_raw).replace("Z", "+00:00"))
+        dt_local = dt.astimezone(tz)
+        time_str = dt_local.strftime("%H:%M")
+        tz_name = "CET" if dt_local.utcoffset().seconds == 3600 else "CEST"
+    except Exception:
+        kickoff_raw = pick.get("kickoff_time") or pick.get("commence_time", "")
+        time_str = str(kickoff_raw)[:5] if kickoff_raw else "--:--"
+        tz_name = "UTC"
+
+    if tier == "ATOMIC":
         msg = (
             f"⚡ ATOMIC | {home} v {away} | "
-            f"+{edge}% edge | {score}/9 signals | "
+            f"+{edge}% | {score}/9 signals | "
             f"BACK @{odds} ({kelly}u) | "
-            f"{time_str} CET"
+            f"{time_str} {tz_name}"
         )
     else:
         msg = (
             f"🎯 EDGE | {home} v {away} | "
-            f"+{edge}% edge | {score}/9 signals | "
+            f"+{edge}% | {score}/9 signals | "
             f"BACK @{odds} ({kelly}u) | "
-            f"{time_str} CET"
+            f"{time_str} {tz_name}"
         )
 
-    # Garantert ≤200 tegn
-    return msg[:200]
+    # Trunker til 200 Unicode codepoints (ikke bytes)
+    if len(msg) > 200:
+        msg = msg[:197] + "..."
+    return msg
 
 
 # ─────────────────────────────────────────────────────────
@@ -2387,7 +2596,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "10.1.1-atomic",
+            "version": "10.1.1-ZD",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2400,7 +2609,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.1.1-atomic",
+        "version": "10.1.1-ZD",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -3119,7 +3328,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.1.1-atomic",
+        "version": "10.1.1-ZD",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
@@ -3176,6 +3385,87 @@ async def status():
         },
         "timestamp": now.isoformat(),
     }
+
+
+@app.post("/admin/picks-switch")
+async def admin_picks_switch():
+    """
+    FASE F: Atomic table switch — picks_v2 → picks.
+    KUN kall etter at picks_v2 backfill er verifisert (old == new).
+    Rollback automatisk ved feil.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Verifiser old == new FØR switch
+            counts = await conn.fetchrow("""
+                SELECT
+                    (SELECT COUNT(*) FROM picks) as old_count,
+                    (SELECT COUNT(*) FROM picks_v2) as new_count
+            """)
+            old_count = counts["old_count"]
+            new_count = counts["new_count"]
+
+            if old_count != new_count:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "Count mismatch — switch avbrutt",
+                        "old_picks": old_count,
+                        "new_picks_v2": new_count,
+                        "diff": abs(old_count - new_count),
+                    }
+                )
+
+            # Atomisk switch
+            await conn.execute("""
+                BEGIN;
+                ALTER TABLE picks RENAME TO picks_v1_backup;
+                ALTER TABLE picks_v2 RENAME TO picks;
+                DROP TRIGGER IF EXISTS picks_sync_trigger ON picks_v1_backup;
+                COMMIT;
+            """)
+
+            # Verifiser
+            final_count = await conn.fetchval("SELECT COUNT(*) FROM picks")
+
+        logger.info(f"[Admin] picks_v2 → picks switch fullført. {final_count} rader.")
+        return {
+            "status": "SWITCHED",
+            "picks_count": final_count,
+            "picks_v1_backup": "bevart",
+            "old_count_before_switch": old_count,
+        }
+
+    except Exception as e:
+        logger.error(f"[Admin] picks-switch feilet: {e}")
+        # Rollback: sjekk om vi trenger å gjenopprette
+        try:
+            async with db_state.pool.acquire() as conn:
+                has_backup = await conn.fetchval(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables "
+                    "WHERE table_name = 'picks_v1_backup')"
+                )
+                has_picks = await conn.fetchval(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables "
+                    "WHERE table_name = 'picks')"
+                )
+                if has_backup and not has_picks:
+                    await conn.execute("""
+                        BEGIN;
+                        ALTER TABLE picks_v1_backup RENAME TO picks;
+                        COMMIT;
+                    """)
+                    logger.warning("[Admin] Rollback fullført — picks_v1_backup → picks")
+        except Exception as rb_err:
+            logger.error(f"[Admin] Rollback feilet: {rb_err}")
+
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)[:200], "rollback": "forsøkt"}
+        )
 
 
 @app.exception_handler(Exception)
