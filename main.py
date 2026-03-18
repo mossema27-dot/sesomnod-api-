@@ -3654,6 +3654,63 @@ async def admin_test_streak(
     }
 
 
+@app.post("/admin/fix-null-teams")
+async def admin_fix_null_teams():
+    """STEG 2 — Fiks NULL home_team/away_team fra match_name."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    async with db_state.pool.acquire() as conn:
+        null_picks_before = await conn.fetchval("""
+            SELECT COUNT(*) FROM picks
+            WHERE (home_team IS NULL OR home_team = '')
+            AND match_name LIKE '% vs %'
+        """)
+        null_dk_before = await conn.fetchval("""
+            SELECT COUNT(*) FROM dagens_kamp
+            WHERE (home_team IS NULL OR home_team = '')
+            AND match LIKE '% vs %'
+        """)
+        await conn.execute("""
+            UPDATE picks SET
+                home_team = TRIM(SPLIT_PART(match_name, ' vs ', 1)),
+                away_team = TRIM(SPLIT_PART(match_name, ' vs ', 2))
+            WHERE (home_team IS NULL OR home_team = '')
+            AND match_name LIKE '% vs %'
+            AND SPLIT_PART(match_name, ' vs ', 2) != ''
+        """)
+        await conn.execute("""
+            UPDATE dagens_kamp SET
+                home_team = TRIM(SPLIT_PART(match, ' vs ', 1)),
+                away_team = TRIM(SPLIT_PART(match, ' vs ', 2))
+            WHERE (home_team IS NULL OR home_team = '')
+            AND match LIKE '% vs %'
+            AND SPLIT_PART(match, ' vs ', 2) != ''
+        """)
+        null_picks_after = await conn.fetchval("""
+            SELECT COUNT(*) FROM picks WHERE home_team IS NULL OR home_team = ''
+        """)
+        null_dk_after = await conn.fetchval("""
+            SELECT COUNT(*) FROM dagens_kamp WHERE home_team IS NULL OR home_team = ''
+        """)
+        sample = await conn.fetch("""
+            SELECT id, match_name, home_team, away_team, atomic_score, soft_edge, tier
+            FROM picks ORDER BY created_at DESC LIMIT 5
+        """)
+        # streak columns check
+        streak_cols = await conn.fetch("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'picks' AND column_name LIKE '%streak%'
+        """)
+    return {
+        "null_picks_before": null_picks_before,
+        "null_dagenskamp_before": null_dk_before,
+        "null_picks_after": null_picks_after,
+        "null_dagenskamp_after": null_dk_after,
+        "picks_sample": [dict(r) for r in sample],
+        "streak_columns": [r["column_name"] for r in streak_cols],
+    }
+
+
 @app.get("/admin/fase0-kartlegg")
 async def admin_fase0_kartlegg():
     """FASE 0 — Kartlegg faktisk DB-data for v11.0 planlegging."""
