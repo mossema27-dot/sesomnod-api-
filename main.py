@@ -3624,10 +3624,14 @@ async def admin_fase0_kartlegg():
             LIMIT 50
         """)
 
-        # D) BTTS i snapshots
+        # D) BTTS i snapshots — søk i JSONB data
         btts_check = await conn.fetch("""
-            SELECT DISTINCT market_type FROM odds_snapshots
-            WHERE market_type ILIKE '%btts%' OR market_type ILIKE '%both%'
+            SELECT DISTINCT mk->>'key' AS market_key
+            FROM odds_snapshots,
+                 jsonb_array_elements(data::jsonb->'bookmakers') bk,
+                 jsonb_array_elements(bk->'markets') mk
+            WHERE (mk->>'key') ILIKE '%btts%'
+               OR (mk->>'key') ILIKE '%both%'
             LIMIT 5
         """)
 
