@@ -509,10 +509,12 @@ async def ensure_tables(pool: asyncpg.Pool):
             """)
 
             # FASE A-2: Backfill historiske data (idempotent via ON CONFLICT)
+            # Bruker kun kolonner som faktisk finnes i picks-tabellen
+            # (home_team/away_team/league er ikke i picks, kun i dagens_kamp)
             await conn.execute("""
                 INSERT INTO picks_v2 (
-                    id, match_name, home_team, away_team, league,
-                    kickoff_time, odds, soft_edge, soft_ev, soft_book,
+                    id, match_name,
+                    odds, soft_edge, soft_ev, soft_book,
                     pinnacle_clv, atomic_score, signals_triggered,
                     result, telegram_posted, posted_at, scan_session,
                     benchmark_book, clv_reference_book, clv_missing,
@@ -521,17 +523,13 @@ async def ensure_tables(pool: asyncpg.Pool):
                 SELECT
                     id,
                     COALESCE(match, ''),
-                    COALESCE(home_team, ''),
-                    COALESCE(away_team, ''),
-                    COALESCE(league, ''),
-                    NULL,
                     odds,
                     soft_edge,
                     soft_ev,
                     soft_book,
                     pinnacle_clv,
                     COALESCE(atomic_score, 0),
-                    COALESCE(signals_triggered, '[]'),
+                    COALESCE(signals_triggered, '[]'::jsonb),
                     result,
                     COALESCE(telegram_posted, FALSE),
                     posted_at,
@@ -540,22 +538,23 @@ async def ensure_tables(pool: asyncpg.Pool):
                     clv_reference_book,
                     COALESCE(clv_missing, FALSE),
                     COALESCE(timestamp, NOW()),
-                    'MONITORED',
-                    '📊 MONITORED',
-                    0.00,
-                    0.00
+                    COALESCE(tier, 'MONITORED'),
+                    COALESCE(tier_label, '📊 MONITORED'),
+                    COALESCE(kelly_multiplier, 0.00),
+                    COALESCE(kelly_stake, 0.00)
                 FROM picks
                 ORDER BY id
                 ON CONFLICT (id) DO NOTHING;
             """)
 
             # FASE A-3: Sync trigger (ny picks → picks_v2 automatisk)
+            # Bruker kun kolonner som eksisterer i picks
             await conn.execute("""
                 CREATE OR REPLACE FUNCTION sync_picks_to_v2()
                 RETURNS TRIGGER AS $$
                 BEGIN
                     INSERT INTO picks_v2 (
-                        id, match_name, home_team, away_team, league,
+                        id, match_name,
                         odds, soft_edge, soft_ev, soft_book, pinnacle_clv,
                         atomic_score, signals_triggered,
                         result, telegram_posted, posted_at, created_at,
@@ -563,23 +562,20 @@ async def ensure_tables(pool: asyncpg.Pool):
                     ) VALUES (
                         NEW.id,
                         COALESCE(NEW.match, ''),
-                        COALESCE(NEW.home_team, ''),
-                        COALESCE(NEW.away_team, ''),
-                        COALESCE(NEW.league, ''),
                         NEW.odds,
                         NEW.soft_edge,
                         NEW.soft_ev,
                         NEW.soft_book,
                         NEW.pinnacle_clv,
                         COALESCE(NEW.atomic_score, 0),
-                        COALESCE(NEW.signals_triggered, '[]'),
+                        COALESCE(NEW.signals_triggered, '[]'::jsonb),
                         NEW.result,
                         COALESCE(NEW.telegram_posted, FALSE),
                         NEW.posted_at,
                         COALESCE(NEW.timestamp, NOW()),
                         COALESCE(NEW.tier, 'MONITORED'),
                         COALESCE(NEW.tier_label, '📊 MONITORED'),
-                        0.00,
+                        COALESCE(NEW.kelly_multiplier, 0.00),
                         COALESCE(NEW.kelly_stake, 0.00)
                     )
                     ON CONFLICT (id) DO UPDATE SET
@@ -3385,6 +3381,70 @@ async def status():
         },
         "timestamp": now.isoformat(),
     }
+
+
+@app.post("/admin/backfill-picks-v2")
+async def admin_backfill_picks_v2():
+    """
+    Kjører backfill fra picks → picks_v2 manuelt.
+    Idempotent via ON CONFLICT DO NOTHING.
+    Bruker kun kolonner som faktisk finnes i picks.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            before = await conn.fetchval("SELECT COUNT(*) FROM picks_v2")
+            await conn.execute("""
+                INSERT INTO picks_v2 (
+                    id, match_name,
+                    odds, soft_edge, soft_ev, soft_book,
+                    pinnacle_clv, atomic_score, signals_triggered,
+                    result, telegram_posted, posted_at, scan_session,
+                    benchmark_book, clv_reference_book, clv_missing,
+                    created_at, tier, tier_label, kelly_multiplier, kelly_stake
+                )
+                SELECT
+                    id,
+                    COALESCE(match, ''),
+                    odds,
+                    soft_edge,
+                    soft_ev,
+                    soft_book,
+                    pinnacle_clv,
+                    COALESCE(atomic_score, 0),
+                    COALESCE(signals_triggered, '[]'::jsonb),
+                    result,
+                    COALESCE(telegram_posted, FALSE),
+                    posted_at,
+                    scan_session,
+                    benchmark_book,
+                    clv_reference_book,
+                    COALESCE(clv_missing, FALSE),
+                    COALESCE(timestamp, NOW()),
+                    COALESCE(tier, 'MONITORED'),
+                    COALESCE(tier_label, '📊 MONITORED'),
+                    COALESCE(kelly_multiplier, 0.00),
+                    COALESCE(kelly_stake, 0.00)
+                FROM picks
+                ORDER BY id
+                ON CONFLICT (id) DO NOTHING
+            """)
+            after = await conn.fetchval("SELECT COUNT(*) FROM picks_v2")
+            old_count = await conn.fetchval("SELECT COUNT(*) FROM picks")
+
+        return {
+            "status": "BACKFILL_OK",
+            "picks_v2_before": before,
+            "picks_v2_after": after,
+            "picks_count": old_count,
+            "inserted": after - before,
+            "match": old_count == after,
+        }
+    except Exception as e:
+        logger.error(f"[Admin] backfill-picks-v2 feilet: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
 @app.post("/admin/picks-switch")
