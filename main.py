@@ -394,6 +394,21 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS pinnacle_closing NUMERIC(5,2);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS clv_pct NUMERIC(6,2);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS total_scanned INTEGER;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS atomic_score INTEGER DEFAULT 0;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS tier VARCHAR(20) DEFAULT 'MONITORED';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS tier_label VARCHAR(50) DEFAULT '📊 MONITORED';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS kelly_stake NUMERIC(6,2) DEFAULT 0.00;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signals_triggered JSONB DEFAULT '[]';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_streak_home VARCHAR(30) DEFAULT 'NEUTRAL';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_streak_away VARCHAR(30) DEFAULT 'NEUTRAL';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS streak_home_count INTEGER DEFAULT 0;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS streak_away_count INTEGER DEFAULT 0;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS market_hint VARCHAR(30);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_velocity VARCHAR(30);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_xg VARCHAR(30);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_weather VARCHAR(30);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_home FLOAT;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_away FLOAT;
 
                 ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS trigger_type VARCHAR(50) DEFAULT 'scheduled';
                 ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS match_id TEXT;
@@ -438,6 +453,8 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS referee_matches_count INTEGER DEFAULT 0;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_streak_home VARCHAR(30) DEFAULT 'NEUTRAL';
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_streak_away VARCHAR(30) DEFAULT 'NEUTRAL';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS streak_home_count INTEGER DEFAULT 0;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS streak_away_count INTEGER DEFAULT 0;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS market_hint VARCHAR(30);
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS market_type_detail VARCHAR(20);
                 CREATE INDEX IF NOT EXISTS idx_picks_atomic ON picks(atomic_score DESC);
@@ -1938,12 +1955,30 @@ async def run_analysis():
             if exists:
                 continue
 
+            # Parse streak count fra signal string (e.g. "SCORING_5_OF_7" → 5)
+            def _parse_streak_count(sig: str) -> int:
+                if sig and sig.startswith("SCORING_"):
+                    try:
+                        return int(sig.split("_")[1])
+                    except (IndexError, ValueError):
+                        pass
+                return 0
+
+            streak_h_count = _parse_streak_count(pick.get("signal_streak_home", ""))
+            streak_a_count = _parse_streak_count(pick.get("signal_streak_away", ""))
+
             row_id = await conn.fetchval("""
                 INSERT INTO dagens_kamp
                     (match, league, home_team, away_team, pick, odds, stake,
                      edge, ev, confidence, kickoff, telegram_posted,
-                     market_type, score, bookmaker_count, pinnacle_opening, total_scanned)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15,$16)
+                     market_type, score, bookmaker_count, pinnacle_opening, total_scanned,
+                     atomic_score, tier, tier_label, kelly_stake,
+                     signals_triggered, signal_streak_home, signal_streak_away,
+                     streak_home_count, streak_away_count, market_hint,
+                     signal_velocity, signal_xg, signal_weather,
+                     xg_divergence_home, xg_divergence_away)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15,$16,
+                        $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
                 RETURNING id
             """,
                 f"{pick['home_team']} vs {pick['away_team']}",
@@ -1962,6 +1997,21 @@ async def run_analysis():
                 pick["num_bookmakers"],
                 pick.get("pinnacle_opening"),
                 total_scanned,
+                pick.get("atomic_score", 0),
+                pick.get("tier", "MONITORED"),
+                pick.get("tier_label", "📊 MONITORED"),
+                pick.get("kelly_stake", 0.0),
+                json.dumps(pick.get("signals_triggered", [])),
+                pick.get("signal_streak_home", "NEUTRAL"),
+                pick.get("signal_streak_away", "NEUTRAL"),
+                streak_h_count,
+                streak_a_count,
+                pick.get("market_hint"),
+                pick.get("signal_velocity"),
+                pick.get("signal_xg"),
+                pick.get("signal_weather"),
+                pick.get("xg_divergence_home"),
+                pick.get("xg_divergence_away"),
             )
             newly_inserted.append({"id": row_id, **pick, "total_scanned": total_scanned})
             logger.info(f"[Analyse] Ny pick (id={row_id}): {pick['pick']} @ {pick['odds']} SCORE={pick['score']}")

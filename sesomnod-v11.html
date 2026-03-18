@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="60">
+<title>SesomNod Truth Engine</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:#0a0a0f;
+  color:#e4e4e7;
+  font-family:'Courier New',monospace;
+  min-height:100vh;
+}
+.pin-overlay {
+  position:fixed; inset:0;
+  background:#0a0a0f;
+  display:flex; align-items:center;
+  justify-content:center; z-index:100;
+}
+.pin-box {
+  background:#18181b;
+  padding:2rem; border-radius:1rem;
+  border:1px solid #10b981;
+  text-align:center; width:300px;
+}
+.pin-input {
+  background:#0a0a0f; color:#10b981;
+  border:1px solid #10b981;
+  padding:0.75rem; width:100%;
+  font-family:'Courier New',monospace;
+  font-size:1.2rem; text-align:center;
+  border-radius:0.5rem; margin:1rem 0;
+  letter-spacing:0.3em;
+}
+.pin-btn {
+  background:#10b981; color:#0a0a0f;
+  border:none; padding:0.75rem 2rem;
+  font-family:'Courier New',monospace;
+  font-weight:bold; cursor:pointer;
+  border-radius:0.5rem; width:100%;
+  font-size:1rem;
+}
+.pin-btn:hover { background:#059669; }
+.pin-error {
+  color:#ef4444; font-size:0.8rem;
+  margin-top:0.5rem; display:none;
+}
+.container {
+  max-width:900px; margin:0 auto;
+  padding:1.5rem;
+}
+.header {
+  display:flex; justify-content:space-between;
+  align-items:center; margin-bottom:2rem;
+  border-bottom:1px solid #27272a;
+  padding-bottom:1rem;
+}
+.logo {
+  font-size:1.8rem; font-weight:bold;
+  color:#10b981; letter-spacing:0.1em;
+}
+.version { color:#71717a; font-size:0.8rem; text-align:right; }
+.no-pick {
+  text-align:center; padding:4rem 2rem;
+  border:1px solid #27272a;
+  border-radius:1rem;
+}
+.no-pick-icon { font-size:4rem; margin-bottom:1rem; }
+.no-pick-title { font-size:2rem; color:#f59e0b; margin-bottom:1rem; }
+.pick-card {
+  background:#18181b;
+  border-radius:1rem; padding:2rem;
+  border:1px solid #27272a;
+  margin-bottom:1.5rem;
+}
+.match-title {
+  font-size:1.8rem; font-weight:bold;
+  margin-bottom:0.5rem;
+}
+.match-meta { color:#71717a; font-size:0.9rem; margin-bottom:2rem; }
+.gauge-container {
+  display:flex; align-items:center;
+  gap:2rem; margin-bottom:2rem;
+  flex-wrap:wrap;
+}
+.gauge-wrap {
+  position:relative;
+  width:140px; height:140px;
+  flex-shrink:0;
+}
+.gauge-wrap svg {
+  width:100%; height:100%;
+  transform:rotate(-90deg);
+}
+.gauge-text {
+  position:absolute; inset:0;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+}
+.gauge-score { font-size:2.5rem; font-weight:bold; color:#10b981; }
+.gauge-max { font-size:0.8rem; color:#71717a; }
+.tier-badge {
+  display:inline-block;
+  padding:0.5rem 1.5rem;
+  border-radius:2rem;
+  font-weight:bold; font-size:1rem;
+}
+.tier-atomic { background:#10b981; color:#0a0a0f; }
+.tier-edge { background:#f59e0b; color:#0a0a0f; }
+.tier-monitored { background:#71717a; color:#0a0a0f; }
+.markets-table {
+  width:100%; border-collapse:collapse;
+  margin-bottom:1.5rem; font-size:0.9rem;
+}
+.markets-table th {
+  text-align:left; padding:0.5rem;
+  color:#71717a; border-bottom:1px solid #27272a;
+}
+.markets-table td {
+  padding:0.5rem;
+  border-bottom:1px solid #18181b;
+}
+.best-market {
+  background:#10b98120;
+  border-left:3px solid #10b981;
+}
+.edge-positive { color:#10b981; }
+.edge-negative { color:#ef4444; }
+.edge-neutral { color:#71717a; }
+.streak-bar { display:flex; gap:4px; align-items:center; margin-top:4px; }
+.streak-dot { width:14px; height:14px; border-radius:50%; flex-shrink:0; }
+.streak-scored { background:#10b981; }
+.streak-missed { background:#27272a; }
+.signals-row { display:flex; flex-wrap:wrap; gap:0.5rem; margin-bottom:1.5rem; }
+.signal-badge {
+  background:#10b98120; color:#10b981;
+  border:1px solid #10b981;
+  padding:0.3rem 0.8rem;
+  border-radius:2rem; font-size:0.8rem;
+}
+.kelly-box {
+  background:#10b98115;
+  border:1px solid #10b981;
+  border-radius:0.75rem;
+  padding:1.5rem; text-align:center;
+  margin-bottom:1.5rem;
+}
+.kelly-market { font-size:1.1rem; color:#71717a; margin-bottom:0.5rem; }
+.kelly-stake { font-size:2.5rem; font-weight:bold; color:#10b981; }
+.kelly-odds { font-size:1rem; color:#e4e4e7; margin-top:0.5rem; }
+.history-table {
+  width:100%; border-collapse:collapse; font-size:0.85rem;
+}
+.history-table th {
+  text-align:left; padding:0.5rem;
+  color:#71717a; border-bottom:1px solid #27272a;
+}
+.history-table td {
+  padding:0.5rem; border-bottom:1px solid #18181b;
+}
+.result-win { color:#10b981; font-weight:bold; }
+.result-loss { color:#ef4444; font-weight:bold; }
+.result-pending { color:#f59e0b; }
+.footer-bar {
+  display:flex; justify-content:space-between;
+  color:#71717a; font-size:0.75rem;
+  margin-top:2rem; padding-top:1rem;
+  border-top:1px solid #27272a;
+  flex-wrap:wrap; gap:0.5rem;
+}
+.section-title {
+  color:#71717a; margin-bottom:1rem; font-size:0.9rem;
+}
+@media(max-width:600px) {
+  .match-title { font-size:1.3rem; }
+  .gauge-container { flex-direction:column; }
+  .markets-table { font-size:0.75rem; }
+  .container { padding:1rem; }
+}
+</style>
+</head>
+<body>
+
+<!-- PIN OVERLAY -->
+<div class="pin-overlay" id="pinOverlay">
+  <div class="pin-box">
+    <div style="color:#10b981;font-size:1.5rem;font-weight:bold;margin-bottom:0.5rem">
+      SESOMNOD
+    </div>
+    <div style="color:#71717a;font-size:0.85rem;margin-bottom:1rem">
+      Truth Engine v11.0
+    </div>
+    <input type="password"
+      class="pin-input" id="pinInput"
+      placeholder="••••••••••"
+      maxlength="12"
+      onkeypress="if(event.key==='Enter') checkPin()">
+    <button class="pin-btn" onclick="checkPin()">ENTER</button>
+    <div class="pin-error" id="pinError">Feil PIN. Prøv igjen.</div>
+  </div>
+</div>
+
+<!-- MAIN CONTENT -->
+<div class="container" id="mainContent" style="display:none">
+  <div class="header">
+    <div class="logo">&#9889; SESOMNOD</div>
+    <div class="version" id="versionInfo">Laster...</div>
+  </div>
+  <div id="pickContent">
+    <div style="text-align:center;padding:2rem;color:#71717a">Henter data...</div>
+  </div>
+</div>
+
+<script>
+const RAILWAY_URL = "https://sesomnod-api-production.up.railway.app";
+const CORRECT_PIN = "SESOMNOD2026";
+
+function checkPin() {
+  const input = document.getElementById('pinInput').value;
+  if (input === CORRECT_PIN) {
+    sessionStorage.setItem('snAuth', 'ok');
+    document.getElementById('pinOverlay').style.display = 'none';
+    document.getElementById('mainContent').style.display = 'block';
+    loadData();
+  } else {
+    document.getElementById('pinError').style.display = 'block';
+    document.getElementById('pinInput').value = '';
+  }
+}
+
+if (sessionStorage.getItem('snAuth') === 'ok') {
+  document.getElementById('pinOverlay').style.display = 'none';
+  document.getElementById('mainContent').style.display = 'block';
+}
+
+// --- Calculations ---
+
+function poissonOver25(lambda) {
+  if (!lambda || lambda <= 0) return 0.5;
+  const e = Math.exp(-lambda);
+  const p0 = e;
+  const p1 = e * lambda;
+  const p2 = e * lambda * lambda / 2;
+  return Math.round((1 - p0 - p1 - p2) * 1000) / 1000;
+}
+
+// BTTS fra streak counts (0-7)
+function bttsProb(homeCount, awayCount) {
+  const total = 7;
+  const h = Math.max(0, Math.min(homeCount || 0, total)) / total;
+  const a = Math.max(0, Math.min(awayCount || 0, total)) / total;
+  return Math.round(((h + a) / 2) * 1000) / 1000;
+}
+
+function streakDots(count, total) {
+  const n = Math.max(0, Math.min(count || 0, total));
+  let html = '<div class="streak-bar">';
+  for (let i = 0; i < total; i++) {
+    html += '<div class="streak-dot ' + (i < n ? 'streak-scored' : 'streak-missed') + '"></div>';
+  }
+  return html + '</div>';
+}
+
+function parseSignals(raw) {
+  let arr = [];
+  try {
+    arr = typeof raw === 'string' ? JSON.parse(raw) : (raw || []);
+  } catch(e) {}
+  const icons = {
+    'SHARP_MONEY':        '&#9889; SHARP MONEY',
+    'STABLE':             '&#128200; STABIL',
+    'PUBLIC_MONEY':       '&#128101; PUBLIC MONEY',
+    'XG_DIVERGENCE':      '&#128202; xG DIVERGENS',
+    'XG_DIVERGENCE_FOUND':'&#128202; xG DIVERGENS',
+    'FAVORABLE':          '&#9728;&#65039; VÆR GUNSTIG',
+    'ADVERSE':            '&#127746; VÆR UGUNSTIG',
+    'HIGH_WIND':          '&#128168; HØY VIND',
+    'NEUTRAL_REF':        '&#128119;&#8205;&#9794;&#65039; NØYTRAL DOMMER',
+    'SCORING_7_OF_7':     '&#128293; SCORER 7/7',
+    'SCORING_5_OF_7':     '&#128293; SCORER 5/7',
+    'STRONG_EDGE_35PCT':  '&#128142; STERK EDGE',
+    'EDGE_25PCT':         '&#9989; EDGE 2.5%+',
+    'STRONG_EV_5PCT':     '&#128176; STERK EV',
+  };
+  return arr.map(function(s) {
+    return '<span class="signal-badge">' + (icons[s] || s) + '</span>';
+  }).join('');
+}
+
+function tierBadge(tier) {
+  const map = {
+    'ATOMIC':    ['tier-atomic',    '&#9889; ATOMIC CONFIRMED'],
+    'EDGE':      ['tier-edge',      '&#127919; EDGE SIGNAL'],
+    'MONITORED': ['tier-monitored', '&#128202; MONITORED'],
+  };
+  const info = map[tier] || map['MONITORED'];
+  return '<span class="tier-badge ' + info[0] + '">' + info[1] + '</span>';
+}
+
+function kickoffStr(kickoff) {
+  if (!kickoff) return '';
+  try {
+    const dt = new Date(kickoff);
+    return dt.toLocaleDateString('no-NO', {day:'2-digit', month:'2-digit'}) +
+      ' ' + dt.toLocaleTimeString('no-NO', {hour:'2-digit', minute:'2-digit'}) + ' CET';
+  } catch(e) { return kickoff; }
+}
+
+// --- Data fetch ---
+
+async function loadData() {
+  try {
+    const [stRes, pkRes] = await Promise.all([
+      fetch(RAILWAY_URL + '/status'),
+      fetch(RAILWAY_URL + '/dagens-kamp'),
+    ]);
+    const stData = await stRes.json();
+    const pkData = await pkRes.json();
+
+    const version = stData.version || 'v11.0';
+    const benchmark = (stData.scanner && stData.scanner.benchmark) || 'unibet';
+    const apiRem = (stData.scheduler && stData.scheduler.api_calls_remaining) || '?';
+
+    document.getElementById('versionInfo').innerHTML =
+      version + ' | Benchmark: ' + benchmark + '<br>API: ' + apiRem + ' kall igjen';
+
+    const allPicks = pkData.data || [];
+
+    // Best pending = ingen result, høyest atomic_score
+    const pending = allPicks
+      .filter(function(p) { return !p.result || p.result === null || p.result === 'PENDING'; })
+      .sort(function(a,b) { return (b.atomic_score || 0) - (a.atomic_score || 0) || (b.score || 0) - (a.score || 0); });
+
+    const bestPick = pending[0] || null;
+
+    // Historikk = siste 5 med result satt
+    const history = allPicks
+      .filter(function(p) { return p.result && p.result !== 'PENDING'; })
+      .slice(0, 5);
+
+    renderContent(bestPick, history, stData);
+
+  } catch(err) {
+    document.getElementById('pickContent').innerHTML =
+      '<div style="text-align:center;padding:2rem;color:#ef4444">' +
+      '&#9888;&#65039; Kan ikke nå systemet.<br>' +
+      '<span style="color:#71717a;font-size:0.8rem">' + err.message + '</span></div>';
+  }
+}
+
+function renderContent(pick, history, status) {
+  let html = '';
+
+  if (pick) {
+    const score = pick.atomic_score || 0;
+    const maxScore = 9;
+    const radius = 45;
+    const circ = 2 * Math.PI * radius;
+    const offset = circ * (1 - score / maxScore);
+
+    // xG — null i alle picks nå, bruk fallback
+    const xgHome = pick.xg_divergence_home || 0;
+    const xgAway = pick.xg_divergence_away || 0;
+    // lambda = total forventede mål (fallback = 2.70 = 1.35+1.35 ligasnitt)
+    const lambda = (xgHome + xgAway > 0) ? (xgHome + xgAway + 2.70) : 2.70;
+    const over25Prob = poissonOver25(lambda);
+    const under25Prob = Math.round((1 - over25Prob) * 1000) / 1000;
+
+    // BTTS fra streak counts
+    const homeCount = pick.streak_home_count || 0;
+    const awayCount = pick.streak_away_count || 0;
+    const bttsP = bttsProb(homeCount, awayCount);
+
+    const edge = parseFloat(pick.edge) || 0;
+    const edgeFmt = (edge > 0 ? '+' : '') + edge.toFixed(2) + '%';
+    const edgeClass = edge > 0 ? 'edge-positive' : 'edge-negative';
+
+    // Bestem beste marked basert på market_hint
+    const hint = pick.market_hint || '';
+    const isOver = hint.includes('OVER');
+    const isBtts = hint.includes('BTTS');
+
+    html += '<div class="pick-card">' +
+      '<div class="match-title">' + (pick.home_team || pick.match || '?') +
+        (pick.away_team ? ' vs ' + pick.away_team : '') + '</div>' +
+      '<div class="match-meta">' +
+        (pick.league || '') + ' | ' + kickoffStr(pick.kickoff) +
+      '</div>' +
+
+      '<div class="gauge-container">' +
+        '<div class="gauge-wrap">' +
+          '<svg viewBox="0 0 100 100">' +
+            '<circle cx="50" cy="50" r="' + radius + '" fill="none" stroke="#27272a" stroke-width="10"/>' +
+            '<circle cx="50" cy="50" r="' + radius + '" fill="none" stroke="#10b981" stroke-width="10"' +
+              ' stroke-dasharray="' + circ + '" stroke-dashoffset="' + offset + '"' +
+              ' stroke-linecap="round"/>' +
+          '</svg>' +
+          '<div class="gauge-text">' +
+            '<span class="gauge-score">' + score + '</span>' +
+            '<span class="gauge-max">/' + maxScore + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div>' +
+          tierBadge(pick.tier) +
+          '<div style="margin-top:1rem;font-size:1.5rem">' +
+            '<span class="' + edgeClass + '">' + edgeFmt + ' edge</span>' +
+          '</div>' +
+          '<div style="color:#71717a;font-size:0.85rem;margin-top:0.5rem">' +
+            'EV: ' + (parseFloat(pick.ev) || 0).toFixed(2) + '%' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+
+      // PICK ANBEFALING
+      '<div style="margin-bottom:1.5rem;padding:1rem;background:#27272a;border-radius:0.5rem">' +
+        '<div style="color:#71717a;font-size:0.8rem;margin-bottom:0.3rem">ANBEFALT PICK</div>' +
+        '<div style="font-size:1.3rem;font-weight:bold">' + (pick.pick || '?') +
+          ' @ <span class="edge-positive">' + (parseFloat(pick.odds) || 0).toFixed(2) + '</span>' +
+        '</div>' +
+        '<div style="color:#71717a;font-size:0.8rem;margin-top:0.3rem">' +
+          'Market: ' + (pick.market_type || 'h2h').toUpperCase() +
+          (hint ? ' | Hint: ' + hint : '') +
+        '</div>' +
+      '</div>' +
+
+      // MARKEDER TABELL
+      '<table class="markets-table">' +
+        '<thead><tr>' +
+          '<th>Marked</th><th>Vår prob</th><th>Status</th>' +
+        '</tr></thead>' +
+        '<tbody>' +
+          '<tr class="' + (!isOver && !isBtts ? 'best-market' : '') + '">' +
+            '<td>1X2 (vinner)</td>' +
+            '<td>—</td>' +
+            '<td class="' + edgeClass + '">' + edgeFmt + ' edge</td>' +
+          '</tr>' +
+          '<tr class="' + (isOver ? 'best-market' : '') + '">' +
+            '<td>Over 2.5 mål <span style="color:#71717a;font-size:0.75rem">(Poisson)</span></td>' +
+            '<td>' + Math.round(over25Prob * 100) + '%</td>' +
+            '<td class="' + (over25Prob > 0.5 ? 'edge-positive' : 'edge-neutral') + '">' +
+              (over25Prob > 0.5 ? 'Favorisert' : 'Nøytral') +
+            '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td>Under 2.5 mål</td>' +
+            '<td>' + Math.round(under25Prob * 100) + '%</td>' +
+            '<td class="edge-neutral">Nøytral</td>' +
+          '</tr>' +
+          '<tr class="' + (isBtts ? 'best-market' : '') + '">' +
+            '<td>BTTS Yes <span style="color:#71717a;font-size:0.75rem">(streak)</span></td>' +
+            '<td>' + Math.round(bttsP * 100) + '%</td>' +
+            '<td class="' + (bttsP > 0.6 ? 'edge-positive' : 'edge-neutral') + '">' +
+              (bttsP > 0.6 ? 'Sterk' : bttsP > 0.45 ? 'Moderat' : 'Svak') +
+            '</td>' +
+          '</tr>' +
+        '</tbody>' +
+      '</table>' +
+
+      // SCORING STREAK
+      '<div style="margin-bottom:1.5rem">' +
+        '<div class="section-title">SCORING STREAK (SISTE 7)</div>' +
+        '<div style="margin-bottom:0.5rem;font-size:0.9rem">' +
+          (pick.home_team || 'Hjemme') + ':' +
+          streakDots(homeCount, 7) +
+          '<span style="color:#71717a;font-size:0.8rem;margin-left:0.5rem">' +
+            (pick.signal_streak_home || 'NEUTRAL') +
+          '</span>' +
+        '</div>' +
+        '<div style="font-size:0.9rem">' +
+          (pick.away_team || 'Borte') + ':' +
+          streakDots(awayCount, 7) +
+          '<span style="color:#71717a;font-size:0.8rem;margin-left:0.5rem">' +
+            (pick.signal_streak_away || 'NEUTRAL') +
+          '</span>' +
+        '</div>' +
+      '</div>' +
+
+      // AKTIVE SIGNALER
+      (pick.signals_triggered && pick.signals_triggered !== '[]' ?
+        '<div class="signals-row">' + parseSignals(pick.signals_triggered) + '</div>' : '') +
+
+      // KELLY
+      (pick.kelly_stake > 0 ?
+        '<div class="kelly-box">' +
+          '<div class="kelly-market">ANBEFALT INNSATS (Kelly 25%)</div>' +
+          '<div class="kelly-stake">' + parseFloat(pick.kelly_stake).toFixed(2) + ' units</div>' +
+          '<div class="kelly-odds">@ ' + parseFloat(pick.odds).toFixed(2) + ' odds</div>' +
+        '</div>' : '') +
+
+    '</div>';
+
+  } else {
+    html += '<div class="no-pick">' +
+      '<div class="no-pick-icon">&#9203;</div>' +
+      '<div class="no-pick-title">HOPP OVER</div>' +
+      '<div style="color:#71717a;max-width:400px;margin:0 auto">' +
+        'Ingen av markedene har dokumentert matematisk edge akkurat n&#229;.<br><br>' +
+        'Dette er en del av systemet. Vi poster kun n&#229;r alle signaler konvergerer.<br><br>' +
+        '<span style="color:#10b981">Neste auto-scan: 07:00 UTC</span>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // HISTORIKK
+  if (history.length > 0) {
+    html += '<div class="pick-card">' +
+      '<div class="section-title">HISTORIKK</div>' +
+      '<table class="history-table">' +
+        '<thead><tr>' +
+          '<th>Kamp</th><th>Pick</th><th>Odds</th><th>Resultat</th><th>CLV</th>' +
+        '</tr></thead>' +
+        '<tbody>' +
+        history.map(function(h) {
+          const resClass = h.result === 'WIN' ? 'result-win' :
+                           h.result === 'LOSS' ? 'result-loss' : 'result-pending';
+          const clv = parseFloat(h.clv_pct);
+          const clvStr = isNaN(clv) ? '&#8212;' :
+            '<span class="' + (clv > 0 ? 'edge-positive' : 'edge-negative') + '">' +
+            (clv > 0 ? '+' : '') + clv.toFixed(2) + '%</span>';
+          return '<tr>' +
+            '<td>' + (h.home_team || h.match || '?') +
+              (h.away_team ? '<br><span style="color:#71717a;font-size:0.75rem">' + h.away_team + '</span>' : '') +
+            '</td>' +
+            '<td>' + (h.pick || '&#8212;') + '</td>' +
+            '<td>' + (parseFloat(h.odds) || 0).toFixed(2) + '</td>' +
+            '<td class="' + resClass + '">' + (h.result || 'PENDING') + '</td>' +
+            '<td>' + clvStr + '</td>' +
+          '</tr>';
+        }).join('') +
+        '</tbody>' +
+      '</table>' +
+    '</div>';
+  }
+
+  // FOOTER
+  const ver = (status.version || 'v11.0');
+  const bm = (status.scanner && status.scanner.benchmark) || 'unibet';
+  const rem = (status.scheduler && status.scheduler.api_calls_remaining) || '?';
+  html += '<div class="footer-bar">' +
+    '<span>' + ver + ' | Benchmark: ' + bm + '</span>' +
+    '<span>API: ' + rem + ' kall igjen | Oppdateres hvert 60s</span>' +
+  '</div>';
+
+  document.getElementById('pickContent').innerHTML = html;
+}
+
+// Auto-load
+if (sessionStorage.getItem('snAuth') === 'ok') {
+  loadData();
+}
+</script>
+</body>
+</html>
