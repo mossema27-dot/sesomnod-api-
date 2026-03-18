@@ -125,6 +125,17 @@ class RefereeSignal:
             referee_name = main_ref.get("name", "Unknown")
             nationality = main_ref.get("nationality", "?")
 
+            # Signal 4 gate: minimum 20 kamper for pålitelig scoring
+            matches_count = main_ref.get("matches_count", 0)
+            if matches_count < 20:
+                return {
+                    "signal": "NEUTRAL_REF",
+                    "atomic_points": 0,
+                    "referee_name": referee_name,
+                    "referee_matches_count": matches_count,
+                    "reason": f"Insufficient data: {matches_count}/20 matches",
+                }
+
             # v10.1.0: Data-innsamling — atomic_points=0
             # Fremtidig: score basert på historisk kort/straffe-rate
             return {
@@ -132,6 +143,7 @@ class RefereeSignal:
                 "atomic_points": 0,
                 "referee_name": referee_name,
                 "referee_nationality": nationality,
+                "referee_matches_count": matches_count,
                 "note": "Scoring aktiviseres i v10.2.0 etter datainnsamling",
             }
 

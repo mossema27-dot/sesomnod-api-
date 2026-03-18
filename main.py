@@ -416,6 +416,11 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS referee_name VARCHAR(100);
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS wind_speed FLOAT;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS temperature FLOAT;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS tier VARCHAR(20) DEFAULT 'MONITORED';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS tier_label VARCHAR(50) DEFAULT '📊 MONITORED';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS kelly_multiplier FLOAT DEFAULT 0.0;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS kelly_stake FLOAT DEFAULT 0.0;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS referee_matches_count INTEGER DEFAULT 0;
                 CREATE INDEX IF NOT EXISTS idx_picks_atomic ON picks(atomic_score DESC);
                 CREATE INDEX IF NOT EXISTS idx_picks_weather ON picks(signal_weather);
                 CREATE INDEX IF NOT EXISTS idx_picks_created ON picks(created_at DESC);
@@ -822,6 +827,46 @@ async def get_xg_divergence(
 
 
 # ─────────────────────────────────────────────────────────
+# KELLY CRITERION
+# ─────────────────────────────────────────────────────────
+def calculate_kelly_stake(
+    edge_pct: float,
+    odds: float,
+    bankroll: float = 1000.0,
+    tier: str = "EDGE",
+) -> float:
+    """
+    Kelly Criterion med tier-multiplier.
+    Fractional Kelly (25%) for sikkerhet.
+    """
+    if odds <= 1.0 or edge_pct <= 0:
+        return 0.0
+
+    # Full Kelly
+    b = odds - 1  # Net odds
+    p = (edge_pct / 100) + (1 / odds)
+    q = 1 - p
+    kelly = (b * p - q) / b
+
+    # Fractional Kelly (25% for safety)
+    fractional_kelly = kelly * 0.25
+
+    # Tier multiplier
+    if tier == "ATOMIC":
+        multiplier = 1.0  # Full fractional
+    elif tier == "EDGE":
+        multiplier = 0.5  # Half fractional
+    else:
+        multiplier = 0.0  # No bet
+
+    stake_fraction = fractional_kelly * multiplier
+    stake_units = round(stake_fraction * 100, 1)
+
+    # Cap på 5 units for sikkerhet
+    return min(stake_units, 5.0)
+
+
+# ─────────────────────────────────────────────────────────
 # SIGNAL 3: ATOMIC SCORE GATE
 # ─────────────────────────────────────────────────────────
 def calculate_atomic_score(
@@ -906,6 +951,23 @@ def calculate_atomic_score(
         verdict = "NO_SIGNAL"
         gate_passed = False
 
+    # Tier-klassifisering
+    if atomic_score >= 7:
+        tier = "ATOMIC"
+        tier_label = "⚡ ATOMIC SIGNAL"
+        post_telegram = True
+        kelly_multiplier = 1.0
+    elif atomic_score >= 4:
+        tier = "EDGE"
+        tier_label = "🎯 EDGE SIGNAL"
+        post_telegram = True
+        kelly_multiplier = 0.5
+    else:
+        tier = "MONITORED"
+        tier_label = "📊 MONITORED"
+        post_telegram = False
+        kelly_multiplier = 0.0
+
     return {
         "atomic_score": atomic_score,
         "verdict": verdict,
@@ -914,6 +976,10 @@ def calculate_atomic_score(
         "xg_available": xg_available,
         "velocity_available": velocity_available,
         "weather_available": weather_available,
+        "tier": tier,
+        "tier_label": tier_label,
+        "post_telegram": post_telegram,
+        "kelly_multiplier": kelly_multiplier,
     }
 
 
@@ -1417,6 +1483,14 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     "referee_name": referee_result.get("referee_name"),
                     "wind_speed": weather_result.get("wind_ms"),
                     "temperature": weather_result.get("temperature_c"),
+                    # Tier + Kelly
+                    "tier": atomic_result["tier"],
+                    "tier_label": atomic_result["tier_label"],
+                    "kelly_multiplier": atomic_result["kelly_multiplier"],
+                    "kelly_stake": calculate_kelly_stake(
+                        soft_edge, target_odds, tier=atomic_result["tier"]
+                    ),
+                    "post_telegram": atomic_result["post_telegram"],
                 })
                 match_pick_count += 1
                 league_pick_count += 1
@@ -1531,9 +1605,15 @@ async def run_analysis():
         logger.warning("[Analyse] TELEGRAM mangler — lagret men ikke postet")
         return
 
+    # STEG 7: Kun EDGE og ATOMIC postes til Telegram — MONITORED logges alltid til DB
+    postable = [p for p in newly_inserted if p.get("post_telegram", False)]
     posts_left = max(0, DAILY_POST_LIMIT - int(daily_posted))
+    monitored_count = len(newly_inserted) - len(postable)
+    if monitored_count > 0:
+        logger.info(f"[Analyse] {monitored_count} MONITORED picks lagret i DB (ingen Telegram-posting)")
+
     rank = 1
-    for pick in newly_inserted[:posts_left]:
+    for pick in postable[:posts_left]:
         try:
             message = _format_pick_message(pick, rank=rank, total_scanned=total_scanned)
             async with httpx.AsyncClient(timeout=15) as client:
@@ -1547,14 +1627,14 @@ async def run_analysis():
                         "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
                         pick["id"]
                     )
-                logger.info(f"[Analyse] Postet til Telegram: {pick['pick']} — {pick['home_team']} vs {pick['away_team']}")
+                logger.info(f"[Analyse] Postet til Telegram: {pick['pick']} — {pick['home_team']} vs {pick['away_team']} [{pick.get('tier','?')}]")
             else:
                 logger.error(f"[Analyse] Telegram feil {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             logger.exception(f"[Analyse] Feil ved posting id={pick['id']}: {e}")
         rank += 1
 
-    skipped = len(newly_inserted) - posts_left
+    skipped = len(postable) - posts_left
     if skipped > 0:
         logger.info(f"[Analyse] {skipped} picks lagret men ikke postet (grense {DAILY_POST_LIMIT} nådd)")
 
@@ -2066,6 +2146,44 @@ def _format_pick_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> s
 
 
 # ─────────────────────────────────────────────────────────
+# TIER TELEGRAM FORMATTER
+# ─────────────────────────────────────────────────────────
+def format_telegram_pick(pick: dict) -> str:
+    """
+    Formaterer Telegram-melding.
+    Garantert ≤200 tegn.
+    Trunkerer lagnavn til 12 tegn.
+    """
+    home = pick["home_team"][:12]
+    away = pick["away_team"][:12]
+    edge = round(float(pick["soft_edge"]), 1)
+    score = pick["atomic_score"]
+    odds = pick["odds"]
+    kelly = pick["kelly_stake"]
+    kickoff_raw = pick.get("kickoff_time") or pick.get("commence_time", "")
+    time_str = kickoff_raw[:5] if kickoff_raw else "--:--"
+    tier_label = pick["tier_label"]
+
+    if pick["tier"] == "ATOMIC":
+        msg = (
+            f"⚡ ATOMIC | {home} v {away} | "
+            f"+{edge}% edge | {score}/9 signals | "
+            f"BACK @{odds} ({kelly}u) | "
+            f"{time_str} CET"
+        )
+    else:
+        msg = (
+            f"🎯 EDGE | {home} v {away} | "
+            f"+{edge}% edge | {score}/9 signals | "
+            f"BACK @{odds} ({kelly}u) | "
+            f"{time_str} CET"
+        )
+
+    # Garantert ≤200 tegn
+    return msg[:200]
+
+
+# ─────────────────────────────────────────────────────────
 # LEGACY JOBS (beholdes for bakoverkompatibilitet)
 # ─────────────────────────────────────────────────────────
 async def post_dagens_kamp_telegram():
@@ -2269,7 +2387,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "10.1.0-atomic",
+            "version": "10.1.1-atomic",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2282,7 +2400,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.1.0-atomic",
+        "version": "10.1.1-atomic",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -3001,7 +3119,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.1.0-atomic",
+        "version": "10.1.1-atomic",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
