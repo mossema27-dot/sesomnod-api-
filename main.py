@@ -3481,6 +3481,51 @@ async def admin_backfill_picks_v2():
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.post("/admin/cleanup-test-picks")
+async def admin_cleanup_test_picks():
+    """Sletter test-rader med home_team='TestHome' fra picks og dagens_kamp."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            # STEG 1 — finn
+            picks_rows = await conn.fetch(
+                "SELECT id, match_name, home_team, away_team, telegram_posted "
+                "FROM picks WHERE home_team = 'TestHome' OR away_team = 'TestAway'"
+            )
+            dk_rows = await conn.fetch(
+                "SELECT id, home_team, away_team "
+                "FROM dagens_kamp WHERE home_team = 'TestHome' OR away_team = 'TestAway'"
+            )
+            # STEG 2 — slett
+            picks_del = await conn.fetchval(
+                "WITH d AS (DELETE FROM picks WHERE home_team='TestHome' OR away_team='TestAway' RETURNING id) "
+                "SELECT COUNT(*) FROM d"
+            )
+            dk_del = await conn.fetchval(
+                "WITH d AS (DELETE FROM dagens_kamp WHERE home_team='TestHome' OR away_team='TestAway' RETURNING id) "
+                "SELECT COUNT(*) FROM d"
+            )
+            # STEG 3 — bekreft
+            picks_left = await conn.fetchval(
+                "SELECT COUNT(*) FROM picks WHERE home_team='TestHome'"
+            )
+            dk_left = await conn.fetchval(
+                "SELECT COUNT(*) FROM dagens_kamp WHERE home_team='TestHome'"
+            )
+        return {
+            "found_in_picks": [dict(r) for r in picks_rows],
+            "found_in_dagens_kamp": [dict(r) for r in dk_rows],
+            "deleted_from_picks": picks_del,
+            "deleted_from_dagens_kamp": dk_del,
+            "picks_remaining": picks_left,
+            "dagens_kamp_remaining": dk_left,
+            "clean": picks_left == 0 and dk_left == 0,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/picks-rollback")
 async def admin_picks_rollback():
     """
