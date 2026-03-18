@@ -3609,76 +3609,90 @@ async def admin_fase0_kartlegg():
     """FASE 0 — Kartlegg faktisk DB-data for v11.0 planlegging."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    result = {}
+
     async with db_state.pool.acquire() as conn:
-        # A) Siste pick med alle felter
-        last_pick = await conn.fetchrow("SELECT * FROM picks ORDER BY created_at DESC LIMIT 1")
-
-        # B) Distinct market_type + bookmaker fra odds_snapshots
-        snap_markets = await conn.fetch("""
-            SELECT DISTINCT
-                s.data::jsonb->>'market_type' AS market_type,
-                bk->>'key' AS bookmaker
-            FROM odds_snapshots s,
-                 jsonb_array_elements(s.data::jsonb->'bookmakers') AS bk
-            ORDER BY market_type, bookmaker
-            LIMIT 50
-        """)
-
-        # D) BTTS i snapshots — søk i JSONB data
-        btts_check = await conn.fetch("""
-            SELECT DISTINCT mk->>'key' AS market_key
-            FROM odds_snapshots,
-                 jsonb_array_elements(data::jsonb->'bookmakers') bk,
-                 jsonb_array_elements(bk->'markets') mk
-            WHERE (mk->>'key') ILIKE '%btts%'
-               OR (mk->>'key') ILIKE '%both%'
-            LIMIT 5
-        """)
-
-        # E) xG-data tilgjengelig
-        xg_data = await conn.fetch("""
-            SELECT match_name, signal_xg_home, signal_xg_away,
-                   xg_divergence_home, xg_divergence_away
-            FROM picks
-            WHERE signal_xg_home IS NOT NULL
-            LIMIT 3
-        """)
-
-        # Picks kolonner
+        # A) Picks kolonner (kjør FØR alt annet)
         cols = await conn.fetch("""
             SELECT column_name, data_type
             FROM information_schema.columns
             WHERE table_name = 'picks'
             ORDER BY ordinal_position
         """)
+        result["picks_columns"] = [{"col": r["column_name"], "type": r["data_type"]} for r in cols]
+        pick_col_names = [r["column_name"] for r in cols]
 
-        # Distinct market_type i picks
-        pick_markets = await conn.fetch("""
-            SELECT DISTINCT market_type, COUNT(*) as cnt
-            FROM picks GROUP BY market_type
+        # A) Siste pick
+        last_pick = await conn.fetchrow("SELECT * FROM picks ORDER BY created_at DESC LIMIT 1")
+        result["A_last_pick"] = dict(last_pick) if last_pick else None
+
+        # B/D) odds_snapshots kolonner
+        snap_cols = await conn.fetch("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = 'odds_snapshots'
+            ORDER BY ordinal_position
         """)
+        result["odds_snapshots_columns"] = [{"col": r["column_name"], "type": r["data_type"]} for r in snap_cols]
 
-        # Snapshot market structure sample
-        snap_sample = await conn.fetchrow("""
+        # B) Snapshot data-struktur — vis ett eksempel event som JSON fragment
+        snap_row = await conn.fetchrow("""
             SELECT league_key, snapshot_time,
-                   jsonb_array_length(data::jsonb->'bookmakers') as bookmaker_count,
-                   (SELECT jsonb_agg(DISTINCT mk->>'key')
-                    FROM jsonb_array_elements(data::jsonb->'bookmakers') bk,
-                         jsonb_array_elements(bk->'markets') mk
-                   ) as markets_available
+                   LEFT(data::text, 2000) AS data_preview
             FROM odds_snapshots
             ORDER BY snapshot_time DESC LIMIT 1
         """)
+        result["F_snapshot_sample"] = dict(snap_row) if snap_row else None
 
-    return {
-        "A_last_pick": dict(last_pick) if last_pick else None,
-        "B_snap_markets_sample": [dict(r) for r in snap_markets[:20]],
-        "D_btts_in_snapshots": [dict(r) for r in btts_check],
-        "E_xg_data": [dict(r) for r in xg_data],
-        "picks_columns": [{"col": r["column_name"], "type": r["data_type"]} for r in cols],
-        "picks_market_types": [dict(r) for r in pick_markets],
-        "F_snapshot_sample": dict(snap_sample) if snap_sample else None,
-    }
+        # B) Hent distinkte market keys fra snapshot JSONB
+        try:
+            snap_markets = await conn.fetch("""
+                SELECT DISTINCT mk->>'key' AS market_key, bk->>'key' AS bookmaker
+                FROM odds_snapshots,
+                     jsonb_array_elements(data::jsonb) AS ev,
+                     jsonb_array_elements(ev->'bookmakers') AS bk,
+                     jsonb_array_elements(bk->'markets') AS mk
+                ORDER BY market_key, bookmaker
+                LIMIT 40
+            """)
+            result["B_market_keys"] = [dict(r) for r in snap_markets]
+        except Exception as e:
+            result["B_market_keys_error"] = str(e)
+
+        # D) BTTS i feed
+        try:
+            btts = await conn.fetch("""
+                SELECT DISTINCT mk->>'key' AS market_key
+                FROM odds_snapshots,
+                     jsonb_array_elements(data::jsonb) AS ev,
+                     jsonb_array_elements(ev->'bookmakers') AS bk,
+                     jsonb_array_elements(bk->'markets') AS mk
+                WHERE (mk->>'key') ILIKE '%btts%'
+                   OR (mk->>'key') ILIKE '%both%'
+                LIMIT 5
+            """)
+            result["D_btts_in_feed"] = [dict(r) for r in btts]
+        except Exception as e:
+            result["D_btts_error"] = str(e)
+
+        # E) xG i picks
+        xg_data = await conn.fetch("""
+            SELECT match_name, signal_xg_home, signal_xg_away,
+                   xg_divergence_home, xg_divergence_away
+            FROM picks WHERE signal_xg_home IS NOT NULL LIMIT 3
+        """)
+        result["E_xg_data"] = [dict(r) for r in xg_data]
+
+        # market_type_detail distinkte verdier (erstatter market_type)
+        if "market_type_detail" in pick_col_names:
+            mt = await conn.fetch("""
+                SELECT DISTINCT market_type_detail, COUNT(*) AS cnt
+                FROM picks GROUP BY market_type_detail
+            """)
+            result["picks_market_type_detail"] = [dict(r) for r in mt]
+
+    return result
 
 
 @app.post("/admin/fix-picks-v2-schema")
