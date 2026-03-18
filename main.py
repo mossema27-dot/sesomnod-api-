@@ -493,6 +493,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                     clv_missing BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    timestamp TIMESTAMPTZ DEFAULT NOW(),
                     tier VARCHAR(20) NOT NULL DEFAULT 'MONITORED',
                     tier_label VARCHAR(50) NOT NULL DEFAULT '📊 MONITORED',
                     kelly_multiplier DECIMAL(3,2) NOT NULL DEFAULT 0.00,
@@ -518,7 +519,8 @@ async def ensure_tables(pool: asyncpg.Pool):
                     pinnacle_clv, atomic_score, signals_triggered,
                     result, telegram_posted, posted_at, scan_session,
                     benchmark_book, clv_reference_book, clv_missing,
-                    created_at, tier, tier_label, kelly_multiplier, kelly_stake
+                    created_at, timestamp,
+                    tier, tier_label, kelly_multiplier, kelly_stake
                 )
                 SELECT
                     id,
@@ -537,6 +539,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                     benchmark_book,
                     clv_reference_book,
                     COALESCE(clv_missing, FALSE),
+                    COALESCE(timestamp, NOW()),
                     COALESCE(timestamp, NOW()),
                     COALESCE(tier, 'MONITORED'),
                     COALESCE(tier_label, '📊 MONITORED'),
@@ -557,7 +560,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                         id, match_name,
                         odds, soft_edge, soft_ev, soft_book, pinnacle_clv,
                         atomic_score, signals_triggered,
-                        result, telegram_posted, posted_at, created_at,
+                        result, telegram_posted, posted_at, created_at, timestamp,
                         tier, tier_label, kelly_multiplier, kelly_stake
                     ) VALUES (
                         NEW.id,
@@ -572,6 +575,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                         NEW.result,
                         COALESCE(NEW.telegram_posted, FALSE),
                         NEW.posted_at,
+                        COALESCE(NEW.timestamp, NOW()),
                         COALESCE(NEW.timestamp, NOW()),
                         COALESCE(NEW.tier, 'MONITORED'),
                         COALESCE(NEW.tier_label, '📊 MONITORED'),
@@ -2632,7 +2636,9 @@ async def get_picks():
         return JSONResponse(status_code=503, content={"status": "offline", "data": [], "error": "Database ikke tilgjengelig"})
     try:
         async with db_state.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM picks ORDER BY timestamp DESC LIMIT 100")
+            rows = await conn.fetch(
+                "SELECT * FROM picks ORDER BY COALESCE(created_at, timestamp) DESC LIMIT 100"
+            )
         return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
@@ -3403,7 +3409,8 @@ async def admin_backfill_picks_v2():
                     pinnacle_clv, atomic_score, signals_triggered,
                     result, telegram_posted, posted_at, scan_session,
                     benchmark_book, clv_reference_book, clv_missing,
-                    created_at, tier, tier_label, kelly_multiplier, kelly_stake
+                    created_at, timestamp,
+                    tier, tier_label, kelly_multiplier, kelly_stake
                 )
                 SELECT
                     id,
@@ -3422,6 +3429,7 @@ async def admin_backfill_picks_v2():
                     benchmark_book,
                     clv_reference_book,
                     COALESCE(clv_missing, FALSE),
+                    COALESCE(timestamp, NOW()),
                     COALESCE(timestamp, NOW()),
                     COALESCE(tier, 'MONITORED'),
                     COALESCE(tier_label, '📊 MONITORED'),
