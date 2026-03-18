@@ -142,7 +142,7 @@ except Exception as _sig_err:
 # Core-moduler — aldri blokkerende ved import-feil
 try:
     from core.kelly_engine import kelly_engine as _kelly_engine
-    from core.rate_limiter import football_limiter, weather_limiter
+    from core.rate_limiter import football_limiter, weather_limiter, odds_limiter
     from core.circuit_breaker import referee_breaker, weather_breaker
     _CORE_AVAILABLE = True
 except Exception as _core_err:
@@ -436,6 +436,10 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS kelly_multiplier FLOAT DEFAULT 0.0;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS kelly_stake FLOAT DEFAULT 0.0;
                 ALTER TABLE picks ADD COLUMN IF NOT EXISTS referee_matches_count INTEGER DEFAULT 0;
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_streak_home VARCHAR(30) DEFAULT 'NEUTRAL';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS signal_streak_away VARCHAR(30) DEFAULT 'NEUTRAL';
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS market_hint VARCHAR(30);
+                ALTER TABLE picks ADD COLUMN IF NOT EXISTS market_type_detail VARCHAR(20);
                 CREATE INDEX IF NOT EXISTS idx_picks_atomic ON picks(atomic_score DESC);
                 CREATE INDEX IF NOT EXISTS idx_picks_weather ON picks(signal_weather);
                 CREATE INDEX IF NOT EXISTS idx_picks_created ON picks(created_at DESC);
@@ -1008,6 +1012,110 @@ async def get_xg_divergence(
 
 
 # ─────────────────────────────────────────────────────────
+# SIGNAL 5: SCORING STREAK
+# ─────────────────────────────────────────────────────────
+_STREAK_LEAGUE_MAP: dict = {
+    "Premier League": "PL",
+    "La Liga": "PD",
+    "Bundesliga": "BL1",
+    "Serie A": "SA",
+    "Ligue 1": "FL1",
+    "Eredivisie": "DED",
+    "Champions League": "CL",
+}
+
+
+async def get_scoring_streak(
+    team_name: str,
+    league_name: str,
+    api_key: str,
+) -> dict:
+    """
+    Signal 5 — Scoring streak.
+    Lag som scorer i 5-7 av siste 7 er underestimert i BTTS/Over.
+    Returnerer alltid. Feiler aldri stille.
+    """
+    if not api_key:
+        return {"streak_signal": "UNAVAILABLE", "atomic_points": 0, "reason": "No API key"}
+
+    fd_league = _STREAK_LEAGUE_MAP.get(league_name)
+    if not fd_league:
+        return {"streak_signal": "LEAGUE_UNKNOWN", "atomic_points": 0}
+
+    try:
+        if football_limiter:
+            await football_limiter.acquire()
+
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"https://api.football-data.org/v4/competitions/{fd_league}/matches",
+                params={"status": "FINISHED"},
+                headers={"X-Auth-Token": api_key},
+            )
+
+        if resp.status_code == 429:
+            return {"streak_signal": "RATE_LIMITED", "atomic_points": 0}
+        if resp.status_code != 200:
+            return {"streak_signal": "API_ERROR", "atomic_points": 0, "http_status": resp.status_code}
+
+        matches = resp.json().get("matches", [])
+
+        # Filtrer kamper for laget
+        team_matches = [
+            m for m in matches
+            if _fuzzy_team_match(team_name, m.get("homeTeam", {}).get("name", ""))
+            or _fuzzy_team_match(team_name, m.get("awayTeam", {}).get("name", ""))
+        ]
+
+        if len(team_matches) < 5:
+            return {
+                "streak_signal": "INSUFFICIENT_DATA",
+                "atomic_points": 0,
+                "matches_found": len(team_matches),
+            }
+
+        # Scorer laget i de siste 7 kampene?
+        scored = []
+        for m in team_matches[:7]:
+            score = m.get("score", {}).get("fullTime", {})
+            home_goals = score.get("home")
+            away_goals = score.get("away")
+            if home_goals is None or away_goals is None:
+                continue
+            is_home = _fuzzy_team_match(team_name, m.get("homeTeam", {}).get("name", ""))
+            goals = home_goals if is_home else away_goals
+            scored.append(1 if goals > 0 else 0)
+
+        if len(scored) < 5:
+            return {"streak_signal": "INSUFFICIENT_DATA", "atomic_points": 0}
+
+        streak = sum(scored)
+
+        if streak >= 7:
+            return {
+                "streak_signal": "SCORING_7_OF_7",
+                "atomic_points": 2,
+                "market_hint": "BTTS_YES/OVER_2.5",
+                "streak_count": streak,
+            }
+        elif streak >= 5:
+            return {
+                "streak_signal": "SCORING_5_OF_7",
+                "atomic_points": 1,
+                "market_hint": "BTTS_YES",
+                "streak_count": streak,
+            }
+        else:
+            return {"streak_signal": "NEUTRAL", "atomic_points": 0, "streak_count": streak}
+
+    except httpx.TimeoutException:
+        return {"streak_signal": "TIMEOUT", "atomic_points": 0}
+    except Exception as e:
+        logger.warning(f"[StreakSignal] Feil: {e}")
+        return {"streak_signal": "ERROR", "atomic_points": 0, "error": str(e)[:100]}
+
+
+# ─────────────────────────────────────────────────────────
 # KELLY CRITERION
 # ─────────────────────────────────────────────────────────
 def calculate_kelly_stake(
@@ -1057,15 +1165,19 @@ def calculate_atomic_score(
     soft_ev: float,
     weather_result: dict = None,
     referee_result: dict = None,
+    streak_home_result: dict = None,
+    streak_away_result: dict = None,
 ) -> dict:
     """
-    Kombinerer alle 4 atomic signals (velocity, xG, weather, referee).
+    Kombinerer alle 5 atomic signals (velocity, xG, weather, referee, streak).
     ALDRI blokkerende — alltid additivt.
     Gammel gate (SOFT_EDGE_MIN) er alltid siste fallback.
-    Maks score: velocity(2) + xG(2) + edge(2) + EV(1) + weather(1) + referee(0) = 8
+    Maks score: velocity(2) + xG(2) + edge(2) + EV(1) + weather(1) + referee(0) + streak(2) = 10 → capped 9
     """
-    weather_result  = weather_result  or {"signal": "WEATHER_UNAVAILABLE", "atomic_points": 0}
-    referee_result  = referee_result  or {"signal": "REFEREE_UNAVAILABLE", "atomic_points": 0}
+    weather_result      = weather_result      or {"signal": "WEATHER_UNAVAILABLE", "atomic_points": 0}
+    referee_result      = referee_result      or {"signal": "REFEREE_UNAVAILABLE", "atomic_points": 0}
+    streak_home_result  = streak_home_result  or {"streak_signal": "UNAVAILABLE", "atomic_points": 0}
+    streak_away_result  = streak_away_result  or {"streak_signal": "UNAVAILABLE", "atomic_points": 0}
 
     atomic_score = 0
     signals_triggered = []
@@ -1093,6 +1205,29 @@ def calculate_atomic_score(
     atomic_score += r_points
     if r_points > 0:
         signals_triggered.append(referee_result.get("signal", "REFEREE"))
+
+    # Signal 5 — Scoring streak (best av home/away)
+    streak_points = max(
+        streak_home_result.get("atomic_points", 0),
+        streak_away_result.get("atomic_points", 0),
+    )
+    atomic_score += streak_points
+    if streak_points > 0:
+        streak_sig = (
+            streak_home_result.get("streak_signal")
+            if streak_home_result.get("atomic_points", 0) >= streak_away_result.get("atomic_points", 0)
+            else streak_away_result.get("streak_signal")
+        )
+        signals_triggered.append(streak_sig or "STREAK")
+
+    # Cap atomic_score ved 9
+    atomic_score = min(atomic_score, 9)
+
+    # market_hint fra streak (prioriter høyeste poeng)
+    if streak_home_result.get("atomic_points", 0) >= streak_away_result.get("atomic_points", 0):
+        market_hint = streak_home_result.get("market_hint") or streak_away_result.get("market_hint")
+    else:
+        market_hint = streak_away_result.get("market_hint") or streak_home_result.get("market_hint")
 
     # Edge-bonus
     if soft_edge >= 3.5:
@@ -1161,6 +1296,9 @@ def calculate_atomic_score(
         "tier_label": tier_label,
         "post_telegram": post_telegram,
         "kelly_multiplier": kelly_multiplier,
+        "market_hint": market_hint,
+        "streak_home_signal": streak_home_result.get("streak_signal", "UNAVAILABLE"),
+        "streak_away_signal": streak_away_result.get("streak_signal", "UNAVAILABLE"),
     }
 
 
@@ -1624,10 +1762,33 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     except Exception as _re:
                         logger.warning(f"[RefereeSignal] Exception: {_re}")
 
+                # Signal 5 — Scoring streak (home + away)
+                streak_home_result = {"streak_signal": "UNAVAILABLE", "atomic_points": 0}
+                streak_away_result = {"streak_signal": "UNAVAILABLE", "atomic_points": 0}
+                if cfg.FOOTBALL_DATA_API_KEY:
+                    try:
+                        if football_limiter:
+                            await football_limiter.acquire()
+                        streak_home_result = await get_scoring_streak(
+                            m["home_team"], league["name"], cfg.FOOTBALL_DATA_API_KEY
+                        )
+                    except Exception as _she:
+                        logger.warning(f"[StreakSignal] home feil: {_she}")
+                    try:
+                        if football_limiter:
+                            await football_limiter.acquire()
+                        streak_away_result = await get_scoring_streak(
+                            m["away_team"], league["name"], cfg.FOOTBALL_DATA_API_KEY
+                        )
+                    except Exception as _sae:
+                        logger.warning(f"[StreakSignal] away feil: {_sae}")
+
                 atomic_result = calculate_atomic_score(
                     velocity_result, xg_result, soft_edge, soft_ev,
                     weather_result=weather_result,
                     referee_result=referee_result,
+                    streak_home_result=streak_home_result,
+                    streak_away_result=streak_away_result,
                 )
                 # ────────────────────────────────────────────────────────────
 
@@ -1681,6 +1842,9 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                     "referee_name": referee_result.get("referee_name"),
                     "wind_speed": weather_result.get("wind_ms"),
                     "temperature": weather_result.get("temperature_c"),
+                    "signal_streak_home": atomic_result["streak_home_signal"],
+                    "signal_streak_away": atomic_result["streak_away_signal"],
+                    "market_hint": atomic_result["market_hint"],
                     # Tier + Kelly (Decimal engine hvis tilgjengelig)
                     "tier": atomic_result["tier"],
                     "tier_label": atomic_result["tier_label"],
@@ -1744,8 +1908,13 @@ async def run_analysis():
         logger.info("[Analyse] Ingen kvalifiserte picks denne runden")
         return
 
-    # Sorter etter SCORE desc
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    # Sorter: today-filter (kickoff 0-12h) prioriteres, deretter SCORE desc
+    def _sort_key(x):
+        hours = x.get("hours_to_kickoff", 999)
+        today_priority = 1 if 0 <= hours <= 12 else 0
+        return (today_priority, x["score"])
+
+    candidates.sort(key=_sort_key, reverse=True)
     logger.info(f"[Analyse] {len(candidates)} kvalifiserte picks fra {total_scanned} kamper")
 
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2602,7 +2771,7 @@ async def health():
         return JSONResponse(status_code=200, content={
             "status": "online",
             "service": cfg.SERVICE_NAME,
-            "version": "10.1.1-ZD",
+            "version": "10.2.0-btts",
             "db": db_state.to_dict(),
             "env": cfg.ENVIRONMENT,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2615,7 +2784,7 @@ async def health():
 async def root():
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.1.1-ZD",
+        "version": "10.2.0-btts",
         "status": "online",
         "db_connected": db_state.connected,
         "leagues": len(SCAN_LEAGUES),
@@ -3336,7 +3505,7 @@ async def status():
 
     return {
         "service": cfg.SERVICE_NAME,
-        "version": "10.1.1-ZD",
+        "version": "10.2.0-btts",
         "db": db_state.to_dict(),
         "config": {
             "database_url_set": bool(cfg.DATABASE_URL),
@@ -3392,6 +3561,46 @@ async def status():
             "last_fetch_ago_sec": last_fetch_ago_sec,
         },
         "timestamp": now.isoformat(),
+    }
+
+
+@app.get("/admin/test-streak")
+async def admin_test_streak(
+    team: str = "Arsenal",
+    league: str = "Premier League",
+):
+    """
+    STEG 10 — Test Signal 5 scoring streak.
+    ?team=Arsenal&league=Premier+League
+    """
+    if not cfg.FOOTBALL_DATA_API_KEY:
+        return JSONResponse(status_code=400, content={"error": "FOOTBALL_DATA_API_KEY mangler"})
+    result = await get_scoring_streak(team, league, cfg.FOOTBALL_DATA_API_KEY)
+
+    # Test calculate_atomic_score med streak +2
+    dummy_velocity = {"atomic_points": 2, "velocity_type": "SHARP_MONEY"}
+    dummy_xg       = {"atomic_points": 2, "signal": "XG_DIVERGENCE"}
+    dummy_weather  = {"atomic_points": 1, "signal": "FAVORABLE"}
+    dummy_ref      = {"atomic_points": 0, "signal": "NEUTRAL_REF"}
+    streak_home    = result
+    streak_away    = {"streak_signal": "NEUTRAL", "atomic_points": 0}
+    atomic = calculate_atomic_score(
+        dummy_velocity, dummy_xg, 3.5, 5.0,
+        weather_result=dummy_weather,
+        referee_result=dummy_ref,
+        streak_home_result=streak_home,
+        streak_away_result=streak_away,
+    )
+
+    return {
+        "team": team,
+        "league": league,
+        "streak_result": result,
+        "atomic_score_with_streak": atomic["atomic_score"],
+        "tier": atomic["tier"],
+        "market_hint": atomic["market_hint"],
+        "signals_triggered": atomic["signals_triggered"],
+        "streak_home_signal": atomic["streak_home_signal"],
     }
 
 
