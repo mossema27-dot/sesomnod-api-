@@ -4399,7 +4399,8 @@ async def test_scorers_endpoint(
     away: str = "Liverpool"
 ):
     """Diagnostic endpoint: test scorer fetch with real Railway API key."""
-    import os, requests
+    import os
+    import httpx
     key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
     out = {
         "key_present": bool(key),
@@ -4410,11 +4411,11 @@ async def test_scorers_endpoint(
     }
     if key:
         try:
-            r = requests.get(
-                "https://api.football-data.org/v4/competitions/PL/scorers?limit=10",
-                headers={"X-Auth-Token": key},
-                timeout=8
-            )
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    "https://api.football-data.org/v4/competitions/PL/scorers?limit=10",
+                    headers={"X-Auth-Token": key},
+                )
             out["api_status"] = r.status_code
             if r.status_code == 200:
                 out["scorers"] = _get_scorers(home, away)
