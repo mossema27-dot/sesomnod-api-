@@ -4401,32 +4401,38 @@ async def test_scorers_endpoint(
     """Diagnostic endpoint: test scorer fetch with real Railway API key."""
     import httpx
     key = cfg.FOOTBALL_DATA_API_KEY  # uses hardcoded fallback if env var not set
-    out = {
+    out: dict = {
         "key_present": bool(key),
         "key_preview": key[:8] + "..." if key else "MISSING",
         "scorers": [],
+        "raw_pl_top10": [],
         "api_status": None,
         "error": None,
     }
-    if key:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(
-                    "https://api.football-data.org/v4/competitions/PL/scorers?limit=10",
-                    headers={"X-Auth-Token": key},
-                )
-            out["api_status"] = r.status_code
-            if r.status_code == 200:
-                raw = r.json().get("scorers", [])
-                out["raw_pl_top10"] = [
-                    {"name": s.get("player", {}).get("name"),
-                     "team": s.get("team", {}).get("name"),
-                     "goals": s.get("numberOfGoals")}
-                    for s in raw
-                ]
-                out["scorers"] = _get_scorers(home, away)
-            else:
-                out["error"] = r.text[:200]
-        except Exception as e:
-            out["error"] = str(e)
+    if not key:
+        return out
+    try:
+        # Single fetch for both key validation AND raw data display
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://api.football-data.org/v4/competitions/PL/scorers?limit=10",
+                headers={"X-Auth-Token": key},
+            )
+        out["api_status"] = r.status_code
+        if r.status_code != 200:
+            out["error"] = r.text[:200]
+            return out
+        raw = r.json().get("scorers", [])
+        out["raw_pl_top10"] = [
+            {"name": s.get("player", {}).get("name"),
+             "team": s.get("team", {}).get("name"),
+             "goals": s.get("numberOfGoals")}
+            for s in raw
+        ]
+        # Wait 1 second before _get_scorers to avoid rate-limiting the second PL call
+        import asyncio
+        await asyncio.sleep(1)
+        out["scorers"] = _get_scorers(home, away)
+    except Exception as e:
+        out["error"] = str(e)
     return out
