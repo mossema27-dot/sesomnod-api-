@@ -96,7 +96,7 @@ PINNACLE_MARGIN_MAX = float(os.getenv("PINNACLE_MARGIN_MAX", "8.0"))  # Max Pinn
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
 ODDS_MAX            = float(os.getenv("ODDS_MAX", "4.50"))      # Fase 0: over 4.50 = for høy varians
 MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "96"))
-DAILY_POST_LIMIT    = 10
+DAILY_POST_LIMIT    = 3
 MAX_PICKS_PER_MATCH = 2
 MAX_PICKS_PER_LEAGUE = 3
 
@@ -3182,9 +3182,29 @@ async def get_picks():
     try:
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM picks ORDER BY id DESC LIMIT 100"
+                "SELECT * FROM picks WHERE timestamp >= NOW() - INTERVAL '2 days' ORDER BY id DESC LIMIT 100"
             )
-        return {"status": "ok", "data": [enrich_pick(dict(r)) for r in rows], "count": len(rows)}
+        import datetime as _dt
+        today_utc = _dt.datetime.utcnow().date()
+
+        def _is_upcoming(pick: dict) -> bool:
+            if pick.get("is_completed") or pick.get("status") == "FINISHED":
+                return False
+            kickoff_str = str(pick.get("kickoff_cet") or "")
+            if "FERDIGSPILT" in kickoff_str.upper() or "FINISHED" in kickoff_str.upper():
+                return False
+            match_date_str = str(pick.get("match_date") or pick.get("kickoff_utc") or "")
+            try:
+                if "T" in match_date_str:
+                    match_dt = _dt.datetime.fromisoformat(match_date_str.replace("Z", "")).date()
+                    return match_dt >= today_utc
+            except Exception:
+                pass
+            return True
+
+        enriched = [enrich_pick(dict(r)) for r in rows]
+        enriched = [p for p in enriched if _is_upcoming(p)]
+        return {"status": "ok", "data": enriched, "count": len(enriched)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
@@ -3502,6 +3522,41 @@ async def trigger_post_telegram():
             })
     except Exception as e:
         logger.exception(f"[/post-telegram] Feil: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.post("/force-telegram")
+async def force_telegram():
+    """Force a Telegram post bypassing daily limit. For testing only."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+    try:
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT * FROM dagens_kamp
+                WHERE timestamp >= $1
+                ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
+                LIMIT 1
+            """, today_start)
+        if not row:
+            return {"status": "no_picks", "message": "Ingen picks i dag — kjør /run-analysis først"}
+        pick_data = dict(row)
+        message = build_telegram_message(pick_data, rank=1)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+            )
+        return {
+            "status": "sent" if resp.status_code == 200 else "failed",
+            "telegram_http": resp.status_code,
+            "pick": pick_data.get("match"),
+            "message_preview": message[:200],
+        }
+    except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
@@ -4205,6 +4260,44 @@ async def admin_backfill_picks_v2():
         }
     except Exception as e:
         logger.error(f"[Admin] backfill-picks-v2 feilet: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/clean-old-picks")
+async def admin_clean_old_picks():
+    """Sletter fullførte og gamle picks fra databasen. Beholder kun picks fra de siste 2 dagene."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Delete from picks table: older than 2 days
+            deleted_picks = await conn.fetchval(
+                "SELECT COUNT(*) FROM picks WHERE timestamp < NOW() - INTERVAL '2 days'"
+            )
+            await conn.execute(
+                "DELETE FROM picks WHERE timestamp < NOW() - INTERVAL '2 days'"
+            )
+            # Delete from dagens_kamp: completed matches or older than 2 days
+            deleted_dk = await conn.fetchval("""
+                SELECT COUNT(*) FROM dagens_kamp
+                WHERE kickoff < NOW() - INTERVAL '4 hours'
+                   OR kickoff < CURRENT_DATE
+            """)
+            await conn.execute("""
+                DELETE FROM dagens_kamp
+                WHERE kickoff < NOW() - INTERVAL '4 hours'
+                   OR kickoff < CURRENT_DATE
+            """)
+            remaining_picks = await conn.fetchval("SELECT COUNT(*) FROM picks")
+            remaining_dk = await conn.fetchval("SELECT COUNT(*) FROM dagens_kamp")
+        return {
+            "status": "ok",
+            "deleted_from_picks": int(deleted_picks),
+            "deleted_from_dagens_kamp": int(deleted_dk),
+            "remaining_picks": int(remaining_picks),
+            "remaining_dagens_kamp": int(remaining_dk),
+        }
+    except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
