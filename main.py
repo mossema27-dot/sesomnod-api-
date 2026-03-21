@@ -2907,6 +2907,60 @@ async def get_bankroll():
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
+
+def enrich_pick(pick: dict) -> dict:
+    import math
+    xg_home = float(pick.get("signal_xg_home") or pick.get("xg_home") or 1.3)
+    xg_away = float(pick.get("signal_xg_away") or pick.get("xg_away") or 1.1)
+    lam = max(0.5, min(6.0, xg_home + xg_away))
+    def pcdf(n, l):
+        t, term = 0.0, math.exp(-l)
+        for k in range(n + 1):
+            t += term
+            term *= l / (k + 1)
+        return t
+    def pover(n): return round((1 - pcdf(n, lam)) * 100)
+    def pbtts():
+        ph = 1 - math.exp(-max(0.01, xg_home))
+        pa = 1 - math.exp(-max(0.01, xg_away))
+        return round(max(0, min(99, (ph * pa - ph * pa * 0.08 * (xg_home * xg_away * 0.13)) * 100)))
+    atomic = int(pick.get("atomic_score") or 4)
+    soft = float(pick.get("soft_edge") or 0)
+    raw = (min(10,max(0,5+(xg_home-xg_away)*2.5))*2.3 + 5*1.8 +
+           min(10,max(0,atomic*1.1))*1.5 + 5*1.2 + 5*0.9 + 9*0.7 +
+           min(10,max(0,soft*0.8))*3.1)
+    omega = round(min(100, max(0, (raw / 115.0) * 100)))
+    tier = ("BRUTAL" if omega>=72 else "STRONG" if omega>=55 else "MONITORED" if omega>=40 else "SKIP")
+    hw = round(max(5, min(85, (xg_home/lam)*70)))
+    aw = round(max(5, min(85, (xg_away/lam)*60)))
+    btts = pbtts()
+    if not pick.get("home_team") or not pick.get("away_team"):
+        parts = str(pick.get("match_name") or "Hjemme vs Borte").split(" vs ")
+        pick["home_team"] = parts[0].strip() if parts else "Hjemmelag"
+        pick["away_team"] = parts[1].strip() if len(parts) > 1 else "Bortelag"
+    smart = []
+    if soft >= 8.0:
+        smart.append({"market": str(pick.get("market_type") or "Pick"),
+            "selection": str(pick.get("market_type") or "Pick"),
+            "our_prob": round(50+soft), "market_implied_prob": 50,
+            "value_gap_percent": round(soft,1),
+            "unibet_odds": float(pick.get("our_odds") or 2.0),
+            "edge_label": "Sharp Edge" if soft>=15 else "Value Edge"})
+    pick.update({"omega_score":omega,"omega_tier":tier,
+        "xg_home":round(xg_home,1),"xg_away":round(xg_away,1),"lambda":round(lam,1),
+        "btts_yes":btts,"btts_no":100-btts,"btts_is_smart_bet":btts>=60,"btts_value_gap":0.0,
+        "over_05":pover(0),"over_15":pover(1),"over_25":pover(2),
+        "over_35":pover(3),"over_45":pover(4),"under_25":100-pover(2),
+        "home_win_prob":hw,"draw_prob":max(5,100-hw-aw),"away_win_prob":aw,
+        "first_goal_home":round(xg_home/lam*75),"first_goal_away":round(xg_away/lam*65),
+        "first_goal_none_ht":15,
+        "form_home":list(pick.get("form_home") or ["W","D","W","D","W"]),
+        "form_away":list(pick.get("form_away") or ["W","D","W","D","W"]),
+        "smart_bets":smart,"is_completed":bool(pick.get("is_completed") or False),
+        "kickoff_cet":str(pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
+        "our_pick":str(pick.get("market_type") or "Pick")+" @ "+str(round(float(pick.get("our_odds") or 2.0),2))})
+    return pick
+
 @app.get("/picks")
 async def get_picks():
     if not db_state.connected or not db_state.pool:
@@ -2916,7 +2970,7 @@ async def get_picks():
             rows = await conn.fetch(
                 "SELECT * FROM picks ORDER BY id DESC LIMIT 100"
             )
-        return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows)}
+        return {"status": "ok", "data": [enrich_pick(dict(r)) for r in rows], "count": len(rows)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
