@@ -2771,7 +2771,11 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
         for i, s in enumerate(scorers[:4]):
             scorer_block += f"{medals[i]} {s['name']} ({s['team']}): ~{s['prob']}% — {s['goals']} mål sesongen\n"
     else:
-        scorer_block = "Data hentes ved kampstart\n"
+        scorer_block = (
+            f"📊 Scorer-data lastes ved kampstart\n"
+            f"xG Hjem ({home[:15]}): {xg_h:.1f} — høy scoringsforventning\n"
+            f"xG Borte ({away[:15]}): {xg_a:.1f}\n"
+        )
 
     return (
         f"⚡ SESOMNOD ENGINE · {ko}\n"
