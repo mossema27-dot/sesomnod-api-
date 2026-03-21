@@ -2703,9 +2703,9 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
     scorers = _get_scorers(home, away)
     if scorers:
         scorer_block = ""
-        medals = ["🥇", "🥈", "🥉"]
-        for i, s in enumerate(scorers):
-            scorer_block += f"{medals[i]} {s['name']} ({s['team']}): ~{s['prob']}% ({s['goals']} mål)\n"
+        medals = ["🥇", "🥈", "🥉", "🎖"]
+        for i, s in enumerate(scorers[:4]):
+            scorer_block += f"{medals[i]} {s['name']} ({s['team']}): ~{s['prob']}% — {s['goals']} mål sesongen\n"
     else:
         scorer_block = "Data hentes ved kampstart\n"
 
