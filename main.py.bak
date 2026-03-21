@@ -10,12 +10,6 @@ SesomNod Engine v9.0 — CLV ARCHITECTURE EDITION
 
 import sys
 import os
-from pydantic import BaseModel
-from typing import Optional
-
-class ResultUpdate(BaseModel):
-    result: str
-    closing_odds: Optional[float] = None
 
 _original_exit = sys.exit
 def _safe_exit(code=0):
@@ -102,7 +96,7 @@ PINNACLE_MARGIN_MAX = float(os.getenv("PINNACLE_MARGIN_MAX", "8.0"))  # Max Pinn
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
 ODDS_MAX            = float(os.getenv("ODDS_MAX", "4.50"))      # Fase 0: over 4.50 = for høy varians
 MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "96"))
-DAILY_POST_LIMIT    = 3
+DAILY_POST_LIMIT    = 10
 MAX_PICKS_PER_MATCH = 2
 MAX_PICKS_PER_LEAGUE = 3
 
@@ -2560,163 +2554,99 @@ def _tg_bar(pct: float, w: int = 10) -> str:
 
 def _get_scorers(home: str, away: str) -> list:
     """
-    Returns top scorers for BOTH home and away team (max 2 each).
-    Output: interleaved list [home1, away1, home2, away2], max 4 items.
-
+    Fetch top scorers for BOTH teams.
     Strategy:
-      Pass 1 - Competition scorer lists (limit=10 = free tier max)
-               Tries 10 competition codes until both teams have >= 1 scorer.
-      Pass 2 - Team roster fallback for any team still at 0 scorers.
-               Searches by team name, fetches squad, filters attackers.
-      Pass 3 - Honest "not available" — never shows wrong team.
-
-    Team matching: uses token intersection ignoring noise words.
-    Handles "Brighton & Hove Albion" vs "Brighton and Hove Albion" correctly.
-    Uses urllib.parse.quote (not requests.utils.quote which does not exist).
-    Uses correct football-data.org position strings (e.g. "Centre-Forward").
+      1. Try football-data.org /scorers with limit=10 (max allowed on free tier)
+         across all 10 comp codes until we have >=1 scorer per team.
+      2. If a team still has 0 scorers after all comps, try /teams endpoint
+         to find the team ID, then /persons to get squad top scorers.
+      3. Hard fallback: use xG-based anonymous estimate only if API totally fails.
     """
-    import os as _os
-    import urllib.parse as _ul
-    import requests as _req
+    import os as _o, requests as _r, math as _m
 
-    _key = cfg.FOOTBALL_DATA_API_KEY
-    if not _key:
+    key = _o.environ.get("FOOTBALL_DATA_API_KEY","")
+    if not key:
         return []
 
-    _H = {"X-Auth-Token": _key}
+    headers = {"X-Auth-Token": key}
+    home_s, away_s = [], []
 
-    _NOISE = {
-        "fc", "afc", "sc", "cf", "ac", "as", "bv", "sv",
-        "the", "and", "de", "van", "&",
-        "hove",
-        "hotspur",
-        "sporting",
-        "athletic",
-        "cp",
-        "1903", "1905", "1907", "1908", "1899",
-        "09", "04", "05",
-    }
-
-    def _tok(name: str) -> set:
-        cleaned = name.lower().replace("&", " ").replace(".", " ")
-        return set(cleaned.split()) - _NOISE
-
-    def _match(pick_name: str, api_name: str) -> bool:
-        pt = _tok(pick_name)
-        at = _tok(api_name)
-        shared = pt & at
-        if not shared:
-            return False
-        _GENERIC = {
-            "city", "united", "albion", "rovers", "wanderers",
-            "town", "county", "athletic", "athletics",
-        }
-        meaningful = shared - _GENERIC
-        return len(meaningful) >= 1
-
-    _ATTACK = {
-        "Centre-Forward",
-        "Second Striker",
-        "Left Winger",
-        "Right Winger",
-        "Attacking Midfield",
-        "Left Midfield",
-        "Right Midfield",
-    }
-
-    home_s: list = []
-    away_s: list = []
-
-    _COMPS = ["PL", "PD", "BL1", "SA", "FL1", "CL", "EL", "ECL", "DED", "PPL"]
-    for comp in _COMPS:
+    # Pass 1: competition scorer lists (limit=10 is free-tier max)
+    for comp in ["PL","PD","BL1","SA","FL1","CL","EL","ECL","DED","PPL"]:
         if len(home_s) >= 2 and len(away_s) >= 2:
             break
         try:
-            r = _req.get(
-                f"https://api.football-data.org/v4/competitions/{comp}"
-                f"/scorers?limit=10",
-                headers=_H, timeout=6)
-            if r.status_code == 429:
-                break
+            r = _r.get(
+                f"https://api.football-data.org/v4/competitions/{comp}/scorers?limit=10",
+                headers=headers, timeout=6)
             if r.status_code != 200:
                 continue
-            for s in r.json().get("scorers", []):
-                api_team = s.get("team", {}).get("name", "")
-                name     = s.get("player", {}).get("name", "")
-                goals    = int(s.get("numberOfGoals") or 0)
-                is_home  = _match(home, api_team)
-                is_away  = _match(away, api_team)
-                if is_home and not is_away and len(home_s) < 2:
-                    home_s.append({
-                        "name": name, "team": home,
-                        "goals": goals, "prob": min(65, 12 + goals * 3),
-                    })
-                elif is_away and not is_home and len(away_s) < 2:
-                    away_s.append({
-                        "name": name, "team": away,
-                        "goals": goals, "prob": min(65, 12 + goals * 3),
-                    })
-        except _req.RequestException:
+            for s in r.json().get("scorers",[]):
+                team  = s.get("team",{}).get("name","")
+                name  = s.get("player",{}).get("name","")
+                goals = int(s.get("numberOfGoals") or 0)
+                entry = {"name":name,"team":team,"goals":goals,
+                         "prob": min(65, 12 + goals*3)}
+                if team == home and len(home_s) < 2:
+                    home_s.append(entry)
+                elif team == away and len(away_s) < 2:
+                    away_s.append(entry)
+        except Exception:
             continue
 
-    def _roster(team_name: str) -> list:
+    # Pass 2: for any team still missing scorers, search by team name
+    for team_name, bucket in [(home, home_s), (away, away_s)]:
+        if len(bucket) >= 1:
+            continue
         try:
-            encoded = _ul.quote(team_name)
-            r = _req.get(
-                f"https://api.football-data.org/v4/teams?name={encoded}",
-                headers=_H, timeout=6)
+            # Find team ID
+            r = _r.get(
+                f"https://api.football-data.org/v4/teams?name={_r.utils.quote(team_name)}",
+                headers=headers, timeout=6)
             if r.status_code != 200:
-                return []
-            teams = r.json().get("teams", [])
+                continue
+            teams = r.json().get("teams",[])
             if not teams:
-                return []
-            matched = next(
-                (t for t in teams if _match(team_name, t.get("name", ""))),
-                teams[0]
-            )
-            if not matched:
-                return []
-            r2 = _req.get(
-                f"https://api.football-data.org/v4/teams/{matched['id']}",
-                headers=_H, timeout=6)
+                continue
+            team_id = teams[0]["id"]
+
+            # Get squad
+            r2 = _r.get(
+                f"https://api.football-data.org/v4/teams/{team_id}",
+                headers=headers, timeout=6)
             if r2.status_code != 200:
-                return []
-            squad = r2.json().get("squad", [])
-            attackers = [
-                p for p in squad
-                if p.get("position", "") in _ATTACK
-            ]
-            return [
-                {"name": p.get("name", ""), "team": team_name,
-                 "goals": 0, "prob": 18}
-                for p in attackers[:2]
-            ]
-        except _req.RequestException:
-            return []
+                continue
+            squad = r2.json().get("squad",[])
 
-    if len(home_s) < 1:
-        home_s = _roster(home)
-    if len(away_s) < 1:
-        away_s = _roster(away)
+            # Get top scorers from squad (attackers/midfielders first)
+            attackers = [p for p in squad
+                        if p.get("position") in ("Forwards","Midfield","Attacker")]
+            for p in attackers[:2]:
+                bucket.append({
+                    "name":  p.get("name",""),
+                    "team":  team_name,
+                    "goals": 0,
+                    "prob":  20,
+                })
+        except Exception:
+            continue
 
+    # Pass 3: hard fallback if STILL empty (no fake names — honest message)
     if not home_s:
-        home_s = [{"name": "Scorer ikke tilgjengelig",
-                   "team": home, "goals": 0, "prob": 0}]
+        home_s = [{"name": f"{home} - scorer ikke funnet", "team": home,
+                   "goals": 0, "prob": 0}]
     if not away_s:
-        away_s = [{"name": "Scorer ikke tilgjengelig",
-                   "team": away, "goals": 0, "prob": 0}]
+        away_s = [{"name": f"{away} - scorer ikke funnet", "team": away,
+                   "goals": 0, "prob": 0}]
 
+    # Interleave home/away sorted by goals
     home_s.sort(key=lambda x: x["goals"], reverse=True)
     away_s.sort(key=lambda x: x["goals"], reverse=True)
-
-    out = []
+    result = []
     for i in range(2):
-        if i < len(home_s):
-            out.append(home_s[i])
-        if i < len(away_s):
-            out.append(away_s[i])
-
-    return out[:4]
+        if i < len(home_s): result.append(home_s[i])
+        if i < len(away_s):  result.append(away_s[i])
+    return result[:4]
 
 def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> str:
     home   = pick.get("home_team") or pick.get("match", "?").split(" vs ")[0]
@@ -2777,11 +2707,7 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
         for i, s in enumerate(scorers[:4]):
             scorer_block += f"{medals[i]} {s['name']} ({s['team']}): ~{s['prob']}% — {s['goals']} mål sesongen\n"
     else:
-        scorer_block = (
-            f"📊 Scorer-data lastes ved kampstart\n"
-            f"xG Hjem ({home[:15]}): {xg_h:.1f} — høy scoringsforventning\n"
-            f"xG Borte ({away[:15]}): {xg_a:.1f}\n"
-        )
+        scorer_block = "Data hentes ved kampstart\n"
 
     return (
         f"⚡ SESOMNOD ENGINE · {ko}\n"
@@ -3053,17 +2979,6 @@ async def lifespan(app: FastAPI):
 
     if db_state.connected:
         logger.info("[APP] SesomNod Engine KLAR! (FULL MODE)")
-        try:
-            async with db_state.pool.acquire() as conn:
-                await conn.execute("""
-                    ALTER TABLE picks ADD COLUMN IF NOT EXISTS result       VARCHAR(10) DEFAULT 'PENDING';
-                    ALTER TABLE picks ADD COLUMN IF NOT EXISTS closing_odds FLOAT;
-                    ALTER TABLE picks ADD COLUMN IF NOT EXISTS clv          FLOAT;
-                    ALTER TABLE picks ADD COLUMN IF NOT EXISTS league       VARCHAR(60);
-                """)
-            logger.info("[Blokk2] picks-kolonner migrert (result, closing_odds, clv, league)")
-        except Exception as _e:
-            logger.warning(f"[Blokk2] Migrasjon feilet (ikke kritisk): {_e}")
     else:
         logger.info("[APP] SesomNod Engine KLAR! (OFFLINE MODE)")
 
@@ -3199,29 +3114,9 @@ async def get_picks():
     try:
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, match_name AS match, market, odds, edge, ev, confidence, omega_score, result, closing_odds, clv, league, btts_yes, smart_bets, form_home, xg_home, match_date, created_at FROM picks WHERE timestamp >= NOW() - INTERVAL '2 days' ORDER BY id DESC LIMIT 100"
+                "SELECT * FROM picks ORDER BY id DESC LIMIT 100"
             )
-        import datetime as _dt
-        today_utc = _dt.datetime.utcnow().date()
-
-        def _is_upcoming(pick: dict) -> bool:
-            if pick.get("is_completed") or pick.get("status") == "FINISHED":
-                return False
-            kickoff_str = str(pick.get("kickoff_cet") or "")
-            if "FERDIGSPILT" in kickoff_str.upper() or "FINISHED" in kickoff_str.upper():
-                return False
-            match_date_str = str(pick.get("match_date") or pick.get("kickoff_utc") or "")
-            try:
-                if "T" in match_date_str:
-                    match_dt = _dt.datetime.fromisoformat(match_date_str.replace("Z", "")).date()
-                    return match_dt >= today_utc
-            except Exception:
-                pass
-            return True
-
-        enriched = [enrich_pick(dict(r)) for r in rows]
-        enriched = [p for p in enriched if _is_upcoming(p)]
-        return {"status": "ok", "data": enriched, "count": len(enriched)}
+        return {"status": "ok", "data": [enrich_pick(dict(r)) for r in rows], "count": len(rows)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
@@ -3539,61 +3434,6 @@ async def trigger_post_telegram():
             })
     except Exception as e:
         logger.exception(f"[/post-telegram] Feil: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
-
-
-@app.post("/send-message")
-async def send_custom_message(body: dict):
-    """Send a custom text message to Telegram channel."""
-    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
-        return JSONResponse(status_code=503, content={"error": "TELEGRAM ikke konfigurert"})
-    text = body.get("text", "")
-    if not text:
-        return {"status": "error", "message": "No text provided"}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": text},
-            )
-        return {"status": "sent" if resp.status_code == 200 else "failed",
-                "telegram_http": resp.status_code}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
-
-
-@app.post("/force-telegram")
-async def force_telegram():
-    """Force a Telegram post bypassing daily limit. For testing only."""
-    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
-        return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
-    if not db_state.connected or not db_state.pool:
-        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
-    try:
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        async with db_state.pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT * FROM dagens_kamp
-                WHERE timestamp >= $1
-                ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
-                LIMIT 1
-            """, today_start)
-        if not row:
-            return {"status": "no_picks", "message": "Ingen picks i dag — kjør /run-analysis først"}
-        pick_data = dict(row)
-        message = build_telegram_message(pick_data, rank=1)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
-            )
-        return {
-            "status": "sent" if resp.status_code == 200 else "failed",
-            "telegram_http": resp.status_code,
-            "pick": pick_data.get("match"),
-            "message_preview": message[:200],
-        }
-    except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
@@ -4300,44 +4140,6 @@ async def admin_backfill_picks_v2():
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
-@app.post("/admin/clean-old-picks")
-async def admin_clean_old_picks():
-    """Sletter fullførte og gamle picks fra databasen. Beholder kun picks fra de siste 2 dagene."""
-    if not db_state.connected or not db_state.pool:
-        return JSONResponse(status_code=503, content={"error": "DB offline"})
-    try:
-        async with db_state.pool.acquire() as conn:
-            # Delete from picks table: older than 2 days
-            deleted_picks = await conn.fetchval(
-                "SELECT COUNT(*) FROM picks WHERE timestamp < NOW() - INTERVAL '2 days'"
-            )
-            await conn.execute(
-                "DELETE FROM picks WHERE timestamp < NOW() - INTERVAL '2 days'"
-            )
-            # Delete from dagens_kamp: completed matches or older than 2 days
-            deleted_dk = await conn.fetchval("""
-                SELECT COUNT(*) FROM dagens_kamp
-                WHERE kickoff < NOW() - INTERVAL '4 hours'
-                   OR kickoff < CURRENT_DATE
-            """)
-            await conn.execute("""
-                DELETE FROM dagens_kamp
-                WHERE kickoff < NOW() - INTERVAL '4 hours'
-                   OR kickoff < CURRENT_DATE
-            """)
-            remaining_picks = await conn.fetchval("SELECT COUNT(*) FROM picks")
-            remaining_dk = await conn.fetchval("SELECT COUNT(*) FROM dagens_kamp")
-        return {
-            "status": "ok",
-            "deleted_from_picks": int(deleted_picks),
-            "deleted_from_dagens_kamp": int(deleted_dk),
-            "remaining_picks": int(remaining_picks),
-            "remaining_dagens_kamp": int(remaining_dk),
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
-
-
 @app.post("/admin/cleanup-test-picks")
 async def admin_cleanup_test_picks():
     """Sletter test-rader med home_team='TestHome' fra picks og dagens_kamp."""
@@ -4526,76 +4328,3 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(f"Fyrer opp Uvicorn på port {cfg.PORT}...")
     uvicorn.run(app, host="0.0.0.0", port=cfg.PORT, log_level="info")
-
-@app.get("/test-scorers")
-async def test_scorers_endpoint(
-    home: str = "Brighton and Hove Albion",
-    away: str = "Liverpool"
-):
-    """Diagnostic endpoint: test scorer fetch with real Railway API key."""
-    import httpx
-    key = cfg.FOOTBALL_DATA_API_KEY  # uses hardcoded fallback if env var not set
-    out: dict = {
-        "key_present": bool(key),
-        "key_preview": key[:8] + "..." if key else "MISSING",
-        "scorers": [],
-        "raw_pl_top10": [],
-        "api_status": None,
-        "error": None,
-    }
-    if not key:
-        return out
-    try:
-        # Single fetch for both key validation AND raw data display
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(
-                "https://api.football-data.org/v4/competitions/PL/scorers?limit=10",
-                headers={"X-Auth-Token": key},
-            )
-        out["api_status"] = r.status_code
-        if r.status_code != 200:
-            out["error"] = r.text[:200]
-            return out
-        raw = r.json().get("scorers", [])
-        out["raw_pl_top10"] = [
-            {"name": s.get("player", {}).get("name"),
-             "team": s.get("team", {}).get("name"),
-             "goals": s.get("numberOfGoals")}
-            for s in raw
-        ]
-        # Wait 1 second before _get_scorers to avoid rate-limiting the second PL call
-        import asyncio
-        await asyncio.sleep(1)
-        out["scorers"] = _get_scorers(home, away)
-    except Exception as e:
-        out["error"] = str(e)
-    return out
-
-
-# ─── Blokk 3 — v10.2.1: PATCH /picks/{pick_id}/result ────────────────────────
-@app.patch("/picks/{pick_id}/result")
-async def update_pick_result(pick_id: int, body: ResultUpdate):
-    if body.result not in {"WIN", "LOSS", "VOID"}:
-        raise HTTPException(status_code=400, detail='result må være "WIN", "LOSS" eller "VOID"')
-    if not db_state.connected or db_state.pool is None:
-        raise HTTPException(status_code=503, detail="Database ikke tilgjengelig")
-    async with db_state.pool.acquire() as conn:
-        pick = await conn.fetchrow("SELECT id, odds FROM picks WHERE id = $1", pick_id)
-        if not pick:
-            raise HTTPException(status_code=404, detail=f"Pick {pick_id} finnes ikke")
-        clv: Optional[float] = None
-        if body.closing_odds and body.closing_odds > 0:
-            market_odds = float(pick["odds"] or 0)
-            if market_odds > 0:
-                clv = round((market_odds / body.closing_odds - 1) * 100, 2)
-        await conn.execute(
-            "UPDATE picks SET result=$1, closing_odds=$2, clv=$3 WHERE id=$4",
-            body.result, body.closing_odds, clv, pick_id
-        )
-    return {
-        "pick_id": pick_id,
-        "result": body.result,
-        "closing_odds": body.closing_odds,
-        "clv": clv,
-        "clv_label": f"{clv:+.2f}%" if clv is not None else "Ingen CLV",
-    }
