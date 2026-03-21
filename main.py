@@ -4417,6 +4417,13 @@ async def test_scorers_endpoint(
                 )
             out["api_status"] = r.status_code
             if r.status_code == 200:
+                raw = r.json().get("scorers", [])
+                out["raw_pl_top10"] = [
+                    {"name": s.get("player", {}).get("name"),
+                     "team": s.get("team", {}).get("name"),
+                     "goals": s.get("numberOfGoals")}
+                    for s in raw
+                ]
                 out["scorers"] = _get_scorers(home, away)
             else:
                 out["error"] = r.text[:200]
