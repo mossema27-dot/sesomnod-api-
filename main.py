@@ -3141,8 +3141,8 @@ async def get_bankroll():
 
 def enrich_pick(pick: dict) -> dict:
     import math
-    xg_home = float(pick.get("signal_xg_home") or pick.get("xg_home") or 1.3)
-    xg_away = float(pick.get("signal_xg_away") or pick.get("xg_away") or 1.1)
+    xg_home = float(pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home") or 1.3)
+    xg_away = float(pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away") or 1.1)
     lam = max(0.5, min(6.0, xg_home + xg_away))
     def pcdf(n, l):
         t, term = 0.0, math.exp(-l)
@@ -3156,7 +3156,7 @@ def enrich_pick(pick: dict) -> dict:
         pa = 1 - math.exp(-max(0.01, xg_away))
         return round(max(0, min(99, (ph * pa - ph * pa * 0.08 * (xg_home * xg_away * 0.13)) * 100)))
     atomic = int(pick.get("atomic_score") or 4)
-    soft = float(pick.get("soft_edge") or 0)
+    soft = float(pick.get("soft_edge") or pick.get("edge") or 0)
     raw = (min(10,max(0,5+(xg_home-xg_away)*2.5))*2.3 + 5*1.8 +
            min(10,max(0,atomic*1.1))*1.5 + 5*1.2 + 5*0.9 + 9*0.7 +
            min(10,max(0,soft*0.8))*3.1)
@@ -3206,24 +3206,24 @@ async def get_picks():
                 """
                 SELECT
                     id,
-                    match_name,
+                    match        AS match_name,
                     home_team,
                     away_team,
                     odds,
-                    soft_edge    AS edge,
-                    soft_ev      AS ev,
+                    edge,
+                    ev,
                     atomic_score,
                     tier         AS omega_tier,
-                    signal_xg_home,
-                    signal_xg_away,
-                    result,
+                    market_hint,
                     league,
-                    kickoff_time,
+                    kickoff      AS kickoff_time,
                     timestamp,
-                    posted_at,
-                    created_at
-                FROM picks_v2
-                WHERE COALESCE(timestamp, created_at, NOW()) >= NOW() - INTERVAL '7 days'
+                    confidence,
+                    signal_xg,
+                    xg_divergence_home,
+                    xg_divergence_away
+                FROM dagens_kamp
+                WHERE timestamp >= NOW() - INTERVAL '7 days'
                 ORDER BY id DESC LIMIT 100
                 """
             )
