@@ -4399,9 +4399,8 @@ async def test_scorers_endpoint(
     away: str = "Liverpool"
 ):
     """Diagnostic endpoint: test scorer fetch with real Railway API key."""
-    import os
     import httpx
-    key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    key = cfg.FOOTBALL_DATA_API_KEY  # uses hardcoded fallback if env var not set
     out = {
         "key_present": bool(key),
         "key_preview": key[:8] + "..." if key else "MISSING",
