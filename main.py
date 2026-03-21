@@ -4392,3 +4392,34 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(f"Fyrer opp Uvicorn på port {cfg.PORT}...")
     uvicorn.run(app, host="0.0.0.0", port=cfg.PORT, log_level="info")
+
+@app.get("/test-scorers")
+async def test_scorers_endpoint(
+    home: str = "Brighton and Hove Albion",
+    away: str = "Liverpool"
+):
+    """Diagnostic endpoint: test scorer fetch with real Railway API key."""
+    import os, requests
+    key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    out = {
+        "key_present": bool(key),
+        "key_preview": key[:8] + "..." if key else "MISSING",
+        "scorers": [],
+        "api_status": None,
+        "error": None,
+    }
+    if key:
+        try:
+            r = requests.get(
+                "https://api.football-data.org/v4/competitions/PL/scorers?limit=10",
+                headers={"X-Auth-Token": key},
+                timeout=8
+            )
+            out["api_status"] = r.status_code
+            if r.status_code == 200:
+                out["scorers"] = _get_scorers(home, away)
+            else:
+                out["error"] = r.text[:200]
+        except Exception as e:
+            out["error"] = str(e)
+    return out
