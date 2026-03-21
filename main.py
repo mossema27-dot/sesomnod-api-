@@ -2547,73 +2547,160 @@ async def post_clv_rapport_telegram():
 # ─────────────────────────────────────────────────────────
 # TELEGRAM MESSAGE FORMATTER
 # ─────────────────────────────────────────────────────────
-def _format_pick_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> str:
-    kickoff = pick.get("kickoff")
+def _tg_bar(pct: float, w: int = 10) -> str:
+    f = round(max(0, min(w, pct / 100 * w)))
+    return "█" * f + "░" * (w - f)
+
+
+def _get_scorers(home: str, away: str) -> list:
+    key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    if not key:
+        return []
+    headers = {"X-Auth-Token": key}
+    comp_map = {
+        "Premier League": "PL", "La Liga": "PD", "Bundesliga": "BL1",
+        "Serie A": "SA", "Ligue 1": "FL1", "Champions League": "CL",
+        "Europa League": "EL", "Conference League": "ECL",
+        "Eredivisie": "DED", "Primeira Liga": "PPL",
+    }
+    import requests as _req
+    for comp_code in comp_map.values():
+        try:
+            url = f"https://api.football-data.org/v4/competitions/{comp_code}/scorers?limit=15"
+            r = _req.get(url, headers=headers, timeout=4)
+            if r.status_code != 200:
+                continue
+            out = []
+            for s in r.json().get("scorers", []):
+                team = s.get("team", {}).get("name", "")
+                if team in [home, away]:
+                    goals = s.get("numberOfGoals", 0) or 0
+                    out.append({
+                        "name": s.get("player", {}).get("name", ""),
+                        "team": team,
+                        "goals": goals,
+                        "prob": min(65, 12 + int(goals) * 3),
+                    })
+            if out:
+                out.sort(key=lambda x: x["goals"], reverse=True)
+                return out[:3]
+        except Exception:
+            continue
+    return []
+
+
+def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> str:
+    home   = pick.get("home_team") or pick.get("match", "?").split(" vs ")[0]
+    away   = pick.get("away_team") or (pick.get("match", "?").split(" vs ")[-1])
+    if pick.get("league_flag") and pick.get("league"):
+        league = f"{pick['league_flag']} {pick['league']}"
+    else:
+        league = pick.get("league", "Football")
+
+    # Kickoff formatting
+    kickoff = pick.get("kickoff") or pick.get("commence_time")
     if kickoff:
         if isinstance(kickoff, str):
             kickoff = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
         cet = kickoff + timedelta(hours=1)
-        dato = cet.strftime("%-d. %b")
-        tid = cet.strftime("%H:%M")
-    elif pick.get("commence_time"):
-        kickoff_dt = datetime.fromisoformat(pick["commence_time"].replace("Z", "+00:00"))
-        cet = kickoff_dt + timedelta(hours=1)
-        dato = cet.strftime("%-d. %b")
-        tid = cet.strftime("%H:%M")
+        ko = cet.strftime("%-d. %b %H:%M CET")
     else:
-        dato, tid = "–", "–"
+        ko = str(pick.get("match_date") or pick.get("kickoff_cet", "?"))
 
-    if pick.get("league_flag") and pick.get("league"):
-        league = f"{pick['league_flag']} {pick['league']}"
+    odds   = float(pick.get("odds") or pick.get("our_odds") or 0)
+    edge   = float(pick.get("edge") or pick.get("soft_edge") or 0)
+    ev     = float(pick.get("ev") or pick.get("ev_percent") or 0)
+    score  = float(pick.get("score") or pick.get("atomic_score") or 0)
+    books  = pick.get("num_bookmakers") or pick.get("bookmakers") or 1
+    market_raw = pick.get("market_type") or "h2h"
+    market = {"h2h": "1X2", "totals_over25": "Over 2.5", "totals_over35": "Over 3.5"}.get(market_raw, market_raw.upper())
+    pick_label = pick.get("pick") or pick.get("pick_label") or f"{home} vinner"
+    scan   = pick.get("total_scanned") or total_scanned or 0
+
+    xg_h = float(pick.get("xg_home") or pick.get("signal_xg_home") or 1.3)
+    xg_a = float(pick.get("xg_away") or pick.get("signal_xg_away") or 1.1)
+    lam  = max(0.5, min(6.0, xg_h + xg_a))
+
+    def _pcdf(n: int, l: float) -> float:
+        t, term = 0.0, math.exp(-l)
+        for k in range(n + 1):
+            t += term
+            term *= l / (k + 1)
+        return t
+
+    def pover(n: int) -> int:
+        return round((1 - _pcdf(n, lam)) * 100)
+
+    ph   = round(max(5, min(85, (xg_h / lam) * 70)))
+    pa   = round(max(5, min(85, (xg_a / lam) * 60)))
+    pd   = max(5, 100 - ph - pa)
+    btts = round(max(15, min(85, (1 - math.exp(-xg_h)) * (1 - math.exp(-xg_a)) * 100)))
+
+    omega = int(pick.get("omega_score") or 0)
+    tier  = ("⚡ BRUTAL EDGE" if omega >= 72 else
+             "💪 STRONG EDGE" if omega >= 55 else
+             "👁 MONITORED"   if omega >= 40 else "📊 ANALYSE")
+
+    scorers = _get_scorers(home, away)
+    if scorers:
+        scorer_block = ""
+        medals = ["🥇", "🥈", "🥉"]
+        for i, s in enumerate(scorers):
+            scorer_block += f"{medals[i]} {s['name']} ({s['team']}): ~{s['prob']}% ({s['goals']} mål)\n"
     else:
-        league = pick.get("league", "–")
-
-    home_team  = pick.get("home_team") or pick.get("match", "–").split(" vs ")[0]
-    away_team  = pick.get("away_team") or pick.get("match", "–").split(" vs ")[-1]
-    odds_val   = float(pick.get("odds") or 0)
-    edge_val   = float(pick.get("edge") or 0)
-    ev_val     = float(pick.get("ev") or 0)
-    score_val  = float(pick.get("score") or 0)
-    num_bk     = pick.get("num_bookmakers") or pick.get("bookmaker_count") or 0
-    pick_label = pick.get("pick", "–")
-    market     = pick.get("market_type") or "h2h"
-    scan_count = pick.get("total_scanned") or total_scanned or 0
-
-    market_display = {
-        "h2h": "1X2",
-        "totals_over25": "Over 2.5",
-        "totals_over35": "Over 3.5",
-    }.get(market, market.upper())
+        scorer_block = "Data hentes ved kampstart\n"
 
     return (
-        "⚡ SESOMNOD ENGINE\n"
-        "Football Decision Intelligence\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🏆 {league} · MATCH BRIEF\n\n"
-        f"🏟 {home_team}\n"
-        "         VS\n"
-        f"       {away_team}\n\n"
-        f"🕒 {dato} · {tid} CET\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📈 EDGE ANALYSE\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Market:    {market_display}\n"
-        f"Odds:      {odds_val}\n"
-        f"Edge:      +{edge_val}%\n"
-        f"EV:        +{ev_val}%\n"
-        f"SCORE:     {score_val:.2f}\n"
-        f"Books:     {num_bk}\n"
-        f"Scan:      {scan_count} kamper analysert\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 MODEL DECISION\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"PICK:    {pick_label}\n"
-        f"ODDS:    @ {odds_val}\n"
-        f"RANK:    #{rank} av dagen\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "You don't get picks. You get control. ⚡\n"
-        "SesomNod Engine"
+        f"⚡ SESOMNOD ENGINE · {ko}\n"
+        f"Football Decision Intelligence\n"
+        f"──────────────────────────────\n\n"
+        f"🏆 {league}\n\n"
+        f"🎯 {home} VS {away}\n"
+        f"🕐 {ko}\n\n"
+        f"──────────────────────────────\n"
+        f"📊 SANNSYNLIGHETER\n"
+        f"──────────────────────────────\n"
+        f"1️⃣  {home[:22]}: {ph}%\n"
+        f"    {_tg_bar(ph)}\n"
+        f"🤝  Uavgjort: {pd}%\n"
+        f"    {_tg_bar(pd)}\n"
+        f"2️⃣  {away[:22]}: {pa}%\n"
+        f"    {_tg_bar(pa)}\n\n"
+        f"──────────────────────────────\n"
+        f"⚽ MÅL (xG {xg_h:.1f} vs {xg_a:.1f})\n"
+        f"──────────────────────────────\n"
+        f"Over 1.5: {pover(1)}%  {_tg_bar(pover(1))}\n"
+        f"Over 2.5: {pover(2)}%  {_tg_bar(pover(2))}\n"
+        f"Over 3.5: {pover(3)}%  {_tg_bar(pover(3))}\n"
+        f"Over 4.5: {pover(4)}%  {_tg_bar(pover(4))}\n\n"
+        f"──────────────────────────────\n"
+        f"🔴 BTTS — Begge lag scorer\n"
+        f"──────────────────────────────\n"
+        f"JA:  {btts}%  {_tg_bar(btts)}\n"
+        f"NEI: {100-btts}%  {_tg_bar(100-btts)}\n\n"
+        f"──────────────────────────────\n"
+        f"🎯 SCORER-PREDIKSJON\n"
+        f"──────────────────────────────\n"
+        f"{scorer_block}\n"
+        f"──────────────────────────────\n"
+        f"📈 EDGE ANALYSE\n"
+        f"──────────────────────────────\n"
+        f"Market: {market} | Odds: {odds}\n"
+        f"Edge: +{edge:.2f}% | EV: +{ev:.2f}%\n"
+        f"Score: {score:.2f} | Books: {books}\n"
+        f"Scan: {scan} kamper analysert\n\n"
+        f"──────────────────────────────\n"
+        f"🎯 MODEL DECISION  {tier}\n"
+        f"──────────────────────────────\n"
+        f"PICK: {pick_label}\n"
+        f"ODDS: @ {odds} | RANK: #{rank} av dagen\n\n"
+        f"You don't get picks. You get control. ⚡\n"
+        f"🔞 Spill alltid ansvarlig | sesomnod.no"
     )
+
+
+def _format_pick_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> str:
+    return build_telegram_message(pick, rank=rank, total_scanned=total_scanned)
 
 
 # ─────────────────────────────────────────────────────────
