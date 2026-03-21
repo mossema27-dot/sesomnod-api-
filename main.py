@@ -87,8 +87,8 @@ EV_MIN              = float(os.getenv("EV_MIN", "1.5"))        # Legacy
 EDGE_MIN            = float(os.getenv("EDGE_MIN", "1.5"))       # Legacy
 CONFIDENCE_MIN      = int(os.getenv("CONFIDENCE_MIN", "65"))    # Fase 0: min confidence
 MIN_BOOKMAKERS      = int(os.getenv("MIN_BOOKMAKERS", "3"))     # Fase 0: min antall bookmakers
-SOFT_EDGE_MIN       = float(os.getenv("SOFT_EDGE_MIN", "3.0"))  # Dual Benchmark: min edge mot soft benchmark
-SOFT_EV_MIN         = float(os.getenv("SOFT_EV_MIN", "3.0"))    # Dual Benchmark: min EV mot soft benchmark
+SOFT_EDGE_MIN       = float(os.getenv("SOFT_EDGE_MIN", "0.5"))  # Dual Benchmark: min edge mot soft benchmark
+SOFT_EV_MIN         = float(os.getenv("SOFT_EV_MIN", "0.5"))    # Dual Benchmark: min EV mot soft benchmark
 BENCHMARK           = os.getenv("BENCHMARK", "unibet")           # Primær soft benchmark-bok (7/7 ligaer)
 PINNACLE_CLV_TRACK  = os.getenv("PINNACLE_CLV_TRACK", "true").lower() == "true"
 PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
@@ -726,7 +726,7 @@ async def _log_api_call(conn, window_name: str, league_key: str, status_code: in
 # ─────────────────────────────────────────────────────────
 # ATOMIC SIGNAL ARCHITECTURE — konstanter
 # ─────────────────────────────────────────────────────────
-ATOMIC_SCORE_MIN         = int(os.getenv("ATOMIC_SCORE_MIN", "3"))
+ATOMIC_SCORE_MIN         = int(os.getenv("ATOMIC_SCORE_MIN", "1"))
 XG_DIVERGENCE_THRESHOLD  = float(os.getenv("XG_DIVERGENCE_THRESHOLD", "0.6"))
 VELOCITY_SHARP_DELTA     = float(os.getenv("VELOCITY_SHARP_DELTA", "0.10"))
 VELOCITY_SHARP_MINUTES   = int(os.getenv("VELOCITY_SHARP_MINUTES", "60"))
