@@ -3192,7 +3192,7 @@ def enrich_pick(pick: dict) -> dict:
         "form_home":list(pick.get("form_home") or ["W","D","W","D","W"]),
         "form_away":list(pick.get("form_away") or ["W","D","W","D","W"]),
         "smart_bets":smart,"is_completed":bool(pick.get("is_completed") or False),
-        "kickoff_cet":str(pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
+        "kickoff_cet":str(pick.get("kickoff_time") or pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
         "our_pick":market_label+" @ "+str(round(our_odds_val,2))})
     return pick
 
@@ -3206,8 +3206,9 @@ async def get_picks():
                 """
                 SELECT
                     id,
-                    match        AS match_name,
-                    pick,
+                    match_name,
+                    home_team,
+                    away_team,
                     odds,
                     soft_edge    AS edge,
                     soft_ev      AS ev,
@@ -3220,8 +3221,10 @@ async def get_picks():
                     closing_odds,
                     clv,
                     league,
+                    kickoff_time,
                     timestamp,
-                    posted_at
+                    posted_at,
+                    created_at
                 FROM picks
                 WHERE timestamp >= NOW() - INTERVAL '2 days'
                 ORDER BY id DESC LIMIT 100
