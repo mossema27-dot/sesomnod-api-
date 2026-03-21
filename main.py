@@ -3225,9 +3225,8 @@ async def get_picks():
                     timestamp,
                     posted_at,
                     created_at
-                FROM picks
-                WHERE timestamp >= NOW() - INTERVAL '7 days'
-                   OR created_at >= NOW() - INTERVAL '7 days'
+                FROM picks_v2
+                WHERE COALESCE(timestamp, created_at, NOW()) >= NOW() - INTERVAL '7 days'
                 ORDER BY id DESC LIMIT 100
                 """
             )
