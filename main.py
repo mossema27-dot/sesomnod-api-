@@ -3525,6 +3525,26 @@ async def trigger_post_telegram():
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
+@app.post("/send-message")
+async def send_custom_message(body: dict):
+    """Send a custom text message to Telegram channel."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return JSONResponse(status_code=503, content={"error": "TELEGRAM ikke konfigurert"})
+    text = body.get("text", "")
+    if not text:
+        return {"status": "error", "message": "No text provided"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": text},
+            )
+        return {"status": "sent" if resp.status_code == 200 else "failed",
+                "telegram_http": resp.status_code}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 @app.post("/force-telegram")
 async def force_telegram():
     """Force a Telegram post bypassing daily limit. For testing only."""
