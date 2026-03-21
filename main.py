@@ -4572,6 +4572,46 @@ async def test_scorers_endpoint(
     return out
 
 
+# ─── Blokk 3.5 — Notion result logger ────────────────────────────────────────
+async def _log_result_to_notion(pick_row: dict, result: str, clv: Optional[float]):
+    """Logger pick-resultat til Notion (oppdaterer Status + CLV)."""
+    if not cfg.NOTION_TOKEN or not cfg.NOTION_DB_ID:
+        return
+    try:
+        name = f"✅ RESULT: {pick_row.get('home_team','?')} vs {pick_row.get('away_team','?')}"
+        status_label = result  # WIN, LOSS, VOID
+
+        props: dict = {
+            "Name":    {"title": [{"text": {"content": name}}]},
+            "Status":  {"select": {"name": status_label}},
+            "Pick":    {"rich_text": [{"text": {"content": str(pick_row.get("pick",""))}}]},
+            "Odds":    {"number": float(pick_row.get("odds") or 0)},
+        }
+        if clv is not None:
+            props["EV"] = {"rich_text": [{"text": {"content": f"CLV: {clv:+.2f}%"}}]}
+        if pick_row.get("home_team"):
+            props["Hjemmelag"] = {"rich_text": [{"text": {"content": pick_row["home_team"]}}]}
+        if pick_row.get("away_team"):
+            props["Bortelag"] = {"rich_text": [{"text": {"content": pick_row["away_team"]}}]}
+
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {cfg.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"parent": {"database_id": cfg.NOTION_DB_ID}, "properties": props},
+            )
+        if resp.status_code == 200:
+            logger.info(f"[Notion] Resultat logget: {result} for pick {pick_row.get('id')}")
+        else:
+            logger.warning(f"[Notion] Resultat-logging feil {resp.status_code}: {resp.text[:150]}")
+    except Exception as exc:
+        logger.warning(f"[Notion] Resultat-logging exception: {exc}")
+
+
 # ─── Blokk 3 — v10.2.1: PATCH /picks/{pick_id}/result ────────────────────────
 @app.patch("/picks/{pick_id}/result")
 async def update_pick_result(pick_id: int, body: ResultUpdate):
@@ -4580,7 +4620,9 @@ async def update_pick_result(pick_id: int, body: ResultUpdate):
     if not db_state.connected or db_state.pool is None:
         raise HTTPException(status_code=503, detail="Database ikke tilgjengelig")
     async with db_state.pool.acquire() as conn:
-        pick = await conn.fetchrow("SELECT id, odds FROM picks WHERE id = $1", pick_id)
+        pick = await conn.fetchrow(
+            "SELECT id, odds, pick, home_team, away_team FROM picks WHERE id = $1", pick_id
+        )
         if not pick:
             raise HTTPException(status_code=404, detail=f"Pick {pick_id} finnes ikke")
         clv: Optional[float] = None
@@ -4592,6 +4634,8 @@ async def update_pick_result(pick_id: int, body: ResultUpdate):
             "UPDATE picks SET result=$1, closing_odds=$2, clv=$3 WHERE id=$4",
             body.result, body.closing_odds, clv, pick_id
         )
+    # Fire-and-forget Notion logging
+    asyncio.create_task(_log_result_to_notion(dict(pick), body.result, clv))
     return {
         "pick_id": pick_id,
         "result": body.result,
