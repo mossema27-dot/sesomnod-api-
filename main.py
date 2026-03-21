@@ -2573,7 +2573,7 @@ def _get_scorers(home: str, away: str) -> list:
     import urllib.parse as _ul
     import requests as _req
 
-    _key = _os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    _key = cfg.FOOTBALL_DATA_API_KEY
     if not _key:
         return []
 
