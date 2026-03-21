@@ -2554,99 +2554,163 @@ def _tg_bar(pct: float, w: int = 10) -> str:
 
 def _get_scorers(home: str, away: str) -> list:
     """
-    Fetch top scorers for BOTH teams.
-    Strategy:
-      1. Try football-data.org /scorers with limit=10 (max allowed on free tier)
-         across all 10 comp codes until we have >=1 scorer per team.
-      2. If a team still has 0 scorers after all comps, try /teams endpoint
-         to find the team ID, then /persons to get squad top scorers.
-      3. Hard fallback: use xG-based anonymous estimate only if API totally fails.
-    """
-    import os as _o, requests as _r, math as _m
+    Returns top scorers for BOTH home and away team (max 2 each).
+    Output: interleaved list [home1, away1, home2, away2], max 4 items.
 
-    key = _o.environ.get("FOOTBALL_DATA_API_KEY","")
-    if not key:
+    Strategy:
+      Pass 1 - Competition scorer lists (limit=10 = free tier max)
+               Tries 10 competition codes until both teams have >= 1 scorer.
+      Pass 2 - Team roster fallback for any team still at 0 scorers.
+               Searches by team name, fetches squad, filters attackers.
+      Pass 3 - Honest "not available" — never shows wrong team.
+
+    Team matching: uses token intersection ignoring noise words.
+    Handles "Brighton & Hove Albion" vs "Brighton and Hove Albion" correctly.
+    Uses urllib.parse.quote (not requests.utils.quote which does not exist).
+    Uses correct football-data.org position strings (e.g. "Centre-Forward").
+    """
+    import os as _os
+    import urllib.parse as _ul
+    import requests as _req
+
+    _key = _os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    if not _key:
         return []
 
-    headers = {"X-Auth-Token": key}
-    home_s, away_s = [], []
+    _H = {"X-Auth-Token": _key}
 
-    # Pass 1: competition scorer lists (limit=10 is free-tier max)
-    for comp in ["PL","PD","BL1","SA","FL1","CL","EL","ECL","DED","PPL"]:
+    _NOISE = {
+        "fc", "afc", "sc", "cf", "ac", "as", "bv", "sv",
+        "the", "and", "de", "van", "&",
+        "hove",
+        "hotspur",
+        "sporting",
+        "athletic",
+        "cp",
+        "1903", "1905", "1907", "1908", "1899",
+        "09", "04", "05",
+    }
+
+    def _tok(name: str) -> set:
+        cleaned = name.lower().replace("&", " ").replace(".", " ")
+        return set(cleaned.split()) - _NOISE
+
+    def _match(pick_name: str, api_name: str) -> bool:
+        pt = _tok(pick_name)
+        at = _tok(api_name)
+        shared = pt & at
+        if not shared:
+            return False
+        _GENERIC = {
+            "city", "united", "albion", "rovers", "wanderers",
+            "town", "county", "athletic", "athletics",
+        }
+        meaningful = shared - _GENERIC
+        return len(meaningful) >= 1
+
+    _ATTACK = {
+        "Centre-Forward",
+        "Second Striker",
+        "Left Winger",
+        "Right Winger",
+        "Attacking Midfield",
+        "Left Midfield",
+        "Right Midfield",
+    }
+
+    home_s: list = []
+    away_s: list = []
+
+    _COMPS = ["PL", "PD", "BL1", "SA", "FL1", "CL", "EL", "ECL", "DED", "PPL"]
+    for comp in _COMPS:
         if len(home_s) >= 2 and len(away_s) >= 2:
             break
         try:
-            r = _r.get(
-                f"https://api.football-data.org/v4/competitions/{comp}/scorers?limit=10",
-                headers=headers, timeout=6)
+            r = _req.get(
+                f"https://api.football-data.org/v4/competitions/{comp}"
+                f"/scorers?limit=10",
+                headers=_H, timeout=6)
+            if r.status_code == 429:
+                break
             if r.status_code != 200:
                 continue
-            for s in r.json().get("scorers",[]):
-                team  = s.get("team",{}).get("name","")
-                name  = s.get("player",{}).get("name","")
-                goals = int(s.get("numberOfGoals") or 0)
-                entry = {"name":name,"team":team,"goals":goals,
-                         "prob": min(65, 12 + goals*3)}
-                if team == home and len(home_s) < 2:
-                    home_s.append(entry)
-                elif team == away and len(away_s) < 2:
-                    away_s.append(entry)
-        except Exception:
+            for s in r.json().get("scorers", []):
+                api_team = s.get("team", {}).get("name", "")
+                name     = s.get("player", {}).get("name", "")
+                goals    = int(s.get("numberOfGoals") or 0)
+                is_home  = _match(home, api_team)
+                is_away  = _match(away, api_team)
+                if is_home and not is_away and len(home_s) < 2:
+                    home_s.append({
+                        "name": name, "team": home,
+                        "goals": goals, "prob": min(65, 12 + goals * 3),
+                    })
+                elif is_away and not is_home and len(away_s) < 2:
+                    away_s.append({
+                        "name": name, "team": away,
+                        "goals": goals, "prob": min(65, 12 + goals * 3),
+                    })
+        except _req.RequestException:
             continue
 
-    # Pass 2: for any team still missing scorers, search by team name
-    for team_name, bucket in [(home, home_s), (away, away_s)]:
-        if len(bucket) >= 1:
-            continue
+    def _roster(team_name: str) -> list:
         try:
-            # Find team ID
-            r = _r.get(
-                f"https://api.football-data.org/v4/teams?name={_r.utils.quote(team_name)}",
-                headers=headers, timeout=6)
+            encoded = _ul.quote(team_name)
+            r = _req.get(
+                f"https://api.football-data.org/v4/teams?name={encoded}",
+                headers=_H, timeout=6)
             if r.status_code != 200:
-                continue
-            teams = r.json().get("teams",[])
+                return []
+            teams = r.json().get("teams", [])
             if not teams:
-                continue
-            team_id = teams[0]["id"]
-
-            # Get squad
-            r2 = _r.get(
-                f"https://api.football-data.org/v4/teams/{team_id}",
-                headers=headers, timeout=6)
+                return []
+            matched = next(
+                (t for t in teams if _match(team_name, t.get("name", ""))),
+                teams[0]
+            )
+            if not matched:
+                return []
+            r2 = _req.get(
+                f"https://api.football-data.org/v4/teams/{matched['id']}",
+                headers=_H, timeout=6)
             if r2.status_code != 200:
-                continue
-            squad = r2.json().get("squad",[])
+                return []
+            squad = r2.json().get("squad", [])
+            attackers = [
+                p for p in squad
+                if p.get("position", "") in _ATTACK
+            ]
+            return [
+                {"name": p.get("name", ""), "team": team_name,
+                 "goals": 0, "prob": 18}
+                for p in attackers[:2]
+            ]
+        except _req.RequestException:
+            return []
 
-            # Get top scorers from squad (attackers/midfielders first)
-            attackers = [p for p in squad
-                        if p.get("position") in ("Forwards","Midfield","Attacker")]
-            for p in attackers[:2]:
-                bucket.append({
-                    "name":  p.get("name",""),
-                    "team":  team_name,
-                    "goals": 0,
-                    "prob":  20,
-                })
-        except Exception:
-            continue
+    if len(home_s) < 1:
+        home_s = _roster(home)
+    if len(away_s) < 1:
+        away_s = _roster(away)
 
-    # Pass 3: hard fallback if STILL empty (no fake names — honest message)
     if not home_s:
-        home_s = [{"name": f"{home} - scorer ikke funnet", "team": home,
-                   "goals": 0, "prob": 0}]
+        home_s = [{"name": "Scorer ikke tilgjengelig",
+                   "team": home, "goals": 0, "prob": 0}]
     if not away_s:
-        away_s = [{"name": f"{away} - scorer ikke funnet", "team": away,
-                   "goals": 0, "prob": 0}]
+        away_s = [{"name": "Scorer ikke tilgjengelig",
+                   "team": away, "goals": 0, "prob": 0}]
 
-    # Interleave home/away sorted by goals
     home_s.sort(key=lambda x: x["goals"], reverse=True)
     away_s.sort(key=lambda x: x["goals"], reverse=True)
-    result = []
+
+    out = []
     for i in range(2):
-        if i < len(home_s): result.append(home_s[i])
-        if i < len(away_s):  result.append(away_s[i])
-    return result[:4]
+        if i < len(home_s):
+            out.append(home_s[i])
+        if i < len(away_s):
+            out.append(away_s[i])
+
+    return out[:4]
 
 def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> str:
     home   = pick.get("home_team") or pick.get("match", "?").split(" vs ")[0]
