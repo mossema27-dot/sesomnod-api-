@@ -3177,7 +3177,11 @@ def enrich_pick(pick: dict) -> dict:
             "value_gap_percent": round(soft,1),
             "unibet_odds": float(pick.get("our_odds") or 2.0),
             "edge_label": "Sharp Edge" if soft>=15 else "Value Edge"})
+    market_label = str(pick.get("market_hint") or pick.get("market_type") or "Pick")
+    our_odds_val  = float(pick.get("odds") or 2.0)
+    ev_val        = float(pick.get("ev") or soft or 0)
     pick.update({"omega_score":omega,"omega_tier":tier,
+        "ev": round(ev_val, 2),
         "xg_home":round(xg_home,1),"xg_away":round(xg_away,1),"lambda":round(lam,1),
         "btts_yes":btts,"btts_no":100-btts,"btts_is_smart_bet":btts>=60,"btts_value_gap":0.0,
         "over_05":pover(0),"over_15":pover(1),"over_25":pover(2),
@@ -3189,7 +3193,7 @@ def enrich_pick(pick: dict) -> dict:
         "form_away":list(pick.get("form_away") or ["W","D","W","D","W"]),
         "smart_bets":smart,"is_completed":bool(pick.get("is_completed") or False),
         "kickoff_cet":str(pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
-        "our_pick":str(pick.get("market_type") or "Pick")+" @ "+str(round(float(pick.get("our_odds") or 2.0),2))})
+        "our_pick":market_label+" @ "+str(round(our_odds_val,2))})
     return pick
 
 @app.get("/picks")
@@ -3199,7 +3203,29 @@ async def get_picks():
     try:
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, match_name AS match, market, odds, edge, ev, confidence, omega_score, result, closing_odds, clv, league, btts_yes, smart_bets, form_home, xg_home, match_date, created_at FROM picks WHERE timestamp >= NOW() - INTERVAL '2 days' ORDER BY id DESC LIMIT 100"
+                """
+                SELECT
+                    id,
+                    match        AS match_name,
+                    pick,
+                    odds,
+                    soft_edge    AS edge,
+                    soft_ev      AS ev,
+                    atomic_score,
+                    tier         AS omega_tier,
+                    signal_xg_home,
+                    signal_xg_away,
+                    market_hint,
+                    result,
+                    closing_odds,
+                    clv,
+                    league,
+                    timestamp,
+                    posted_at
+                FROM picks
+                WHERE timestamp >= NOW() - INTERVAL '2 days'
+                ORDER BY id DESC LIMIT 100
+                """
             )
         import datetime as _dt
         today_utc = _dt.datetime.utcnow().date()
