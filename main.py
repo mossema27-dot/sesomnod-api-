@@ -640,7 +640,7 @@ async def ensure_tables(pool: asyncpg.Pool):
             )
             await conn.execute(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_picks_v2_atomic "
-                "ON picks_v2(atomic_score) WHERE atomic_score >= 3"
+                "ON picks_v2(atomic_score) WHERE atomic_score >= 1"
             )
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
@@ -1299,10 +1299,10 @@ def calculate_atomic_score(
         market_hint = streak_away_result.get("market_hint") or streak_home_result.get("market_hint")
 
     # Edge-bonus
-    if soft_edge >= 3.5:
+    if soft_edge >= 0.5:
         atomic_score += 2
         signals_triggered.append("STRONG_EDGE_35PCT")
-    elif soft_edge >= 2.5:
+    elif soft_edge >= 0.5:
         atomic_score += 1
         signals_triggered.append("EDGE_25PCT")
 
@@ -1323,26 +1323,26 @@ def calculate_atomic_score(
     if not xg_available and not velocity_available:
         verdict = "LEGACY_GATE"
         gate_passed = soft_edge >= float(os.getenv("SOFT_EDGE_MIN", "2.0"))
-    elif atomic_score >= 6:
+    elif atomic_score >= 1:
         verdict = "ATOMIC_CONFIRMED"
         gate_passed = True
-    elif atomic_score >= 4:
+    elif atomic_score >= 1:
         verdict = "ATOMIC_PROBABLE"
-        gate_passed = soft_edge >= 2.5
-    elif atomic_score >= 2:
+        gate_passed = soft_edge >= 0.5
+    elif atomic_score >= 1:
         verdict = "WEAK_SIGNAL"
-        gate_passed = soft_edge >= 3.5
+        gate_passed = soft_edge >= 0.5
     else:
         verdict = "NO_SIGNAL"
         gate_passed = False
 
     # Tier-klassifisering
-    if atomic_score >= 7:
+    if atomic_score >= 1:
         tier = "ATOMIC"
         tier_label = "⚡ ATOMIC SIGNAL"
         post_telegram = True
         kelly_multiplier = 1.0
-    elif atomic_score >= 4:
+    elif atomic_score >= 1:
         tier = "EDGE"
         tier_label = "🎯 EDGE SIGNAL"
         post_telegram = True
