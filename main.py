@@ -3226,8 +3226,8 @@ async def get_picks():
                     closing_odds,
                     clv
                 FROM dagens_kamp
-                WHERE kickoff >= NOW() - INTERVAL '3 hours'
-                  AND kickoff <= NOW() + INTERVAL '36 hours'
+                WHERE kickoff >= NOW() - INTERVAL '4 hours'
+                  AND kickoff <= NOW() + INTERVAL '48 hours'
                 ORDER BY kickoff ASC
                 LIMIT 100
                 """
