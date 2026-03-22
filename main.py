@@ -3141,8 +3141,8 @@ async def get_bankroll():
 
 def enrich_pick(pick: dict) -> dict:
     import math
-    xg_home = float(pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home") or 1.3)
-    xg_away = float(pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away") or 1.1)
+    xg_home = max(0.0, float(pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home") or 1.3))
+    xg_away = max(0.0, float(pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away") or 1.1))
     lam = max(0.5, min(6.0, xg_home + xg_away))
     def pcdf(n, l):
         t, term = 0.0, math.exp(-l)
@@ -3187,7 +3187,8 @@ def enrich_pick(pick: dict) -> dict:
         "over_05":pover(0),"over_15":pover(1),"over_25":pover(2),
         "over_35":pover(3),"over_45":pover(4),"under_25":100-pover(2),
         "home_win_prob":hw,"draw_prob":max(5,100-hw-aw),"away_win_prob":aw,
-        "first_goal_home":round(xg_home/lam*75),"first_goal_away":round(xg_away/lam*65),
+        "home_odds":round(100/max(1,hw),2),"draw_odds":round(100/max(1,100-hw-aw),2),"away_odds":round(100/max(1,aw),2),
+        "first_goal_home":max(0,round(xg_home/lam*75)),"first_goal_away":max(0,round(xg_away/lam*65)),
         "first_goal_none_ht":15,
         "form_home":list(pick.get("form_home") or ["W","D","W","D","W"]),
         "form_away":list(pick.get("form_away") or ["W","D","W","D","W"]),
@@ -3195,6 +3196,51 @@ def enrich_pick(pick: dict) -> dict:
         "kickoff_cet":str(pick.get("kickoff_time") or pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
         "our_pick":market_label+" @ "+str(round(our_odds_val,2))})
     return pick
+
+_live_cache: dict = {"data": {}, "fetched_at": 0.0}
+
+async def fetch_live_scores() -> dict:
+    """Henter live scores fra football-data.org. Caches i 60s."""
+    now = time.time()
+    if now - _live_cache["fetched_at"] < 60:
+        return _live_cache["data"]
+    fd_key = os.environ.get("FOOTBALL_DATA_API_KEY", "")
+    if not fd_key:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                "https://api.football-data.org/v4/matches",
+                headers={"X-Auth-Token": fd_key},
+                params={"status": "LIVE,IN_PLAY,PAUSED,HALFTIME"},
+            )
+        if r.status_code != 200:
+            return {}
+        scores: dict = {}
+        for m in r.json().get("matches", []):
+            home = m["homeTeam"]["name"]
+            away = m["awayTeam"]["name"]
+            sc = m.get("score", {})
+            ft = sc.get("fullTime", {}) or {}
+            ht = sc.get("halfTime", {}) or {}
+            h_goals = ft.get("home") if ft.get("home") is not None else ht.get("home") or 0
+            a_goals = ft.get("away") if ft.get("away") is not None else ht.get("away") or 0
+            minute = m.get("minute") or ""
+            scores[f"{home} vs {away}"] = {
+                "score": f"{h_goals}-{a_goals}",
+                "minute": minute,
+                "status": m.get("status", ""),
+            }
+            # Also try short name variants
+            scores[f"{m['homeTeam'].get('shortName', home)} vs {m['awayTeam'].get('shortName', away)}"] = scores[f"{home} vs {away}"]
+        _live_cache["data"] = scores
+        _live_cache["fetched_at"] = now
+        logger.info(f"[live-scores] {len(scores)} live kamper hentet")
+        return scores
+    except Exception as e:
+        logger.warning(f"[live-scores] feil: {e}")
+        return {}
+
 
 @app.get("/picks")
 async def get_picks():
@@ -3226,13 +3272,20 @@ async def get_picks():
                     closing_odds,
                     clv
                 FROM dagens_kamp
-                WHERE kickoff >= NOW() - INTERVAL '4 hours'
-                  AND kickoff <= NOW() + INTERVAL '48 hours'
+                WHERE kickoff >= NOW() - INTERVAL '3 hours'
+                  AND kickoff <= NOW() + INTERVAL '36 hours'
                 ORDER BY kickoff ASC
                 LIMIT 100
                 """
             )
         enriched = [enrich_pick(dict(r)) for r in rows]
+        live_scores = await fetch_live_scores()
+        for pick in enriched:
+            match_key = pick.get("match_name", "")
+            live = live_scores.get(match_key, {})
+            pick["live_score"] = live.get("score") if live else None
+            pick["minute"] = live.get("minute") if live else None
+            pick["is_live"] = bool(live)
         return {"status": "ok", "data": enriched, "count": len(enriched)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
