@@ -3206,47 +3206,33 @@ async def get_picks():
                 """
                 SELECT
                     id,
-                    match        AS match_name,
+                    match                 AS match_name,
                     home_team,
                     away_team,
                     odds,
                     edge,
                     ev,
                     atomic_score,
-                    tier         AS omega_tier,
+                    tier                  AS omega_tier,
                     market_hint,
                     league,
-                    kickoff      AS kickoff_time,
+                    kickoff               AS kickoff_time,
                     timestamp,
                     confidence,
                     signal_xg,
                     xg_divergence_home,
-                    xg_divergence_away
+                    xg_divergence_away,
+                    result,
+                    closing_odds,
+                    clv
                 FROM dagens_kamp
-                WHERE timestamp >= NOW() - INTERVAL '7 days'
-                ORDER BY id DESC LIMIT 100
+                WHERE kickoff >= NOW() - INTERVAL '3 hours'
+                  AND kickoff <= NOW() + INTERVAL '36 hours'
+                ORDER BY kickoff ASC
+                LIMIT 100
                 """
             )
-        import datetime as _dt
-        today_utc = _dt.datetime.utcnow().date()
-
-        def _is_upcoming(pick: dict) -> bool:
-            if pick.get("is_completed") or pick.get("status") == "FINISHED":
-                return False
-            kickoff_str = str(pick.get("kickoff_cet") or "")
-            if "FERDIGSPILT" in kickoff_str.upper() or "FINISHED" in kickoff_str.upper():
-                return False
-            match_date_str = str(pick.get("match_date") or pick.get("kickoff_utc") or "")
-            try:
-                if "T" in match_date_str:
-                    match_dt = _dt.datetime.fromisoformat(match_date_str.replace("Z", "")).date()
-                    return match_dt >= today_utc
-            except Exception:
-                pass
-            return True
-
         enriched = [enrich_pick(dict(r)) for r in rows]
-        enriched = [p for p in enriched if _is_upcoming(p)]
         return {"status": "ok", "data": enriched, "count": len(enriched)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
