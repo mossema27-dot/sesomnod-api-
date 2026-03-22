@@ -4646,22 +4646,31 @@ async def update_pick_result(pick_id: int, body: ResultUpdate):
     if not db_state.connected or db_state.pool is None:
         raise HTTPException(status_code=503, detail="Database ikke tilgjengelig")
     async with db_state.pool.acquire() as conn:
+        # Ensure result column exists on dagens_kamp
+        await conn.execute("""
+            ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS result       VARCHAR(10);
+            ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS closing_odds FLOAT;
+            ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS clv          FLOAT;
+        """)
         pick = await conn.fetchrow(
-            "SELECT id, odds, pick, home_team, away_team FROM picks WHERE id = $1", pick_id
+            "SELECT id, odds, pick, home_team, away_team, match FROM dagens_kamp WHERE id = $1",
+            pick_id
         )
         if not pick:
-            raise HTTPException(status_code=404, detail=f"Pick {pick_id} finnes ikke")
+            raise HTTPException(status_code=404, detail=f"Pick {pick_id} finnes ikke i dagens_kamp")
         clv: Optional[float] = None
         if body.closing_odds and body.closing_odds > 0:
             market_odds = float(pick["odds"] or 0)
             if market_odds > 0:
                 clv = round((market_odds / body.closing_odds - 1) * 100, 2)
         await conn.execute(
-            "UPDATE picks SET result=$1, closing_odds=$2, clv=$3 WHERE id=$4",
+            "UPDATE dagens_kamp SET result=$1, closing_odds=$2, clv=$3 WHERE id=$4",
             body.result, body.closing_odds, clv, pick_id
         )
+    pick_dict = dict(pick)
+    pick_dict["match_name"] = pick_dict.pop("match", "")
     # Fire-and-forget Notion logging
-    asyncio.create_task(_log_result_to_notion(dict(pick), body.result, clv))
+    asyncio.create_task(_log_result_to_notion(pick_dict, body.result, clv))
     return {
         "pick_id": pick_id,
         "result": body.result,
