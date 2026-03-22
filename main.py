@@ -4678,3 +4678,94 @@ async def update_pick_result(pick_id: int, body: ResultUpdate):
         "clv": clv,
         "clv_label": f"{clv:+.2f}%" if clv is not None else "Ingen CLV",
     }
+
+
+@app.get("/control-wall")
+async def get_control_wall():
+    if not db_state.connected or db_state.pool is None:
+        return JSONResponse(status_code=503, content={"error": "Database ikke tilgjengelig"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT
+                    id,
+                    COALESCE(match, match_name, '') AS match_name,
+                    COALESCE(market_hint, pick, '') AS market,
+                    COALESCE(atomic_score, 0)       AS omega_score,
+                    COALESCE(edge, 0)               AS edge,
+                    COALESCE(ev, 0)                 AS ev,
+                    COALESCE(confidence, '')        AS confidence,
+                    COALESCE(xg_divergence_home, 0) AS xg_home,
+                    COALESCE(xg_divergence_away, 0) AS xg_away,
+                    result
+                FROM dagens_kamp
+                WHERE timestamp >= NOW() - INTERVAL '24 hours'
+                ORDER BY COALESCE(atomic_score, 0) DESC
+                LIMIT 200
+            """)
+
+        def veto(r: dict) -> str:
+            ev_val = r["ev"] or 0
+            om_val = r["omega_score"] or 0
+            conf   = r["confidence"] or ""
+            if ev_val < 8:
+                return f"EV +{ev_val:.1f}% under terskel (≥8% kreves)"
+            if conf not in ("HIGH", "VERY HIGH"):
+                return f"Konfidens '{conf}' — ikke HIGH"
+            if om_val < 50:
+                return f"OMEGA {om_val} — signal for svakt (≥50 kreves)"
+            return "Utilstrekkelig samlet edge"
+
+        all_rows = [dict(r) for r in rows]
+        accepted = [r for r in all_rows if (r["ev"] or 0) >= 8 and (r["confidence"] or "") in ("HIGH", "VERY HIGH")]
+        rejected = [r for r in all_rows if not ((r["ev"] or 0) >= 8 and (r["confidence"] or "") in ("HIGH", "VERY HIGH"))]
+
+        return {
+            "date": datetime.utcnow().date().isoformat(),
+            "scanned": len(all_rows),
+            "accepted": len(accepted),
+            "rejected_count": len(rejected),
+            "rejected_picks": [
+                {**r, "veto_reason": veto(r)} for r in rejected[:30]
+            ],
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+@app.get("/picks/{pick_id}/receipt")
+async def get_pick_receipt(pick_id: int):
+    if not db_state.connected or db_state.pool is None:
+        return JSONResponse(status_code=503, content={"error": "Database ikke tilgjengelig"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT
+                    id,
+                    COALESCE(match, match_name, '') AS match_name,
+                    COALESCE(market_hint, pick, '') AS market,
+                    COALESCE(odds, 0)               AS placed_odds,
+                    COALESCE(atomic_score, 0)       AS omega_score,
+                    COALESCE(ev, 0)                 AS ev_pct,
+                    clv                             AS clv_pct,
+                    COALESCE(result, 'PENDING')     AS result,
+                    timestamp
+                FROM dagens_kamp
+                WHERE id = $1
+            """, pick_id)
+        if not row:
+            return JSONResponse(status_code=404, content={"error": f"Pick {pick_id} ikke funnet"})
+        d = dict(row)
+        return {
+            "id": d["id"],
+            "match": d["match_name"],
+            "market": d["market"],
+            "placed_odds": float(d["placed_odds"] or 0),
+            "omega_score": int(d["omega_score"] or 0),
+            "ev_pct": float(d["ev_pct"] or 0),
+            "clv_pct": round(float(d["clv_pct"]), 2) if d["clv_pct"] is not None else None,
+            "result": d["result"],
+            "date": d["timestamp"].strftime("%d.%m.%Y") if d["timestamp"] else "",
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
