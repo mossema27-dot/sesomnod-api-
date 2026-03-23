@@ -2828,7 +2828,7 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
         f"PICK: {pick_label}\n"
         f"ODDS: @ {odds} | RANK: #{rank} av dagen\n\n"
         f"You don't get picks. You get control. ⚡\n"
-        f"🔞 Spill alltid ansvarlig | sesomnod.no"
+        f"SesomNod gir deg kontroll og innsikt — ikke tilfeldigheter. Trenger du hjelp med spillavhengighet? Ring Hjelpelinjen gratis på 800 800 40."
     )
 
 
