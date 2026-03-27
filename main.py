@@ -101,7 +101,7 @@ PINNACLE_EDGE_MIN   = 1.0    # Min edge mot Pinnacle (brukt kun i logging)
 PINNACLE_MARGIN_MAX = float(os.getenv("PINNACLE_MARGIN_MAX", "8.0"))  # Max Pinnacle margin%
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
 ODDS_MAX            = float(os.getenv("ODDS_MAX", "4.50"))      # Fase 0: over 4.50 = for høy varians
-MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "96"))
+MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "24"))
 DAILY_POST_LIMIT    = 3
 MAX_PICKS_PER_MATCH = 2
 MAX_PICKS_PER_LEAGUE = 3
