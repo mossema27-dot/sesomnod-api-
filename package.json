@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "kelly": "^3.0.0",
+    "twilio": "^5.13.1"
+  }
+}
