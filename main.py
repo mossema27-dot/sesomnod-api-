@@ -1431,11 +1431,29 @@ async def fetch_all_odds(leagues: list = None, window_name: str = "early"):
                 if not isinstance(data, list):
                     continue
 
+                # Filtrer kun kamper innen 24 timer (kun dagens kamper)
+                now = datetime.now(timezone.utc)
+                filtered_data = []
+                for m in data:
+                    try:
+                        commence = datetime.fromisoformat(
+                            m["commence_time"].replace("Z", "+00:00")
+                        )
+                        hours = (commence - now).total_seconds() / 3600
+                        if 1 <= hours <= 24:  # Kun dagens kamper
+                            filtered_data.append(m)
+                    except:
+                        continue
+                
+                if not filtered_data:
+                    logger.info(f"[OddsCache] {league['name']}: Ingen kamper innen 24 timer")
+                    continue
+
                 async with db_state.pool.acquire() as conn:
                     await conn.execute("""
                         INSERT INTO odds_snapshots (league_key, snapshot_time, data)
                         VALUES ($1, $2, $3)
-                    """, league["key"], snap_time, json.dumps(data))
+                    """, league["key"], snap_time, json.dumps(filtered_data))
 
                     # Populer match_odds_history for velocity-beregning
                     for m in data:
