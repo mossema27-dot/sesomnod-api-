@@ -4826,3 +4826,21 @@ async def get_pick_receipt(pick_id: int):
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+# ─── TEAM LOGO PROXY ─────────────────────────────────────────────────────────
+# Fetches TheSportsDB server-side to avoid browser CORS restrictions.
+@app.get("/team-logo")
+async def get_team_logo(team: str):
+    try:
+        import httpx
+        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={team}"
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(url)
+            data = r.json()
+            if data.get("teams"):
+                logo = data["teams"][0].get("strTeamBadge") or ""
+                return {"logo": logo}
+        return {"logo": ""}
+    except Exception:
+        return {"logo": ""}
