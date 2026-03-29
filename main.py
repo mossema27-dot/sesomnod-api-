@@ -3192,7 +3192,7 @@ def enrich_pick(pick: dict) -> dict:
         pick["home_team"] = parts[0].strip() if parts else "Hjemmelag"
         pick["away_team"] = parts[1].strip() if len(parts) > 1 else "Bortelag"
     smart = []
-    if soft >= 8.0:
+    if soft >= 7.0:
         smart.append({"market": str(pick.get("market_type") or "Pick"),
             "selection": str(pick.get("market_type") or "Pick"),
             "our_prob": round(50+soft), "market_implied_prob": 50,
@@ -3294,7 +3294,7 @@ async def get_picks():
                     closing_odds,
                     clv
                 FROM dagens_kamp
-                WHERE kickoff >= NOW() - INTERVAL '3 hours'
+                WHERE kickoff > NOW() - INTERVAL '1 hour'
                   AND kickoff <= NOW() + INTERVAL '36 hours'
                 ORDER BY kickoff ASC
                 LIMIT 100
