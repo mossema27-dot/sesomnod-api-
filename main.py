@@ -2923,9 +2923,11 @@ async def post_dagens_kamp_telegram():
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
         async with db_state.pool.acquire() as conn:
+            # Count picks already posted today (by kickoff window so date-of-insert doesn't matter)
             daily_posted = await conn.fetchval("""
                 SELECT COUNT(*) FROM dagens_kamp
-                WHERE telegram_posted = TRUE AND timestamp >= $1
+                WHERE telegram_posted = TRUE
+                  AND kickoff BETWEEN $1 AND $1 + INTERVAL '24 hours'
             """, today_start)
 
             posts_left = max(0, DAILY_POST_LIMIT - int(daily_posted))
@@ -2933,12 +2935,14 @@ async def post_dagens_kamp_telegram():
                 logger.info(f"[Scheduler] Daglig grense ({DAILY_POST_LIMIT}) nådd")
                 return
 
+            # Fetch unposted picks with kickoff today (within ±3h → +36h window)
             rows = await conn.fetch("""
                 SELECT * FROM dagens_kamp
-                WHERE telegram_posted = FALSE AND timestamp >= $1
+                WHERE telegram_posted = FALSE
+                  AND kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
                 ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
-                LIMIT $2
-            """, today_start, posts_left)
+                LIMIT $1
+            """, posts_left)
 
         if not rows:
             logger.info("[Scheduler] Ingen upostede picks i dag")
@@ -3568,9 +3572,11 @@ async def trigger_post_telegram():
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
     async with db_state.pool.acquire() as conn:
+        # Count picks already posted today (by kickoff so insert date doesn't matter)
         daily_posted = await conn.fetchval("""
             SELECT COUNT(*) FROM dagens_kamp
-            WHERE telegram_posted = TRUE AND timestamp >= $1
+            WHERE telegram_posted = TRUE
+              AND kickoff BETWEEN $1 AND $1 + INTERVAL '24 hours'
         """, today_start)
 
         if int(daily_posted) >= DAILY_POST_LIMIT:
@@ -3578,10 +3584,11 @@ async def trigger_post_telegram():
 
         row = await conn.fetchrow("""
             SELECT * FROM dagens_kamp
-            WHERE telegram_posted = FALSE AND timestamp >= $1
+            WHERE telegram_posted = FALSE
+              AND kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
             ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
             LIMIT 1
-        """, today_start)
+        """)
 
     if not row:
         return {"status": "skipped", "reason": "Ingen upostede picks i dag"}
