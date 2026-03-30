@@ -68,14 +68,23 @@ auto_result_module = _safe_import("auto_result")
 # KONFIGURASJON
 # ─────────────────────────────────────────────────────────
 SCAN_LEAGUES = [
-    {"key": "soccer_epl",                    "name": "Premier League",   "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
-    {"key": "soccer_spain_la_liga",           "name": "La Liga",          "flag": "🇪🇸"},
-    {"key": "soccer_germany_bundesliga",      "name": "Bundesliga",       "flag": "🇩🇪"},
-    {"key": "soccer_italy_serie_a",           "name": "Serie A",          "flag": "🇮🇹"},
-    {"key": "soccer_france_ligue_one",        "name": "Ligue 1",          "flag": "🇫🇷"},
-    {"key": "soccer_uefa_champs_league",   "name": "Champions League", "flag": "🏆"},
-    {"key": "soccer_uefa_europa_league",      "name": "Europa League",    "flag": "🇪🇺"},
-    {"key": "soccer_netherlands_eredivisie",  "name": "Eredivisie",       "flag": "🇳🇱"},
+    {"key": "soccer_epl",                                "name": "Premier League",         "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+    {"key": "soccer_spain_la_liga",                      "name": "La Liga",                "flag": "🇪🇸"},
+    {"key": "soccer_germany_bundesliga",                 "name": "Bundesliga",             "flag": "🇩🇪"},
+    {"key": "soccer_italy_serie_a",                      "name": "Serie A",                "flag": "🇮🇹"},
+    {"key": "soccer_france_ligue_one",                   "name": "Ligue 1",                "flag": "🇫🇷"},
+    {"key": "soccer_uefa_champs_league",                 "name": "Champions League",       "flag": "🏆"},
+    {"key": "soccer_uefa_europa_league",                 "name": "Europa League",          "flag": "🇪🇺"},
+    {"key": "soccer_netherlands_eredivisie",             "name": "Eredivisie",             "flag": "🇳🇱"},
+    # International & second-tier — active during top-flight breaks
+    {"key": "soccer_fifa_world_cup_qualifiers_europe",   "name": "WC Qualifiers Europe",   "flag": "🌍"},
+    {"key": "soccer_uefa_nations_league",                "name": "UEFA Nations League",     "flag": "🇪🇺"},
+    {"key": "soccer_spain_segunda_division",             "name": "La Liga 2",              "flag": "🇪🇸"},
+    {"key": "soccer_england_championship",               "name": "Championship",           "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+    {"key": "soccer_germany_bundesliga2",                "name": "Bundesliga 2",           "flag": "🇩🇪"},
+    {"key": "soccer_italy_serie_b",                      "name": "Serie B",                "flag": "🇮🇹"},
+    {"key": "soccer_argentina_primera_division",         "name": "Primera División ARG",   "flag": "🇦🇷"},
+    {"key": "soccer_brazil_campeonato",                  "name": "Campeonato Brasileiro",  "flag": "🇧🇷"},
 ]
 
 # Topp-4 ligaer for kveldsscan (Vindu 2 — 18:00 UTC)
@@ -4851,3 +4860,252 @@ async def get_team_logo(team: str):
         return {"logo": ""}
     except Exception:
         return {"logo": ""}
+
+
+@app.get("/ladder-history")
+async def get_ladder_history():
+    """Return bot pick history with bankroll simulation (ladder/reset model)."""
+    _EMPTY = {
+        "ladder": [], "current_bankroll": 1000, "peak_bankroll": 1000,
+        "max_streak": 0, "total_picks": 0, "wins": 0, "hit_rate": 0.0,
+        "milestones": [], "next_pick": None, "bot_status": "WAITING",
+    }
+    try:
+        async with db_state.pool.acquire() as conn:
+            # picks_v2 has the full schema (match_name, kickoff_time, soft_ev, etc.)
+            # If picks_v2 is empty, fall back to picks (which may have 'match' or 'match_name')
+            settled = await conn.fetch("""
+                SELECT
+                    id,
+                    match_name,
+                    COALESCE(league, '') AS league,
+                    kickoff_time,
+                    odds,
+                    COALESCE(soft_ev, 0) AS soft_ev,
+                    COALESCE(atomic_score, 0) AS atomic_score,
+                    COALESCE(tier, 'EDGE') AS tier,
+                    COALESCE(tier_label, 'EDGE') AS tier_label,
+                    result,
+                    COALESCE(signal_velocity, 'NEUTRAL') AS signal_velocity,
+                    created_at
+                FROM picks_v2
+                WHERE result IS NOT NULL
+                ORDER BY kickoff_time ASC
+            """)
+            next_row = await conn.fetchrow("""
+                SELECT match_name, kickoff_time, odds
+                FROM picks_v2
+                WHERE result IS NULL AND kickoff_time > NOW() - INTERVAL '2 hours'
+                ORDER BY kickoff_time ASC LIMIT 1
+            """)
+            if not next_row:
+                # dagens_kamp may use 'match' or 'kickoff' (older column names)
+                try:
+                    next_row = await conn.fetchrow("""
+                        SELECT
+                            COALESCE(match_name, match, '') AS match_name,
+                            COALESCE(kickoff_time, kickoff) AS kickoff_time,
+                            odds
+                        FROM dagens_kamp
+                        WHERE result IS NULL
+                          AND COALESCE(kickoff_time, kickoff) > NOW() - INTERVAL '2 hours'
+                        ORDER BY COALESCE(kickoff_time, kickoff) ASC
+                        LIMIT 1
+                    """)
+                except Exception:
+                    next_row = None
+
+        START = 1000.0
+        bank  = START
+        peak  = START
+        wins  = 0
+        current_streak = 0
+        max_streak     = 0
+        milestone_levels = [5000, 10000, 25000, 50000]
+        triggered: set[int] = set()
+        milestones: list[dict] = []
+        ladder: list[dict] = []
+
+        for row in settled:
+            stake   = round(bank, 2)          # full bankroll is the stake
+            result  = (row["result"] or "").upper()
+            odds    = float(row["odds"] or 2.0)
+            won     = result == "WIN"
+
+            # Reasoning from available signals
+            parts: list[str] = []
+            vel = row.get("signal_velocity") or ""
+            if vel and vel not in ("NEUTRAL", ""):
+                parts.append(f"Odds-bevegelse: {vel}")
+            ev_val = float(row["soft_ev"] or 0)
+            tier   = row["tier"] or "EDGE"
+            reasoning = " · ".join(parts) if parts else \
+                f"EV +{ev_val:.1f}% oppdaget · OMEGA {tier}-nivå · {int(row['atomic_score'] or 0)}/9 signaler"
+
+            pick_type = "1X2"
+
+            if won:
+                bank  = round(stake * odds, 2)   # full compound: stake × odds
+                wins += 1
+                current_streak += 1
+                max_streak = max(max_streak, current_streak)
+            else:
+                bank = START      # RESET on loss
+                current_streak = 0
+
+            bank = max(bank, 0.0)
+            peak = max(peak, bank)
+
+            # Milestones
+            for level in milestone_levels:
+                if level not in triggered and bank >= level:
+                    triggered.add(level)
+                    milestones.append({
+                        "amount":  level,
+                        "match":   row["match_name"],
+                        "message": f"🎯 {level:,} NOK nådd etter {row['match_name']}!".replace(",", " "),
+                    })
+
+            ladder.append({
+                "match":          row["match_name"],
+                "league":         row["league"] or "",
+                "kickoff":        row["kickoff_time"].isoformat() if row["kickoff_time"] else "",
+                "odds":           odds,
+                "pick_type":      pick_type,
+                "atomic_score":   int(row["atomic_score"] or 0),
+                "won":            won,
+                "stake":          stake,
+                "bankroll_after": round(bank),
+                "streak":         current_streak if won else 0,
+                "reasoning":      reasoning,
+                "is_demo":        True,
+            })
+
+        # Perfect run: what if every pick won?
+        perfect_bank = START
+        for step in ladder:
+            perfect_bank = round(perfect_bank * step["odds"], 2)
+
+        total = len(ladder)
+        hit_rate = round(wins / total * 100, 1) if total > 0 else 0.0
+        bot_status = "ACTIVE" if next_row else ("WAITING" if total == 0 else "IDLE")
+
+        next_pick_data = None
+        if next_row:
+            ko = next_row["kickoff_time"]
+            np_odds = float(next_row["odds"] or 0)
+            next_pick_data = {
+                "match":            next_row["match_name"],
+                "kickoff":          ko.isoformat() if ko else "",
+                "odds":             np_odds,
+                "potential_win":    round(bank * np_odds, 2),
+                "potential_profit": round(bank * (np_odds - 1), 2),
+            }
+
+        return {
+            "ladder":               ladder,
+            "current_bankroll":     round(bank),
+            "peak_bankroll":        round(peak),
+            "max_streak":           max_streak,
+            "total_picks":          total,
+            "wins":                 wins,
+            "hit_rate":             hit_rate,
+            "milestones":           milestones,
+            "next_pick":            next_pick_data,
+            "bot_status":           bot_status,
+            "perfect_run_bankroll": round(perfect_bank),
+            "perfect_run_text":     f"Hvis boten traff alle: 1 000 → {round(perfect_bank):,} NOK".replace(",", " "),
+        }
+    except Exception as e:
+        logger.error(f"/ladder-history error: {e}")
+        return {
+            "ladder": [], "current_bankroll": 1000, "peak_bankroll": 1000,
+            "max_streak": 0, "total_picks": 0, "wins": 0, "hit_rate": 0.0,
+            "milestones": [], "next_pick": None, "bot_status": "ERROR",
+        }
+
+@app.post("/admin/seed-ladder")
+async def admin_seed_ladder():
+    """Re-seed picks_v2 with compound-staking demo picks. Deletes existing demo data first."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            deleted = await conn.fetchval(
+                "WITH d AS (DELETE FROM picks_v2 WHERE match_name IS NOT NULL RETURNING id) "
+                "SELECT COUNT(*) FROM d"
+            )
+
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+
+            # Sequence: WIN WIN LOSS WIN WIN LOSS WIN
+            # Bankroll: 1000→1850→3885→reset 1000→1650→3135→reset 1000→1780
+            demo = [
+                ("Bayer Leverkusen vs Dortmund",  "Germany - Bundesliga",
+                 now - timedelta(days=14), 1.85, 8.4, 7.9, 7, "EDGE",     "💪 EDGE",       "WIN"),
+                ("Inter Milan vs Napoli",          "Italy - Serie A",
+                 now - timedelta(days=11), 2.10, 9.1, 8.6, 8, "EDGE",     "💪 EDGE",       "WIN"),
+                ("Atletico Madrid vs Sevilla",     "Spain - LaLiga",
+                 now - timedelta(days=9),  1.72, 7.3, 6.9, 6, "MONITORED","📊 MONITORED",  "LOSS"),
+                ("PSG vs Lyon",                    "France - Ligue 1",
+                 now - timedelta(days=7),  1.65, 8.8, 8.2, 7, "EDGE",     "💪 EDGE",       "WIN"),
+                ("Liverpool vs Aston Villa",       "England - Premier League",
+                 now - timedelta(days=5),  1.90, 9.6, 9.1, 9, "ATOMIC",   "⚡ ATOMIC",     "WIN"),
+                ("Marseille vs Nice",              "France - Ligue 1",
+                 now - timedelta(days=3),  2.05, 7.8, 7.3, 6, "MONITORED","📊 MONITORED",  "LOSS"),
+                ("Bayern München vs Stuttgart",    "Germany - Bundesliga",
+                 now - timedelta(days=1),  1.78, 9.8, 9.2, 9, "ATOMIC",   "⚡ ATOMIC",     "WIN"),
+            ]
+
+            inserted = 0
+            for match_name, league, kickoff, odds, edge, ev, atomic, tier, tier_label, result in demo:
+                home, away = (match_name.split(" vs ", 1) + ["Unknown"])[:2]
+                await conn.execute("""
+                    INSERT INTO picks_v2 (
+                        match_name, home_team, away_team, league, kickoff_time,
+                        odds, soft_edge, soft_ev, atomic_score,
+                        tier, tier_label, kelly_multiplier, kelly_stake,
+                        result, created_at, posted_at, telegram_posted
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0.5,2.00,$12,NOW(),NOW(),TRUE)
+                """, match_name, home, away, league, kickoff,
+                     odds, edge, ev, atomic, tier, tier_label, result)
+                inserted += 1
+
+            return {"status": "seeded", "deleted": deleted or 0, "inserted": inserted}
+    except Exception as e:
+        logger.error(f"/admin/seed-ladder error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── placeholder kept for diff alignment ──
+@app.get("/admin/debug-picks-v2")
+async def debug_picks_v2():
+    """Check actual columns and row count of picks_v2 on the server."""
+    if not db_state.connected or not db_state.pool:
+        return {"error": "DB offline"}
+    async with db_state.pool.acquire() as conn:
+        cols = await conn.fetch(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name='picks_v2' AND table_schema='public' ORDER BY ordinal_position"
+        )
+        count = await conn.fetchval("SELECT COUNT(*) FROM picks_v2")
+        count_result = await conn.fetchval("SELECT COUNT(*) FROM picks_v2 WHERE result IS NOT NULL")
+        tables = await conn.fetch(
+            "SELECT table_name, table_type FROM information_schema.tables "
+            "WHERE table_name IN ('picks','picks_v2','picks_v1_backup') AND table_schema='public'"
+        )
+        return {
+            "picks_v2_columns": [{"name": r["column_name"], "type": r["data_type"]} for r in cols],
+            "picks_v2_count": count,
+            "picks_v2_result_count": count_result,
+            "tables": [{"name": r["table_name"], "type": r["table_type"]} for r in tables],
+        }
+
+
+async def _ladder_history_compat():
+    return {
+            "history": [],
+            "milestones": [],
+            "next_pick": None,
+        }
