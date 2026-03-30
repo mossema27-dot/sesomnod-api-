@@ -2984,6 +2984,159 @@ async def post_dagens_kamp_telegram():
         logger.exception(f"[Scheduler] Uventet feil: {e}")
 
 
+async def _check_live_results():
+    """
+    Runs every 15 minutes 24/7.
+    Fetches FINISHED matches from football-data.org, updates result/score in
+    dagens_kamp, fires MiroFish /close-clv, and logs result to Notion.
+    Never raises — all errors are logged and swallowed.
+    """
+    FOOTBALL_API_KEY = cfg.FOOTBALL_DATA_API_KEY
+    MIROFISH_URL = "https://mirofish-service-production.up.railway.app"
+
+    if not FOOTBALL_API_KEY:
+        logger.info("[Results] SKIP: No FOOTBALL_DATA_API_KEY")
+        return
+
+    if not db_state.connected or not db_state.pool:
+        logger.info("[Results] SKIP: DB offline")
+        return
+
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.football-data.org/v4/matches",
+                headers={"X-Auth-Token": FOOTBALL_API_KEY},
+                params={"dateFrom": today, "dateTo": today, "status": "FINISHED"},
+            )
+
+        if r.status_code != 200:
+            logger.warning(f"[Results] football-data.org returned {r.status_code}: {r.text[:150]}")
+            return
+
+        finished = r.json().get("matches", [])
+        if not finished:
+            logger.info("[Results] No finished matches today")
+            return
+
+        logger.info(f"[Results] {len(finished)} finished matches from football-data.org")
+
+        # Ensure new columns exist (idempotent — ADD COLUMN IF NOT EXISTS)
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                ALTER TABLE dagens_kamp
+                ADD COLUMN IF NOT EXISTS home_score INTEGER,
+                ADD COLUMN IF NOT EXISTS away_score INTEGER,
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
+            """)
+            pending = await conn.fetch(
+                """SELECT id, match, home_team, away_team, pick, odds, kickoff
+                   FROM dagens_kamp
+                   WHERE result IS NULL
+                   AND kickoff::date = CURRENT_DATE"""
+            )
+
+        if not pending:
+            logger.info("[Results] No pending picks today")
+            return
+
+        logger.info(f"[Results] {len(pending)} pending picks to check")
+        mirofish_needed = False
+
+        for pick in pending:
+            pick_home = str(pick["home_team"] or "").lower().strip()
+            pick_away = str(pick["away_team"] or "").lower().strip()
+
+            # Match against football-data.org results (full name then shortName)
+            matched = None
+            for attempt in ("name", "shortName"):
+                for m in finished:
+                    api_home = m.get("homeTeam", {}).get(attempt, "").lower().strip()
+                    api_away = m.get("awayTeam", {}).get(attempt, "").lower().strip()
+                    if (pick_home in api_home or api_home in pick_home) and \
+                       (pick_away in api_away or api_away in pick_away):
+                        matched = m
+                        break
+                if matched:
+                    break
+
+            if not matched:
+                logger.info(f"[Results] No match found for {pick['home_team']} vs {pick['away_team']}")
+                continue
+
+            score = matched.get("score", {}).get("fullTime", {})
+            home_score = score.get("home")
+            away_score = score.get("away")
+            if home_score is None or away_score is None:
+                continue
+
+            result_str = f"{home_score}-{away_score}"
+            total_goals = home_score + away_score
+            btts = home_score > 0 and away_score > 0
+
+            # Determine outcome from the `pick` field
+            pick_type = str(pick["pick"] or "").lower().strip()
+            pick_won = None
+            if pick_type == "draw":
+                pick_won = home_score == away_score
+            elif pick_type in ("home", "home win", "1"):
+                pick_won = home_score > away_score
+            elif pick_type in ("away", "away win", "2"):
+                pick_won = away_score > home_score
+            elif "over 3.5" in pick_type:
+                pick_won = total_goals > 3
+            elif "over 2.5" in pick_type or "over2.5" in pick_type:
+                pick_won = total_goals > 2
+            elif "over 1.5" in pick_type:
+                pick_won = total_goals > 1
+            elif "over 0.5" in pick_type:
+                pick_won = total_goals > 0
+            elif "btts no" in pick_type:
+                pick_won = not btts
+            elif "btts" in pick_type:
+                pick_won = btts
+            elif "under 2.5" in pick_type:
+                pick_won = total_goals < 3
+            elif "under 3.5" in pick_type:
+                pick_won = total_goals < 4
+
+            outcome_str = "WIN" if pick_won else "LOSS" if pick_won is False else "VOID"
+
+            async with db_state.pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE dagens_kamp
+                       SET result=$1, home_score=$2, away_score=$3, updated_at=NOW()
+                       WHERE id=$4""",
+                    outcome_str, home_score, away_score, pick["id"],
+                )
+
+            logger.info(
+                f"[Results] {pick['home_team']} vs {pick['away_team']}: "
+                f"{result_str} → {outcome_str} (pick: {pick['pick']})"
+            )
+            mirofish_needed = True
+
+            # Log to Notion (fire-and-forget)
+            if pick_won is not None:
+                pick_dict = dict(pick)
+                pick_dict["match_name"] = pick_dict.get("match", "")
+                asyncio.create_task(_log_result_to_notion(pick_dict, outcome_str, None))
+
+        # Trigger MiroFish close-clv once per run if any results were written
+        if mirofish_needed:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(f"{MIROFISH_URL}/close-clv")
+                logger.info("[Results] MiroFish /close-clv triggered")
+            except Exception as mf_err:
+                logger.warning(f"[Results] MiroFish error (non-fatal): {mf_err}")
+
+    except Exception as e:
+        logger.warning(f"[Results] Top-level exception: {e}")
+
+
 # ─────────────────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────────────────
@@ -3075,6 +3228,16 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Live results hvert 15. minutt 24/7
+    scheduler.add_job(
+        _check_live_results,
+        "interval",
+        minutes=15,
+        id="live_results",
+        max_instances=1,
+        coalesce=True,
+    )
+
     scheduler.start()
     logger.info(
         "[Scheduler] Startet — "
@@ -3091,6 +3254,11 @@ async def lifespan(app: FastAPI):
                     ALTER TABLE picks ADD COLUMN IF NOT EXISTS closing_odds FLOAT;
                     ALTER TABLE picks ADD COLUMN IF NOT EXISTS clv          FLOAT;
                     ALTER TABLE picks ADD COLUMN IF NOT EXISTS league       VARCHAR(60);
+                """)
+            await conn.execute("""
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_score  INTEGER;
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS away_score  INTEGER;
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ;
                 """)
             logger.info("[Blokk2] picks-kolonner migrert (result, closing_odds, clv, league)")
         except Exception as _e:
@@ -3728,6 +3896,13 @@ async def trigger_post_telegram():
         "posted_count": len([r for r in results if r.get("status") == "posted"]),
         "results": results,
     }
+
+
+@app.post("/check-results-now")
+async def check_results_now():
+    """Manual trigger for _check_live_results — for testing and on-demand result checks."""
+    await _check_live_results()
+    return {"status": "done", "message": "check_live_results executed"}
 
 
 @app.post("/send-message")
