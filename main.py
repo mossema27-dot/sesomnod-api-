@@ -3570,9 +3570,74 @@ async def test_telegram():
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
+async def _log_pick_to_mirofish(pick_row: dict) -> dict:
+    """
+    Auto-log a pick to MiroFish for CLV tracking.
+    Called after every successful Telegram post.
+    NEVER raises — MiroFish failure never breaks Telegram posting.
+    """
+    MIROFISH_URL = "https://mirofish-service-production.up.railway.app"
+    try:
+        home_raw = str(pick_row.get("home_team") or "unknown")
+        away_raw = str(pick_row.get("away_team") or "unknown")
+
+        kickoff_raw = pick_row.get("kickoff")
+        if hasattr(kickoff_raw, "strftime"):
+            if kickoff_raw.tzinfo is None:
+                kickoff_raw = kickoff_raw.replace(tzinfo=timezone.utc)
+            kickoff_iso = kickoff_raw.isoformat()
+            date_str = kickoff_raw.strftime("%Y%m%d")
+        else:
+            kickoff_iso = str(kickoff_raw)
+            try:
+                dt = datetime.fromisoformat(str(kickoff_raw).replace("Z", "+00:00"))
+                date_str = dt.strftime("%Y%m%d")
+            except Exception:
+                date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+        home_slug = home_raw.lower().replace(" ", "-")
+        away_slug = away_raw.lower().replace(" ", "-")
+        pick_id = f"{home_slug}-{away_slug}-{date_str}"
+
+        our_odds_raw = pick_row.get("odds")
+        if our_odds_raw is None or float(our_odds_raw) <= 1.0:
+            return {"logged": False, "reason": "no_valid_odds_field"}
+        our_odds = float(our_odds_raw)
+
+        edge_val = float(pick_row.get("edge") or 0.0)
+        match_name = pick_row.get("match") or f"{home_raw} vs {away_raw}"
+
+        payload = {
+            "pick_id": pick_id,
+            "match": match_name,
+            "home_team": home_raw,
+            "away_team": away_raw,
+            "our_odds": our_odds,
+            "kickoff": kickoff_iso,
+            "edge_at_pick": edge_val,
+            "market": "h2h",
+        }
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(f"{MIROFISH_URL}/track", json=payload)
+            if r.status_code == 200:
+                logger.info(f"[MiroFish] Logged: {pick_id} | odds={our_odds}")
+                return {"logged": True, "pick_id": pick_id}
+            elif r.status_code == 400 and "already tracked" in r.text:
+                logger.info(f"[MiroFish] Already tracked: {pick_id}")
+                return {"logged": False, "reason": "already_tracked"}
+            else:
+                logger.warning(f"[MiroFish] HTTP {r.status_code}: {r.text[:200]}")
+                return {"logged": False, "reason": f"http_{r.status_code}"}
+
+    except Exception as e:
+        logger.warning(f"[MiroFish] Exception: {e}")
+        return {"logged": False, "reason": str(e)}
+
+
 @app.post("/post-telegram")
 async def trigger_post_telegram():
-    """Poster beste upostede HIGH/MEDIUM confidence pick til Telegram."""
+    """Poster upostede ATOMIC/EDGE picks (edge >= 7%) til Telegram, inntil daglig grense."""
     if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
         return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
     if not db_state.connected or not db_state.pool:
@@ -3591,54 +3656,78 @@ async def trigger_post_telegram():
         if int(daily_posted) >= DAILY_POST_LIMIT:
             return {"status": "skipped", "reason": f"Daglig grense ({DAILY_POST_LIMIT}) nådd", "posted_today": int(daily_posted)}
 
-        row = await conn.fetchrow("""
+        # Fix A+B: fetch ALL qualified picks (edge >= 7%, ATOMIC/EDGE tier only)
+        rows = await conn.fetch("""
             SELECT * FROM dagens_kamp
             WHERE telegram_posted = FALSE
               AND kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
+              AND edge >= 0.07
+              AND tier IN ('ATOMIC', 'EDGE')
             ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
-            LIMIT 1
         """)
 
-    if not row:
-        return {"status": "skipped", "reason": "Ingen upostede picks i dag"}
-
-    pick_data = dict(row)
-    already_posted = int(daily_posted)
-    rank = already_posted + 1
-
-    message = _format_pick_message(pick_data, rank=rank)
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
-            )
-        if resp.status_code == 200:
-            async with db_state.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
-                    pick_data["id"]
-                )
-            logger.info(f"[/post-telegram] Postet pick id={pick_data['id']}: {pick_data.get('pick')}")
-            return {
-                "status": "posted",
-                "pick_id": pick_data["id"],
-                "pick": pick_data.get("pick"),
-                "match": pick_data.get("match"),
-                "odds": float(pick_data.get("odds") or 0),
-                "ev": float(pick_data.get("ev") or 0),
-                "score": float(pick_data.get("score") or 0),
-                "telegram_status": resp.status_code,
-            }
+    # Fix C: zero qualified picks → explicit status with dynamic reason, no post
+    if not rows:
+        async with db_state.pool.acquire() as conn:
+            already_posted_qualified = await conn.fetchval("""
+                SELECT COUNT(*) FROM dagens_kamp
+                WHERE telegram_posted = TRUE
+                  AND kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
+                  AND edge >= 0.07
+                  AND tier IN ('ATOMIC', 'EDGE')
+            """)
+        if int(already_posted_qualified) > 0:
+            reason = "all qualified picks already posted today"
         else:
-            return JSONResponse(status_code=502, content={
-                "status": "error",
-                "telegram_status": resp.status_code,
-                "detail": resp.text[:200],
-            })
-    except Exception as e:
-        logger.exception(f"[/post-telegram] Feil: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+            reason = "no picks meet quality threshold (EDGE/ATOMIC + edge >= 7%)"
+        return {"status": "no_qualified_picks", "reason": reason}
+
+    already_posted = int(daily_posted)
+    remaining_slots = DAILY_POST_LIMIT - already_posted
+    results = []
+
+    for row in rows[:remaining_slots]:
+        pick_data = dict(row)
+        rank = already_posted + len(results) + 1
+        message = _format_pick_message(pick_data, rank=rank)
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                    json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+                )
+            if resp.status_code == 200:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
+                        pick_data["id"]
+                    )
+                logger.info(f"[/post-telegram] Postet pick id={pick_data['id']}: {pick_data.get('pick')}")
+                mirofish_result = await _log_pick_to_mirofish(pick_data)
+                results.append({
+                    "status": "posted",
+                    "pick_id": pick_data["id"],
+                    "pick": pick_data.get("pick"),
+                    "match": pick_data.get("match"),
+                    "odds": float(pick_data.get("odds") or 0),
+                    "ev": float(pick_data.get("ev") or 0),
+                    "edge": float(pick_data.get("edge") or 0),
+                    "tier": pick_data.get("tier"),
+                    "telegram_status": resp.status_code,
+                    "mirofish": mirofish_result,
+                })
+            else:
+                logger.warning(f"[/post-telegram] Telegram feil {resp.status_code} for pick id={pick_data['id']}")
+                results.append({"status": "error", "pick_id": pick_data["id"], "telegram_status": resp.status_code, "detail": resp.text[:200]})
+        except Exception as e:
+            logger.exception(f"[/post-telegram] Feil for pick id={pick_data.get('id')}: {e}")
+            results.append({"status": "error", "pick_id": pick_data.get("id"), "error": str(e)[:200]})
+
+    return {
+        "status": "done",
+        "posted_count": len([r for r in results if r.get("status") == "posted"]),
+        "results": results,
+    }
 
 
 @app.post("/send-message")
