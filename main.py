@@ -3256,9 +3256,10 @@ async def lifespan(app: FastAPI):
                     ALTER TABLE picks ADD COLUMN IF NOT EXISTS league       VARCHAR(60);
                 """)
             await conn.execute("""
-                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_score  INTEGER;
-                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS away_score  INTEGER;
-                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ;
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_score   INTEGER;
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS away_score   INTEGER;
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ;
+                    ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS pinnacle_h2h TEXT;
                 """)
             logger.info("[Blokk2] picks-kolonner migrert (result, closing_odds, clv, league)")
         except Exception as _e:
@@ -3339,9 +3340,43 @@ async def get_bankroll():
 
 
 def enrich_pick(pick: dict) -> dict:
-    import math
-    xg_home = max(0.0, float(pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home") or 1.3))
-    xg_away = max(0.0, float(pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away") or 1.1))
+    import math, json as _json
+    xg_home = max(0.0, float(
+        pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home") or 0
+    ))
+    xg_away = max(0.0, float(
+        pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away") or 0
+    ))
+
+    # When real xG is missing, derive from actual Pinnacle h/d/a odds stored per match
+    if xg_home == 0 or xg_away == 0:
+        try:
+            h2h_raw = pick.get("pinnacle_h2h")
+            h_odds = d_odds = a_odds = 0.0
+            if h2h_raw:
+                parsed = _json.loads(h2h_raw) if isinstance(h2h_raw, str) else h2h_raw
+                h_odds = float(parsed.get("home") or 0)
+                d_odds = float(parsed.get("draw") or 0)
+                a_odds = float(parsed.get("away") or 0)
+
+            if h_odds > 1.0 and a_odds > 1.0 and d_odds > 1.0:
+                # Remove vig → fair probabilities
+                total_implied = (1/h_odds) + (1/d_odds) + (1/a_odds)
+                fair_home = (1/h_odds) / total_implied
+                fair_away = (1/a_odds) / total_implied
+                # Scale to goal expectation (avg ~2.7 goals per match)
+                xg_home = round(fair_home * 2.7, 2)
+                xg_away = round(fair_away * 2.7, 2)
+            else:
+                # Last resort: use pick odds + edge to infer one-sided strength
+                pick_odds = float(pick.get("odds") or 2.5)
+                edge_val  = float(pick.get("edge") or 0)
+                implied   = min(0.85, (1.0 / max(1.01, pick_odds)) + edge_val)
+                xg_home   = round(implied * 2.7, 2)
+                xg_away   = round(max(0.5, (1.0 - implied - 0.25) * 2.7), 2)
+        except Exception:
+            xg_home = 1.3
+            xg_away = 1.1
     lam = max(0.5, min(6.0, xg_home + xg_away))
     def pcdf(n, l):
         t, term = 0.0, math.exp(-l)
@@ -3469,7 +3504,8 @@ async def get_picks():
                     xg_divergence_away,
                     result,
                     closing_odds,
-                    clv
+                    clv,
+                    pinnacle_h2h
                 FROM dagens_kamp
                 WHERE kickoff > NOW() - INTERVAL '1 hour'
                   AND kickoff <= NOW() + INTERVAL '36 hours'
