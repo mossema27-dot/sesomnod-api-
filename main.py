@@ -111,7 +111,7 @@ PINNACLE_MARGIN_MAX = float(os.getenv("PINNACLE_MARGIN_MAX", "8.0"))  # Max Pinn
 ODDS_MIN            = float(os.getenv("ODDS_MIN", "1.60"))      # Fase 0: under 1.60 = for lav verdi
 ODDS_MAX            = float(os.getenv("ODDS_MAX", "4.50"))      # Fase 0: over 4.50 = for høy varians
 MATCH_HOURS_MAX     = int(os.getenv("MATCH_HOURS_MAX", "24"))
-DAILY_POST_LIMIT    = 3
+DAILY_POST_LIMIT    = 10
 MAX_PICKS_PER_MATCH = 2
 MAX_PICKS_PER_LEAGUE = 3
 
@@ -130,8 +130,7 @@ class Config:
     DATABASE_URL: str    = _clean("DATABASE_URL")
     TELEGRAM_TOKEN: str  = _clean("TELEGRAM_TOKEN")
     TELEGRAM_CHAT_ID: str = _clean("TELEGRAM_CHAT_ID")
-    # TODO: once Railway ODDS_API_KEY env var is updated, revert to: _clean("ODDS_API_KEY")
-    ODDS_API_KEY: str    = _clean("ODDS_API_KEY_NEW") or "6241bf29534eb1374817ce0f22463607"
+    ODDS_API_KEY: str    = _clean("ODDS_API_KEY") or "6241bf29534eb1374817ce0f22463607"
     NOTION_TOKEN: str    = _clean("NOTION_TOKEN")
     NOTION_DB_ID: str    = _clean("NOTION_DATABASE_ID")
     NOTION_CHANGELOG_DB_ID: str = _clean("NOTION_CHANGELOG_DB_ID") or "fd23588f-5099-41c4-8292-ddf45b429d34"
