@@ -5171,48 +5171,32 @@ async def get_ladder_history():
     }
     try:
         async with db_state.pool.acquire() as conn:
-            # picks_v2 has the full schema (match_name, kickoff_time, soft_ev, etc.)
-            # If picks_v2 is empty, fall back to picks (which may have 'match' or 'match_name')
+            # Use dagens_kamp — has pick, edge, ev, kickoff with correct column names
             settled = await conn.fetch("""
                 SELECT
-                    id,
-                    match_name,
+                    COALESCE(home_team || ' vs ' || away_team, match, '') AS match_name,
                     COALESCE(league, '') AS league,
-                    kickoff_time,
+                    kickoff AS kickoff_time,
                     odds,
-                    COALESCE(soft_ev, 0) AS soft_ev,
+                    COALESCE(ev, 0) AS soft_ev,
                     COALESCE(atomic_score, 0) AS atomic_score,
                     COALESCE(tier, 'EDGE') AS tier,
                     COALESCE(tier_label, 'EDGE') AS tier_label,
                     result,
-                    COALESCE(signal_velocity, 'NEUTRAL') AS signal_velocity,
-                    created_at
-                FROM picks_v2
+                    COALESCE(signal_velocity, 'NEUTRAL') AS signal_velocity
+                FROM dagens_kamp
                 WHERE result IS NOT NULL
-                ORDER BY kickoff_time ASC
+                ORDER BY kickoff ASC
             """)
             next_row = await conn.fetchrow("""
-                SELECT match_name, kickoff_time, odds
-                FROM picks_v2
-                WHERE result IS NULL AND kickoff_time > NOW() - INTERVAL '2 hours'
-                ORDER BY kickoff_time ASC LIMIT 1
+                SELECT
+                    COALESCE(home_team || ' vs ' || away_team, match, '') AS match_name,
+                    kickoff AS kickoff_time,
+                    odds
+                FROM dagens_kamp
+                WHERE result IS NULL AND kickoff > NOW() - INTERVAL '2 hours'
+                ORDER BY kickoff ASC LIMIT 1
             """)
-            if not next_row:
-                # dagens_kamp may use 'match' or 'kickoff' (older column names)
-                try:
-                    next_row = await conn.fetchrow("""
-                        SELECT
-                            COALESCE(match_name, match, '') AS match_name,
-                            COALESCE(kickoff_time, kickoff) AS kickoff_time,
-                            odds
-                        FROM dagens_kamp
-                        WHERE result IS NULL
-                          AND COALESCE(kickoff_time, kickoff) > NOW() - INTERVAL '2 hours'
-                        ORDER BY COALESCE(kickoff_time, kickoff) ASC
-                        LIMIT 1
-                    """)
-                except Exception:
-                    next_row = None
 
         START = 1000.0
         bank  = START
@@ -5277,7 +5261,7 @@ async def get_ladder_history():
                 "bankroll_after": round(bank),
                 "streak":         current_streak if won else 0,
                 "reasoning":      reasoning,
-                "is_demo":        True,
+                "is_demo":        False,
             })
 
         # Perfect run: what if every pick won?
