@@ -4049,6 +4049,38 @@ async def log_results_manual(results: list[dict]):
     async with db_state.pool.acquire() as conn:
         logged = []
         for p in results:
+            hs = int(p["home_score"])
+            aws = int(p["away_score"])
+            pick_type = str(p.get("pick", "")).lower().strip()
+            total_goals = hs + aws
+            btts = hs > 0 and aws > 0
+
+            # Compute WIN/LOSS/VOID from pick + score
+            pick_won = None
+            if pick_type in ("draw", "uavgjort"):
+                pick_won = hs == aws
+            elif pick_type in ("home", "home win", "1", "hjemme"):
+                pick_won = hs > aws
+            elif pick_type in ("away", "away win", "2", "borte"):
+                pick_won = aws > hs
+            elif "over 3.5" in pick_type:
+                pick_won = total_goals > 3
+            elif "over 2.5" in pick_type:
+                pick_won = total_goals > 2
+            elif "over 1.5" in pick_type:
+                pick_won = total_goals > 1
+            elif "over 0.5" in pick_type:
+                pick_won = total_goals > 0
+            elif "btts no" in pick_type:
+                pick_won = not btts
+            elif "btts" in pick_type:
+                pick_won = btts
+            elif "under 2.5" in pick_type:
+                pick_won = total_goals < 3
+            elif "under 3.5" in pick_type:
+                pick_won = total_goals < 4
+            outcome = "WIN" if pick_won else "LOSS" if pick_won is False else "VOID"
+
             row = await conn.fetchrow("""
                 SELECT id FROM dagens_kamp
                 WHERE home_team ILIKE $1 AND away_team ILIKE $2
@@ -4058,8 +4090,8 @@ async def log_results_manual(results: list[dict]):
                     UPDATE dagens_kamp
                     SET result=$1, home_score=$2, away_score=$3, updated_at=NOW()
                     WHERE id=$4
-                """, p["result"], p["home_score"], p["away_score"], row["id"])
-                logged.append(f"UPDATED: {p['home']} vs {p['away']}")
+                """, outcome, hs, aws, row["id"])
+                logged.append(f"UPDATED: {p['home']} vs {p['away']} → {outcome}")
             else:
                 await conn.execute("""
                     INSERT INTO dagens_kamp
@@ -4073,11 +4105,9 @@ async def log_results_manual(results: list[dict]):
                     float(p.get("odds", 3.5)),
                     15.0, "EDGE",
                     datetime(2026, 3, 31, 20, 0, 0, tzinfo=timezone.utc),
-                    p["result"],
-                    int(p["home_score"]),
-                    int(p["away_score"])
+                    outcome, hs, aws
                 )
-                logged.append(f"INSERTED: {p['home']} vs {p['away']}")
+                logged.append(f"INSERTED: {p['home']} vs {p['away']} → {outcome}")
         total = await conn.fetchval("SELECT COUNT(*) FROM dagens_kamp WHERE result IS NOT NULL")
         return {"logged": logged, "total_settled": total, "phase0": f"{total}/30"}
 
