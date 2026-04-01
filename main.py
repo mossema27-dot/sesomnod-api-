@@ -2109,7 +2109,12 @@ async def run_analysis():
         return
 
     # STEG 7: Kun EDGE og ATOMIC postes til Telegram — MONITORED logges alltid til DB
-    postable = [p for p in newly_inserted if p.get("post_telegram", False)]
+    postable = [
+        p for p in newly_inserted
+        if p.get("post_telegram", False)
+        and float(p.get("edge") or 0) >= 7
+        and p.get("tier") in ("ATOMIC", "EDGE")
+    ]
     posts_left = max(0, DAILY_POST_LIMIT - int(daily_posted))
     monitored_count = len(newly_inserted) - len(postable)
     if monitored_count > 0:
@@ -2772,8 +2777,33 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
     pick_label = pick.get("pick") or pick.get("pick_label") or f"{home} vinner"
     scan   = pick.get("total_scanned") or total_scanned or 0
 
-    xg_h = float(pick.get("xg_home") or pick.get("signal_xg_home") or 1.3)
-    xg_a = float(pick.get("xg_away") or pick.get("signal_xg_away") or 1.1)
+    # Try real Pinnacle odds first
+    pinnacle_raw = pick.get("pinnacle_h2h")
+    if pinnacle_raw:
+        import json as _json
+        try:
+            if isinstance(pinnacle_raw, str):
+                p_odds = _json.loads(pinnacle_raw)
+            else:
+                p_odds = pinnacle_raw
+            h = float(p_odds.get("home", 0))
+            a = float(p_odds.get("away", 0))
+            d = float(p_odds.get("draw", 0))
+            if h > 1.0 and a > 1.0 and d > 1.0:
+                total = 1/h + 1/d + 1/a
+                fair_home = (1/h) / total
+                fair_away = (1/a) / total
+                xg_h = round(fair_home * 2.7, 2)
+                xg_a = round(fair_away * 2.7, 2)
+            else:
+                xg_h = float(pick.get("signal_xg_home") or pick.get("xg_divergence_home") or 1.3)
+                xg_a = float(pick.get("signal_xg_away") or pick.get("xg_divergence_away") or 1.1)
+        except Exception:
+            xg_h = float(pick.get("signal_xg_home") or 1.3)
+            xg_a = float(pick.get("signal_xg_away") or 1.1)
+    else:
+        xg_h = float(pick.get("signal_xg_home") or pick.get("xg_divergence_home") or 1.3)
+        xg_a = float(pick.get("signal_xg_away") or pick.get("xg_divergence_away") or 1.1)
     lam  = max(0.5, min(6.0, xg_h + xg_a))
 
     def _pcdf(n: int, l: float) -> float:
@@ -3686,6 +3716,78 @@ async def trigger_fetch_odds():
         "api_used": api_used,
         "details": results,
     }
+
+
+@app.post("/update-pinnacle")
+async def update_pinnacle_h2h():
+    """Fetch Pinnacle H2H odds and write to dagens_kamp.pinnacle_h2h for today's picks."""
+    if not cfg.ODDS_API_KEY:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "ODDS_API_KEY mangler"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "error", "error": "DB offline"})
+
+    all_matches = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for league in SCAN_LEAGUES:
+            try:
+                resp = await client.get(
+                    f"https://api.the-odds-api.com/v4/sports/{league['key']}/odds/",
+                    params={
+                        "apiKey": cfg.ODDS_API_KEY,
+                        "regions": "eu",
+                        "bookmakers": "pinnacle",
+                        "markets": "h2h",
+                        "oddsFormat": "decimal",
+                    }
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        all_matches.extend(data)
+            except Exception as e:
+                logger.warning(f"[Pinnacle] Skip {league['name']}: {e}")
+
+    logger.info(f"[Pinnacle] Fetched {len(all_matches)} matches from Odds API")
+
+    updated = []
+    not_found = []
+    async with db_state.pool.acquire() as conn:
+        picks = await conn.fetch(
+            "SELECT id, home_team, away_team FROM dagens_kamp WHERE kickoff::date = CURRENT_DATE"
+        )
+        for pick in picks:
+            ht = pick["home_team"].lower().strip()
+            at = pick["away_team"].lower().strip()
+            matched = None
+            for m in all_matches:
+                mh = m.get("home_team", "").lower().strip()
+                ma = m.get("away_team", "").lower().strip()
+                if (ht in mh or mh in ht) and (at in ma or ma in at):
+                    matched = m
+                    break
+            if not matched:
+                not_found.append(f"{pick['home_team']} vs {pick['away_team']}")
+                continue
+            for bm in matched.get("bookmakers", []):
+                if bm["key"] == "pinnacle":
+                    outcomes = bm["markets"][0]["outcomes"]
+                    odds_dict = {}
+                    for o in outcomes:
+                        n = o["name"].lower()
+                        if n == matched["home_team"].lower():
+                            odds_dict["home"] = o["price"]
+                        elif n == matched["away_team"].lower():
+                            odds_dict["away"] = o["price"]
+                        else:
+                            odds_dict["draw"] = o["price"]
+                    await conn.execute(
+                        "UPDATE dagens_kamp SET pinnacle_h2h=$1 WHERE id=$2",
+                        json.dumps(odds_dict), pick["id"]
+                    )
+                    updated.append({"match": f"{pick['home_team']} vs {pick['away_team']}", "odds": odds_dict})
+                    break
+
+    return {"status": "ok", "updated": len(updated), "not_found": len(not_found), "details": updated, "missing": not_found}
 
 
 @app.post("/run-analysis")
