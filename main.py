@@ -4070,7 +4070,7 @@ async def log_results_manual(results: list[dict]):
                     p.get("pick",""),
                     float(p.get("odds", 3.5)),
                     15.0, "EDGE",
-                    "2026-03-31T20:00:00+00:00",
+                    datetime(2026, 3, 31, 20, 0, 0, tzinfo=timezone.utc),
                     p["result"],
                     int(p["home_score"]),
                     int(p["away_score"])
