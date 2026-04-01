@@ -85,6 +85,8 @@ SCAN_LEAGUES = [
     {"key": "soccer_italy_serie_b",                      "name": "Serie B",                "flag": "🇮🇹"},
     {"key": "soccer_argentina_primera_division",         "name": "Primera División ARG",   "flag": "🇦🇷"},
     {"key": "soccer_brazil_campeonato",                  "name": "Campeonato Brasileiro",  "flag": "🇧🇷"},
+    {"key": "soccer_portugal_primeira_liga",             "name": "Primeira Liga",          "flag": "🇵🇹"},
+    {"key": "soccer_turkey_super_league",                "name": "Süper Lig",              "flag": "🇹🇷"},
 ]
 
 # Topp-4 ligaer for kveldsscan (Vindu 2 — 18:00 UTC)
@@ -2112,7 +2114,7 @@ async def run_analysis():
     postable = [
         p for p in newly_inserted
         if p.get("post_telegram", False)
-        and float(p.get("edge") or 0) >= 7
+        and float(p.get("edge") or 0) >= 6
         and p.get("tier") in ("ATOMIC", "EDGE")
     ]
     posts_left = max(0, DAILY_POST_LIMIT - int(daily_posted))
@@ -3433,7 +3435,7 @@ def enrich_pick(pick: dict) -> dict:
         pick["home_team"] = parts[0].strip() if parts else "Hjemmelag"
         pick["away_team"] = parts[1].strip() if len(parts) > 1 else "Bortelag"
     smart = []
-    if soft >= 7.0:
+    if soft >= 6.0:
         smart.append({"market": str(pick.get("market_type") or "Pick"),
             "selection": str(pick.get("market_type") or "Pick"),
             "our_prob": round(50+soft), "market_implied_prob": 50,
@@ -3942,7 +3944,7 @@ async def _log_pick_to_mirofish(pick_row: dict) -> dict:
 
 @app.post("/post-telegram")
 async def trigger_post_telegram():
-    """Poster upostede ATOMIC/EDGE picks (edge >= 7%) til Telegram, inntil daglig grense."""
+    """Poster upostede ATOMIC/EDGE picks (edge >= 6%) til Telegram, inntil daglig grense."""
     if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
         return JSONResponse(status_code=503, content={"status": "error", "error": "TELEGRAM ikke konfigurert"})
     if not db_state.connected or not db_state.pool:
@@ -3961,12 +3963,12 @@ async def trigger_post_telegram():
         if int(daily_posted) >= DAILY_POST_LIMIT:
             return {"status": "skipped", "reason": f"Daglig grense ({DAILY_POST_LIMIT}) nådd", "posted_today": int(daily_posted)}
 
-        # Fix A+B: fetch ALL qualified picks (edge >= 7%, ATOMIC/EDGE tier only)
+        # Fix A+B: fetch ALL qualified picks (edge >= 6%, ATOMIC/EDGE tier only)
         rows = await conn.fetch("""
             SELECT * FROM dagens_kamp
             WHERE telegram_posted = FALSE
               AND kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
-              AND edge >= 0.07
+              AND edge >= 0.06
               AND tier IN ('ATOMIC', 'EDGE')
             ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
         """)
@@ -3978,13 +3980,13 @@ async def trigger_post_telegram():
                 SELECT COUNT(*) FROM dagens_kamp
                 WHERE telegram_posted = TRUE
                   AND kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
-                  AND edge >= 0.07
+                  AND edge >= 0.06
                   AND tier IN ('ATOMIC', 'EDGE')
             """)
         if int(already_posted_qualified) > 0:
             reason = "all qualified picks already posted today"
         else:
-            reason = "no picks meet quality threshold (EDGE/ATOMIC + edge >= 7%)"
+            reason = "no picks meet quality threshold (EDGE/ATOMIC + edge >= 6%)"
         return {"status": "no_qualified_picks", "reason": reason}
 
     already_posted = int(daily_posted)
