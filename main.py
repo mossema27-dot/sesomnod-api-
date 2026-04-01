@@ -4042,6 +4042,44 @@ async def check_results_now():
     return {"status": "done", "message": "check_live_results executed"}
 
 
+@app.post("/log-results")
+async def log_results_manual(results: list[dict]):
+    async with db_state.pool.acquire() as conn:
+        logged = []
+        for p in results:
+            row = await conn.fetchrow("""
+                SELECT id FROM dagens_kamp
+                WHERE home_team ILIKE $1 AND away_team ILIKE $2
+            """, f"%{p['home']}%", f"%{p['away']}%")
+            if row:
+                await conn.execute("""
+                    UPDATE dagens_kamp
+                    SET result=$1, home_score=$2, away_score=$3, updated_at=NOW()
+                    WHERE id=$4
+                """, p["result"], p["home_score"], p["away_score"], row["id"])
+                logged.append(f"UPDATED: {p['home']} vs {p['away']}")
+            else:
+                await conn.execute("""
+                    INSERT INTO dagens_kamp
+                    (match, home_team, away_team, pick, odds, edge, tier,
+                     kickoff, telegram_posted, result, home_score, away_score)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,TRUE,$9,$10,$11)
+                """,
+                    f"{p['home']} vs {p['away']}",
+                    p["home"], p["away"],
+                    p.get("pick",""),
+                    float(p.get("odds", 3.5)),
+                    15.0, "EDGE",
+                    "2026-03-31T20:00:00+00:00",
+                    p["result"],
+                    int(p["home_score"]),
+                    int(p["away_score"])
+                )
+                logged.append(f"INSERTED: {p['home']} vs {p['away']}")
+        total = await conn.fetchval("SELECT COUNT(*) FROM dagens_kamp WHERE result IS NOT NULL")
+        return {"logged": logged, "total_settled": total, "phase0": f"{total}/30"}
+
+
 @app.post("/send-message")
 async def send_custom_message(body: dict):
     """Send a custom text message to Telegram channel."""
