@@ -3382,6 +3382,49 @@ async def lifespan(app: FastAPI):
         except Exception as _e:
             logger.warning(f"[ML] ml_models migration failed: {_e}")
 
+        # Backtest tables
+        try:
+            async with db_state.pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS backtest_results (
+                        id SERIAL PRIMARY KEY,
+                        run_at TIMESTAMP DEFAULT NOW(),
+                        league VARCHAR(100),
+                        season VARCHAR(20),
+                        total_matches INTEGER,
+                        qualified_picks INTEGER,
+                        hit_rate FLOAT,
+                        roi_pct FLOAT,
+                        avg_clv FLOAT,
+                        avg_brier FLOAT,
+                        max_drawdown_pct FLOAT,
+                        total_profit_units FLOAT,
+                        parameters JSONB
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS backtest_picks (
+                        id SERIAL PRIMARY KEY,
+                        backtest_run_id INTEGER REFERENCES backtest_results(id),
+                        match_date DATE,
+                        home_team VARCHAR(100),
+                        away_team VARCHAR(100),
+                        league VARCHAR(100),
+                        predicted_outcome VARCHAR(20),
+                        actual_outcome VARCHAR(20),
+                        predicted_prob FLOAT,
+                        closing_odds FLOAT,
+                        clv FLOAT,
+                        brier_contribution FLOAT,
+                        profit_units FLOAT,
+                        cumulative_profit FLOAT,
+                        was_correct BOOLEAN
+                    )
+                """)
+            logger.info("[Backtest] Tables ready.")
+        except Exception as _e:
+            logger.warning(f"[Backtest] Migration failed: {_e}")
+
         # Load XGBoost model in background (does not block startup)
         async def _load_xgb():
             try:
@@ -3391,6 +3434,62 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f"[XGB] Startup load failed (non-critical): {e}")
         asyncio.create_task(_load_xgb())
+
+        # Run backtest in background
+        async def _run_backtest():
+            try:
+                await asyncio.sleep(10)  # wait for pool + XGB
+                from services.football_data_fetcher import get_historical_data
+                from services.backtest_engine import run_backtest
+                from services.metrics import update_backtest_metrics
+                df = await asyncio.to_thread(get_historical_data)
+                summary = await asyncio.to_thread(run_backtest, df, "Top 5 Leagues")
+                update_backtest_metrics(summary)
+                async with db_state.pool.acquire() as conn:
+                    run_id = await conn.fetchval("""
+                        INSERT INTO backtest_results (
+                            league, season, total_matches, qualified_picks,
+                            hit_rate, roi_pct, avg_clv, avg_brier,
+                            max_drawdown_pct, total_profit_units, parameters
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                        RETURNING id
+                    """,
+                        "Top 5 Leagues", "2023-2025",
+                        summary.total_matches_scanned,
+                        summary.qualified_picks,
+                        summary.hit_rate,
+                        summary.roi_pct,
+                        summary.avg_clv,
+                        summary.avg_brier,
+                        summary.max_drawdown_pct,
+                        summary.total_profit_units,
+                        '{"edge_threshold":0.06,"half_kelly":true,"cap":0.10}',
+                    )
+                    if summary.picks:
+                        await conn.executemany("""
+                            INSERT INTO backtest_picks (
+                                backtest_run_id, match_date, home_team, away_team,
+                                league, predicted_outcome, actual_outcome,
+                                predicted_prob, closing_odds, clv,
+                                brier_contribution, profit_units,
+                                cumulative_profit, was_correct
+                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                        """, [
+                            (run_id, p.match_date, p.home_team, p.away_team,
+                             p.league, p.predicted_outcome, p.actual_outcome,
+                             p.predicted_prob, p.closing_odds, p.clv,
+                             p.brier_contribution, p.profit_units,
+                             p.cumulative_profit, p.was_correct)
+                            for p in summary.picks
+                        ])
+                logger.info(
+                    "[Backtest] Done: %d picks | hit=%.1f%% | ROI=%.1f%% | CLV=%.1f%%",
+                    summary.qualified_picks, summary.hit_rate * 100,
+                    summary.roi_pct, summary.avg_clv,
+                )
+            except Exception as e:
+                logger.error("[Backtest] Startup task failed: %s", e, exc_info=True)
+        asyncio.create_task(_run_backtest())
     else:
         logger.info("[APP] SesomNod Engine KLAR! (OFFLINE MODE)")
 
@@ -3416,6 +3515,13 @@ app = FastAPI(
     version="10.0.1",
     lifespan=lifespan,
 )
+
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+    logger.info("[Metrics] Prometheus /metrics endpoint mounted.")
+except ImportError:
+    logger.warning("[Metrics] prometheus-fastapi-instrumentator not available.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -3463,6 +3569,97 @@ async def get_bankroll():
         return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.get("/backtest/latest")
+async def get_backtest_latest():
+    """Latest backtest results with Phase 1 gate evaluation."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM backtest_results ORDER BY run_at DESC LIMIT 1")
+        if not row:
+            return {"error": "No backtest results yet", "status": 404}
+        r = dict(row)
+        r["run_at"] = r["run_at"].isoformat() if r.get("run_at") else None
+        hit_ok = (r.get("hit_rate") or 0) > 0.55
+        clv_ok = (r.get("avg_clv") or 0) > 2.0
+        brier_ok = (r.get("avg_brier") or 1) < 0.25
+        dd_ok = (r.get("max_drawdown_pct") or 100) < 20.0
+        r["phase1_gate"] = {
+            "hit_rate_ok": hit_ok, "clv_ok": clv_ok,
+            "brier_ok": brier_ok, "drawdown_ok": dd_ok,
+            "gate_passed": all([hit_ok, clv_ok, brier_ok, dd_ok]),
+        }
+        return r
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+@app.get("/backtest/picks")
+async def get_backtest_picks(limit: int = 50, offset: int = 0):
+    """Paginated backtest pick history."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM backtest_picks ORDER BY match_date DESC LIMIT $1 OFFSET $2",
+                limit, offset,
+            )
+            total = await conn.fetchval("SELECT COUNT(*) FROM backtest_picks")
+        return {"total": total, "limit": limit, "offset": offset, "picks": [dict(r) for r in rows]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+@app.get("/dashboard/stats")
+async def get_dashboard_stats():
+    """Public dashboard: live Phase 0 + backtest + Phase 1 gate status."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    live_data = {"phase0_picks": 0, "hit_rate": 0.0, "avg_clv": 0.0, "profit_units": 0.0}
+    backtest_data = {"hit_rate": 0.0, "roi_pct": 0.0, "avg_clv": 0.0, "qualified_picks": 0}
+    try:
+        async with db_state.pool.acquire() as conn:
+            live_row = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS settled,
+                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
+                    COALESCE(AVG(clv), 0) AS avg_clv
+                FROM dagens_kamp
+                WHERE tier IN ('ATOMIC','EDGE') AND result IS NOT NULL
+            """)
+            if live_row and live_row["settled"] and live_row["settled"] > 0:
+                s, w = live_row["settled"], live_row["wins"] or 0
+                live_data = {
+                    "phase0_picks": int(s),
+                    "hit_rate": round(w / s, 4) if s > 0 else 0.0,
+                    "avg_clv": round(float(live_row["avg_clv"]), 2),
+                    "profit_units": 0.0,
+                }
+            bt_row = await conn.fetchrow("""
+                SELECT hit_rate, roi_pct, avg_clv, qualified_picks, avg_brier, max_drawdown_pct
+                FROM backtest_results ORDER BY run_at DESC LIMIT 1
+            """)
+            if bt_row:
+                backtest_data = {
+                    "hit_rate": round(bt_row["hit_rate"] or 0, 4),
+                    "roi_pct": round(bt_row["roi_pct"] or 0, 2),
+                    "avg_clv": round(bt_row["avg_clv"] or 0, 2),
+                    "qualified_picks": bt_row["qualified_picks"] or 0,
+                    "avg_brier": round(bt_row["avg_brier"] or 0, 4),
+                }
+        hit_ok = live_data["hit_rate"] > 0.55
+        clv_ok = live_data["avg_clv"] > 2.0
+        return {
+            "live": live_data, "backtest": backtest_data,
+            "phase1_gate": {"hit_rate_ok": hit_ok, "clv_ok": clv_ok, "gate_passed": all([hit_ok, clv_ok])},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
 
