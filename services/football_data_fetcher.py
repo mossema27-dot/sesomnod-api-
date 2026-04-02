@@ -31,7 +31,9 @@ LEAGUE_CSVS = [
     "https://www.football-data.co.uk/mmz4281/2324/F1.csv",
 ]
 
-KEEP_COLUMNS = ["HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date"]
+REQUIRED_COLUMNS = ["HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date"]
+ODDS_COLUMNS = ["PSH", "PSD", "PSA", "B365H", "B365D", "B365A"]
+KEEP_COLUMNS = REQUIRED_COLUMNS + ODDS_COLUMNS
 CACHE_TTL_SECONDS = 86400  # 24 hours
 
 # ── Module-level cache ───────────────────────────────────────────────────────
@@ -49,12 +51,13 @@ def _fetch_single_csv(url: str) -> pd.DataFrame | None:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text), encoding="utf-8", on_bad_lines="skip")
-        # Only keep required columns (some CSVs may have different schemas)
-        available = [c for c in KEEP_COLUMNS if c in df.columns]
-        if len(available) < len(KEEP_COLUMNS):
-            logger.warning("CSV %s missing columns: %s", url, set(KEEP_COLUMNS) - set(available))
+        # Must have the 5 required columns; odds columns are optional
+        missing_required = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing_required:
+            logger.warning("CSV %s missing required columns: %s", url, missing_required)
             return None
-        df = df[KEEP_COLUMNS].copy()
+        available = [c for c in KEEP_COLUMNS if c in df.columns]
+        df = df[available].copy()
         # Clean goal columns
         df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce")
         df["FTAG"] = pd.to_numeric(df["FTAG"], errors="coerce")
