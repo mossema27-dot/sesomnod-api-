@@ -104,8 +104,8 @@ def run_backtest(
 
         actual = "H" if fthg > ftag else ("D" if fthg == ftag else "A")
 
-        # Use Bet365 for fair probs (higher margin = value discoverable vs Pinnacle)
-        # Bet at Pinnacle odds (highest odds in market)
+        # Pinnacle = sharp market → true probabilities
+        # Bet365 = soft market → where value exists
         def _safe_odds(col_name: str) -> float:
             if col_name in row.index:
                 try:
@@ -116,33 +116,41 @@ def run_backtest(
                     pass
             return 0.0
 
-        b365_h = _safe_odds("B365H")
-        b365_d = _safe_odds("B365D")
-        b365_a = _safe_odds("B365A")
         pin_h = _safe_odds("PSH")
         pin_d = _safe_odds("PSD")
         pin_a = _safe_odds("PSA")
-
-        if not all([b365_h > 1, b365_d > 1, b365_a > 1]):
-            continue
         if not all([pin_h > 1, pin_d > 1, pin_a > 1]):
             continue
 
-        # Fair probs from Bet365 (remove their ~6% margin)
-        hp, dp, ap = _no_vig(b365_h, b365_d, b365_a)
+        # Pinnacle no-vig = true probabilities
+        overround = 1 / pin_h + 1 / pin_d + 1 / pin_a
+        true_h = (1 / pin_h) / overround
+        true_d = (1 / pin_d) / overround
+        true_a = (1 / pin_a) / overround
 
-        # Edge = fair_prob × pinnacle_odds - 1
+        # Bet365 odds (soft market — where we bet)
+        b365_h = _safe_odds("B365H")
+        b365_d = _safe_odds("B365D")
+        b365_a = _safe_odds("B365A")
+
+        # Edge = true_prob × bet365_odds - 1
         best = None
         best_edge = 0.0
-        pin_map = {"H": pin_h, "D": pin_d, "A": pin_a}
-        for code, prob in [("H", hp), ("D", dp), ("A", ap)]:
-            odds = pin_map[code]
-            edge = prob * odds - 1
-            if edge > best_edge and edge >= EDGE_THRESHOLD and prob >= MIN_CONFIDENCE:
+        for code, true_prob, b365_odds in [
+            ("H", true_h, b365_h),
+            ("D", true_d, b365_d),
+            ("A", true_a, b365_a),
+        ]:
+            if b365_odds <= 1.01:
+                continue
+            if true_prob < MIN_CONFIDENCE:
+                continue
+            edge = true_prob * b365_odds - 1
+            if edge > best_edge:
                 best_edge = edge
-                best = (code, prob, odds)
+                best = (code, true_prob, b365_odds)
 
-        if best is None:
+        if best is None or best_edge < EDGE_THRESHOLD:
             continue
 
         code, prob, odds = best
