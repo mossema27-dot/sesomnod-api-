@@ -11,7 +11,7 @@ import pandas as pd
 
 logger = logging.getLogger("sesomnod.backtest")
 
-EDGE_THRESHOLD = 0.04   # 4% minimum edge
+EDGE_THRESHOLD = 0.02   # 2% minimum edge
 MIN_CONFIDENCE = 0.35   # min true prob to consider
 HALF_KELLY_CAP = 0.10   # max 10% stake per pick
 
