@@ -11,8 +11,8 @@ import pandas as pd
 
 logger = logging.getLogger("sesomnod.backtest")
 
-EDGE_THRESHOLD = 0.02   # 2% minimum edge (Pinnacle no-vig yields small edges)
-MIN_CONFIDENCE = 0.40   # min no-vig prob to consider
+EDGE_THRESHOLD = 0.04   # 4% minimum edge
+MIN_CONFIDENCE = 0.35   # min true prob to consider
 HALF_KELLY_CAP = 0.10   # max 10% stake per pick
 
 
@@ -116,22 +116,29 @@ def run_backtest(
                     pass
             return 0.0
 
-        pin_h = _safe_odds("PSH")
-        pin_d = _safe_odds("PSD")
-        pin_a = _safe_odds("PSA")
-        if not all([pin_h > 1, pin_d > 1, pin_a > 1]):
-            continue
-
-        # Pinnacle no-vig = true probabilities
-        overround = 1 / pin_h + 1 / pin_d + 1 / pin_a
-        true_h = (1 / pin_h) / overround
-        true_d = (1 / pin_d) / overround
-        true_a = (1 / pin_a) / overround
-
         # Bet365 odds (soft market — where we bet)
         b365_h = _safe_odds("B365H")
         b365_d = _safe_odds("B365D")
         b365_a = _safe_odds("B365A")
+        if not all([b365_h > 1, b365_d > 1, b365_a > 1]):
+            continue
+
+        # Pinnacle no-vig = true probabilities (sharp benchmark)
+        pin_h = _safe_odds("PSH")
+        pin_d = _safe_odds("PSD")
+        pin_a = _safe_odds("PSA")
+
+        if all([pin_h > 1, pin_d > 1, pin_a > 1]):
+            overround = 1 / pin_h + 1 / pin_d + 1 / pin_a
+            true_h = (1 / pin_h) / overround
+            true_d = (1 / pin_d) / overround
+            true_a = (1 / pin_a) / overround
+        else:
+            # Fall back to Bet365 no-vig if no Pinnacle
+            overround = 1 / b365_h + 1 / b365_d + 1 / b365_a
+            true_h = (1 / b365_h) / overround
+            true_d = (1 / b365_d) / overround
+            true_a = (1 / b365_a) / overround
 
         # Edge = true_prob × bet365_odds - 1
         best = None

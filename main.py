@@ -3463,7 +3463,7 @@ async def lifespan(app: FastAPI):
                         summary.avg_brier,
                         summary.max_drawdown_pct,
                         summary.total_profit_units,
-                        '{"edge_threshold":0.06,"half_kelly":true,"cap":0.10}',
+                        '{"edge_threshold":0.04,"strategy":"pinnacle_novig_vs_bet365","half_kelly":true,"cap":0.10}',
                     )
                     if summary.picks:
                         await conn.executemany("""
