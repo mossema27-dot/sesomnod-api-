@@ -2755,7 +2755,9 @@ def _build_dc_kelly_block(pick: dict) -> str:
     """Build Dixon-Coles + Kelly section for Telegram message. Returns empty string if data unavailable."""
     dc = pick.get("dixon_coles")
     kelly = pick.get("kelly")
-    if not dc or dc.get("fallback_used"):
+    if not dc:
+        return ""
+    if dc.get("fallback_used"):
         return ""
     block = (
         f"──────────────────────────────\n"
@@ -2764,7 +2766,13 @@ def _build_dc_kelly_block(pick: dict) -> str:
         f"Home: {dc['home_win_prob']:.0%} | Draw: {dc['draw_prob']:.0%} | Away: {dc['away_win_prob']:.0%}\n"
         f"BTTS: {dc['btts_prob']:.0%}\n"
     )
-    if kelly and kelly.get("is_value_bet"):
+    if kelly and kelly.get("kelly_tier") == "UNVERIFIED":
+        block += (
+            f"⚠️ KELLY: IKKE TILGJENGELIG\n"
+            f"Modellen mangler historisk data for disse lagene.\n"
+            f"Ingen stake-anbefaling gis.\n"
+        )
+    elif kelly and kelly.get("is_value_bet"):
         block += (
             f"💰 Kelly: {kelly['recommended_stake_pct']:.1f}u (Half-Kelly) | "
             f"Edge: +{kelly['edge_pct']:.1f}% | {kelly['kelly_tier']}\n"
@@ -3526,7 +3534,11 @@ async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
             else:
                 model_prob = dc_result.home_win_prob
 
-            kelly_result = calculate_kelly(model_prob, odds)
+            kelly_result = calculate_kelly(
+                model_prob=model_prob,
+                decimal_odds=odds,
+                model_verified=not dc_result.fallback_used,
+            )
             pick["kelly"] = kelly_result.to_dict()
 
         except Exception as e:
@@ -3668,7 +3680,11 @@ async def get_pick_analysis(match_id: int):
                 model_prob = dc_result.draw_prob
             else:
                 model_prob = dc_result.home_win_prob
-            kelly_result = calculate_kelly(model_prob, odds)
+            kelly_result = calculate_kelly(
+                model_prob=model_prob,
+                decimal_odds=odds,
+                model_verified=not dc_result.fallback_used,
+            )
 
             return {
                 "status": "ok",

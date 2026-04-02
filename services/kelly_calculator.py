@@ -33,6 +33,7 @@ def calculate_kelly(
     model_prob: float,
     decimal_odds: float,
     bankroll: float = 100.0,
+    model_verified: bool = True,
 ) -> KellyResult:
     """
     Calculate Kelly Criterion stake size.
@@ -43,10 +44,23 @@ def calculate_kelly(
         model_prob: Our model's probability (0-1)
         decimal_odds: Bookmaker decimal odds (e.g. 2.10)
         bankroll: Total bankroll in units (default 100)
+        model_verified: False if Dixon-Coles used fallback (no real model data)
 
     Returns:
         KellyResult with stake recommendation
     """
+    # Guard: unverified model = no stake recommendation
+    if not model_verified:
+        return KellyResult(
+            raw_kelly_fraction=0.0,
+            half_kelly_fraction=0.0,
+            recommended_stake_pct=0.0,
+            recommended_stake_units=0.0,
+            edge_pct=round((model_prob * decimal_odds - 1) * 100, 2),
+            is_value_bet=False,
+            kelly_tier="UNVERIFIED",
+        )
+
     # Edge calculation
     edge_pct = (model_prob * decimal_odds - 1) * 100
 
