@@ -127,8 +127,9 @@ def run_backtest(
 
         best = None
         best_edge = 0.0
+        pin_map = {"H": pin_h, "D": pin_d, "A": pin_a}
         for code, prob in [("H", hp), ("D", dp), ("A", ap)]:
-            odds = bet_odds.get(code) or pin_h if code == "H" else bet_odds.get(code) or (pin_d if code == "D" else pin_a)
+            odds = bet_odds.get(code) or pin_map[code]
             edge = prob * odds - 1
             if edge > best_edge and edge >= EDGE_THRESHOLD and prob >= MIN_CONFIDENCE:
                 best_edge = edge
