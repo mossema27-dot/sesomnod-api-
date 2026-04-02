@@ -18,7 +18,7 @@ import pandas as pd
 logger = logging.getLogger("sesomnod.backtest")
 
 # ── Hyperparameters ──────────────────────────────────────────
-EDGE_THRESHOLD = 0.03    # 3% minimum model edge vs Bet365
+EDGE_THRESHOLD = 0.20    # 20% minimum model edge vs Bet365
 MIN_CONFIDENCE = 0.30    # minimum model probability to consider
 HALF_KELLY_CAP = 0.10    # max stake fraction per pick
 ROLLING_WINDOW = 38      # matches of history per league
