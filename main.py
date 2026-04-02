@@ -1353,12 +1353,12 @@ def calculate_atomic_score(
         gate_passed = False
 
     # Tier-klassifisering
-    if atomic_score >= 1:
+    if atomic_score >= 5 and soft_edge >= 7:
         tier = "ATOMIC"
         tier_label = "⚡ ATOMIC SIGNAL"
         post_telegram = True
         kelly_multiplier = 1.0
-    elif atomic_score >= 1:
+    elif atomic_score >= 2 and soft_edge >= 4:
         tier = "EDGE"
         tier_label = "🎯 EDGE SIGNAL"
         post_telegram = True
@@ -3426,7 +3426,9 @@ def enrich_pick(pick: dict) -> dict:
            min(10,max(0,atomic*1.1))*1.5 + 5*1.2 + 5*0.9 + 9*0.7 +
            min(10,max(0,soft*0.8))*3.1)
     omega = round(min(100, max(0, (raw / 115.0) * 100)))
-    tier = ("BRUTAL" if omega>=72 else "STRONG" if omega>=55 else "MONITORED" if omega>=40 else "SKIP")
+    db_tier = pick.get("omega_tier")  # from DB (aliased as omega_tier in SELECT)
+    omega_tier = ("BRUTAL" if omega>=72 else "STRONG" if omega>=55 else "MONITORED" if omega>=40 else "SKIP")
+    tier = db_tier if db_tier in ("ATOMIC", "EDGE", "MONITORED") else omega_tier
     hw = round(max(5, min(85, (xg_home/lam)*70)))
     aw = round(max(5, min(85, (xg_away/lam)*60)))
     btts = pbtts()
@@ -3445,7 +3447,7 @@ def enrich_pick(pick: dict) -> dict:
     market_label = str(pick.get("market_hint") or pick.get("market_type") or "Pick")
     our_odds_val  = float(pick.get("odds") or 2.0)
     ev_val        = float(pick.get("ev") or soft or 0)
-    pick.update({"omega_score":omega,"omega_tier":tier,
+    pick.update({"omega_score":omega,"omega_tier":tier,"tier":tier,
         "ev": round(ev_val, 2),
         "xg_home":round(xg_home,1),"xg_away":round(xg_away,1),"lambda":round(lam,1),
         "btts_yes":btts,"btts_no":100-btts,"btts_is_smart_bet":btts>=60,"btts_value_gap":0.0,
