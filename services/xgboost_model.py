@@ -185,7 +185,15 @@ def predict_match(
         shap_top3: list[dict] = []
         try:
             shap_values = _explainer.shap_values(X)
-            sv = shap_values[predicted_idx][0]
+            # Handle different SHAP output formats:
+            # List of arrays (one per class) → shap_values[class_idx][sample_idx]
+            # 3D array (n_samples, n_features, n_classes) → shap_values[0, :, class_idx]
+            if isinstance(shap_values, list):
+                sv = np.array(shap_values[predicted_idx]).flatten()[:len(FEATURE_COLS)]
+            elif hasattr(shap_values, 'ndim') and shap_values.ndim == 3:
+                sv = shap_values[0, :, predicted_idx]
+            else:
+                sv = np.array(shap_values).flatten()[:len(FEATURE_COLS)]
             feature_shap = list(zip(FEATURE_COLS, sv))
             feature_shap.sort(key=lambda x: abs(x[1]), reverse=True)
             shap_top3 = [
@@ -198,8 +206,9 @@ def predict_match(
                 }
                 for f, v in feature_shap[:3]
             ]
+            logger.info("SHAP top3: %s", [(s['label'], s['shap_value']) for s in shap_top3])
         except Exception as shap_err:
-            logger.warning("SHAP failed: %s", shap_err)
+            logger.warning("SHAP failed: %s", shap_err, exc_info=True)
 
         return XGBPrediction(
             home_win_prob=round(home_prob, 4),
