@@ -3463,7 +3463,7 @@ async def lifespan(app: FastAPI):
                         summary.avg_brier,
                         summary.max_drawdown_pct,
                         summary.total_profit_units,
-                        '{"edge_threshold":0.02,"strategy":"pinnacle_novig_vs_bet365","half_kelly":true,"cap":0.10}',
+                        '{"strategy":"rolling_poisson_vs_bet365","edge_threshold":0.03,"rolling_window":38,"half_kelly":true,"cap":0.10,"min_confidence":0.30}',
                     )
                     if summary.picks:
                         await conn.executemany("""
@@ -3477,7 +3477,7 @@ async def lifespan(app: FastAPI):
                         """, [
                             (run_id, p.match_date, p.home_team, p.away_team,
                              p.league, p.predicted_outcome, p.actual_outcome,
-                             p.predicted_prob, p.closing_odds, p.clv,
+                             p.model_prob, p.bet365_odds, p.edge_pct,
                              p.brier_contribution, p.profit_units,
                              p.cumulative_profit, p.was_correct)
                             for p in summary.picks

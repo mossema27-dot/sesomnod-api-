@@ -12,28 +12,24 @@ import requests
 
 logger = logging.getLogger("sesomnod.football_data")
 
-# ── CSV sources: current season + previous season per league ─────────────────
-LEAGUE_CSVS = [
-    # EPL
-    "https://www.football-data.co.uk/mmz4281/2425/E0.csv",
-    "https://www.football-data.co.uk/mmz4281/2324/E0.csv",
-    # La Liga
-    "https://www.football-data.co.uk/mmz4281/2425/SP1.csv",
-    "https://www.football-data.co.uk/mmz4281/2324/SP1.csv",
-    # Bundesliga
-    "https://www.football-data.co.uk/mmz4281/2425/D1.csv",
-    "https://www.football-data.co.uk/mmz4281/2324/D1.csv",
-    # Serie A
-    "https://www.football-data.co.uk/mmz4281/2425/I1.csv",
-    "https://www.football-data.co.uk/mmz4281/2324/I1.csv",
-    # Ligue 1
-    "https://www.football-data.co.uk/mmz4281/2425/F1.csv",
-    "https://www.football-data.co.uk/mmz4281/2324/F1.csv",
+# ── CSV sources: (url, league_name) ──────────────────────────────────────────
+LEAGUE_URLS = [
+    ("https://www.football-data.co.uk/mmz4281/2425/E0.csv",  "EPL"),
+    ("https://www.football-data.co.uk/mmz4281/2324/E0.csv",  "EPL"),
+    ("https://www.football-data.co.uk/mmz4281/2425/SP1.csv", "LaLiga"),
+    ("https://www.football-data.co.uk/mmz4281/2324/SP1.csv", "LaLiga"),
+    ("https://www.football-data.co.uk/mmz4281/2425/D1.csv",  "Bundesliga"),
+    ("https://www.football-data.co.uk/mmz4281/2324/D1.csv",  "Bundesliga"),
+    ("https://www.football-data.co.uk/mmz4281/2425/I1.csv",  "SerieA"),
+    ("https://www.football-data.co.uk/mmz4281/2324/I1.csv",  "SerieA"),
+    ("https://www.football-data.co.uk/mmz4281/2425/F1.csv",  "Ligue1"),
+    ("https://www.football-data.co.uk/mmz4281/2324/F1.csv",  "Ligue1"),
 ]
 
 REQUIRED_COLUMNS = ["HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date"]
 ODDS_COLUMNS = ["PSH", "PSD", "PSA", "B365H", "B365D", "B365A"]
-KEEP_COLUMNS = REQUIRED_COLUMNS + ODDS_COLUMNS
+EXTRA_COLUMNS = ["League"]
+KEEP_COLUMNS = REQUIRED_COLUMNS + ODDS_COLUMNS + EXTRA_COLUMNS
 CACHE_TTL_SECONDS = 86400  # 24 hours
 
 # ── Module-level cache ───────────────────────────────────────────────────────
@@ -45,12 +41,14 @@ class FootballDataFetchError(Exception):
     """Raised when all CSV fetches fail."""
 
 
-def _fetch_single_csv(url: str) -> pd.DataFrame | None:
+def _fetch_single_csv(url: str, league_name: str = "") -> pd.DataFrame | None:
     """Fetch and parse a single CSV. Returns None on failure."""
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text), encoding="utf-8", on_bad_lines="skip")
+        if league_name:
+            df["League"] = league_name
         # Must have the 5 required columns; odds columns are optional
         missing_required = [c for c in REQUIRED_COLUMNS if c not in df.columns]
         if missing_required:
@@ -90,8 +88,8 @@ def get_historical_data() -> pd.DataFrame:
         return _cached_data
 
     frames: list[pd.DataFrame] = []
-    for url in LEAGUE_CSVS:
-        df = _fetch_single_csv(url)
+    for url, league_name in LEAGUE_URLS:
+        df = _fetch_single_csv(url, league_name)
         if df is not None and len(df) > 0:
             frames.append(df)
 
