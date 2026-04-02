@@ -2751,6 +2751,42 @@ def _get_scorers(home: str, away: str) -> list:
 
     return out[:4]
 
+def _build_shap_block(xgb: dict | None) -> str:
+    """Build SHAP explainability section for Telegram message."""
+    if not xgb:
+        return ""
+    if not xgb.get("model_available"):
+        return ""
+    shap_top3 = xgb.get("shap_top3") or []
+    if not shap_top3:
+        return ""
+    outcome_labels = {
+        "HOME_WIN": "Hjemmeseier",
+        "DRAW": "Uavgjort",
+        "AWAY_WIN": "Borteseier",
+    }
+    predicted = outcome_labels.get(
+        xgb.get("predicted_outcome", ""),
+        xgb.get("predicted_outcome", "—"),
+    )
+    conf = xgb.get("confidence", 0)
+    lines = [
+        "──────────────────────────────",
+        "🧠 AI-ANALYSE (XGBoost)",
+        f"Prediksjon: {predicted} | Sikkerhet: {conf:.0%}",
+        "",
+        "Topp signaler:",
+    ]
+    for i, s in enumerate(shap_top3[:3], 1):
+        arrow = "+" if s.get("direction") == "positiv" else "-"
+        lines.append(
+            f"  {i}. {arrow} {s.get('label', s.get('feature'))} "
+            f"= {s.get('value')} ({s.get('shap_value'):+.3f})"
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _build_dc_kelly_block(pick: dict) -> str:
     """Build Dixon-Coles + Kelly section for Telegram message. Returns empty string if data unavailable."""
     dc = pick.get("dixon_coles")
@@ -2918,6 +2954,7 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
         f"──────────────────────────────\n"
         f"PICK: {pick_label}\n"
         f"ODDS: @ {odds} | RANK: #{rank} av dagen\n\n"
+        + _build_shap_block(pick.get("xgboost")) +
         f"You don't get picks. You get control. ⚡\n"
         f"SesomNod gir deg kontroll og innsikt — ikke tilfeldigheter. Trenger du hjelp med spillavhengighet? Ring Hjelpelinjen gratis på 800 800 40."
     )
@@ -3328,6 +3365,32 @@ async def lifespan(app: FastAPI):
             logger.info("[Blokk2] picks-kolonner migrert (result, closing_odds, clv, league)")
         except Exception as _e:
             logger.warning(f"[Blokk2] Migrasjon feilet (ikke kritisk): {_e}")
+
+        # ml_models table for XGBoost persistence
+        try:
+            async with db_state.pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ml_models (
+                        model_name VARCHAR(100) PRIMARY KEY,
+                        model_data BYTEA NOT NULL,
+                        accuracy FLOAT,
+                        training_samples INTEGER,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+            logger.info("[ML] ml_models table ready.")
+        except Exception as _e:
+            logger.warning(f"[ML] ml_models migration failed: {_e}")
+
+        # Load XGBoost model in background (does not block startup)
+        async def _load_xgb():
+            try:
+                await asyncio.sleep(3)  # let DB pool stabilize
+                from services.xgboost_model import ensure_model_loaded
+                await ensure_model_loaded(db_state.pool)
+            except Exception as e:
+                logger.warning(f"[XGB] Startup load failed (non-critical): {e}")
+        asyncio.create_task(_load_xgb())
     else:
         logger.info("[APP] SesomNod Engine KLAR! (OFFLINE MODE)")
 
@@ -3545,6 +3608,20 @@ async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
             logger.warning("[DC] Failed for %s vs %s: %s", pick.get("home_team"), pick.get("away_team"), e)
             pick["dixon_coles"] = None
             pick["kelly"] = None
+
+        # XGBoost prediction
+        try:
+            from services.pick_feature_extractor import extract_features_for_pick
+            from services.xgboost_model import predict_match
+            features = extract_features_for_pick(
+                home_team=pick.get("home_team", ""),
+                away_team=pick.get("away_team", ""),
+            )
+            xgb_result = predict_match(**features)
+            pick["xgboost"] = xgb_result.to_dict()
+        except Exception as xgb_err:
+            logger.warning("[XGB] Failed for %s vs %s: %s", pick.get("home_team"), pick.get("away_team"), xgb_err)
+            pick["xgboost"] = None
 
     return picks
 
