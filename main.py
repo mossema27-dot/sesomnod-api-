@@ -3571,6 +3571,26 @@ async def get_bankroll():
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
+@app.get("/backtest/debug")
+async def backtest_debug():
+    """Debug: show what columns the historical data has."""
+    try:
+        from services.football_data_fetcher import get_historical_data
+        df = get_historical_data()
+        sample = df.head(1).to_dict(orient="records")[0] if len(df) > 0 else {}
+        return {
+            "rows": len(df),
+            "columns": list(df.columns),
+            "has_PSH": "PSH" in df.columns,
+            "has_B365H": "B365H" in df.columns,
+            "sample_row_keys": list(sample.keys()),
+            "PSH_sample": str(sample.get("PSH", "MISSING")),
+            "B365H_sample": str(sample.get("B365H", "MISSING")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/backtest/latest")
 async def get_backtest_latest():
     """Latest backtest results with Phase 1 gate evaluation."""
