@@ -11,8 +11,8 @@ import pandas as pd
 
 logger = logging.getLogger("sesomnod.backtest")
 
-EDGE_THRESHOLD = 0.06   # 6% minimum edge
-MIN_CONFIDENCE = 0.45   # min no-vig prob to consider
+EDGE_THRESHOLD = 0.02   # 2% minimum edge (Pinnacle no-vig yields small edges)
+MIN_CONFIDENCE = 0.40   # min no-vig prob to consider
 HALF_KELLY_CAP = 0.10   # max 10% stake per pick
 
 
@@ -104,17 +104,31 @@ def run_backtest(
 
         actual = "H" if fthg > ftag else ("D" if fthg == ftag else "A")
 
-        h_o = _get_odds(row, "H")
-        d_o = _get_odds(row, "D")
-        a_o = _get_odds(row, "A")
-        if not all([h_o, d_o, a_o]):
+        # Use Pinnacle for fair probs, Bet365 for betting odds
+        pin_h = _get_odds(row, "H")
+        pin_d = _get_odds(row, "D")
+        pin_a = _get_odds(row, "A")
+        if not all([pin_h, pin_d, pin_a]):
             continue
 
-        hp, dp, ap = _no_vig(h_o, d_o, a_o)
+        hp, dp, ap = _no_vig(pin_h, pin_d, pin_a)
+
+        # Get Bet365 odds for edge calculation (higher margin = more edge)
+        bet_cols = {"H": "B365H", "D": "B365D", "A": "B365A"}
+        bet_odds = {}
+        for code, col in bet_cols.items():
+            if col in row.index:
+                try:
+                    v = float(row[col])
+                    if v > 1.01 and not np.isnan(v):
+                        bet_odds[code] = v
+                except (ValueError, TypeError):
+                    pass
 
         best = None
         best_edge = 0.0
-        for code, prob, odds in [("H", hp, h_o), ("D", dp, d_o), ("A", ap, a_o)]:
+        for code, prob in [("H", hp), ("D", dp), ("A", ap)]:
+            odds = bet_odds.get(code) or pin_h if code == "H" else bet_odds.get(code) or (pin_d if code == "D" else pin_a)
             edge = prob * odds - 1
             if edge > best_edge and edge >= EDGE_THRESHOLD and prob >= MIN_CONFIDENCE:
                 best_edge = edge
