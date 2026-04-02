@@ -104,32 +104,39 @@ def run_backtest(
 
         actual = "H" if fthg > ftag else ("D" if fthg == ftag else "A")
 
-        # Use Pinnacle for fair probs, Bet365 for betting odds
-        pin_h = _get_odds(row, "H")
-        pin_d = _get_odds(row, "D")
-        pin_a = _get_odds(row, "A")
-        if not all([pin_h, pin_d, pin_a]):
-            continue
-
-        hp, dp, ap = _no_vig(pin_h, pin_d, pin_a)
-
-        # Get Bet365 odds for edge calculation (higher margin = more edge)
-        bet_cols = {"H": "B365H", "D": "B365D", "A": "B365A"}
-        bet_odds = {}
-        for code, col in bet_cols.items():
-            if col in row.index:
+        # Use Bet365 for fair probs (higher margin = value discoverable vs Pinnacle)
+        # Bet at Pinnacle odds (highest odds in market)
+        def _safe_odds(col_name: str) -> float:
+            if col_name in row.index:
                 try:
-                    v = float(row[col])
+                    v = float(row[col_name])
                     if v > 1.01 and not np.isnan(v):
-                        bet_odds[code] = v
+                        return v
                 except (ValueError, TypeError):
                     pass
+            return 0.0
 
+        b365_h = _safe_odds("B365H")
+        b365_d = _safe_odds("B365D")
+        b365_a = _safe_odds("B365A")
+        pin_h = _safe_odds("PSH")
+        pin_d = _safe_odds("PSD")
+        pin_a = _safe_odds("PSA")
+
+        if not all([b365_h > 1, b365_d > 1, b365_a > 1]):
+            continue
+        if not all([pin_h > 1, pin_d > 1, pin_a > 1]):
+            continue
+
+        # Fair probs from Bet365 (remove their ~6% margin)
+        hp, dp, ap = _no_vig(b365_h, b365_d, b365_a)
+
+        # Edge = fair_prob × pinnacle_odds - 1
         best = None
         best_edge = 0.0
         pin_map = {"H": pin_h, "D": pin_d, "A": pin_a}
         for code, prob in [("H", hp), ("D", dp), ("A", ap)]:
-            odds = bet_odds.get(code) or pin_map[code]
+            odds = pin_map[code]
             edge = prob * odds - 1
             if edge > best_edge and edge >= EDGE_THRESHOLD and prob >= MIN_CONFIDENCE:
                 best_edge = edge
