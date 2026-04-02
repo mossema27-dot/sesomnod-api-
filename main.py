@@ -2751,6 +2751,30 @@ def _get_scorers(home: str, away: str) -> list:
 
     return out[:4]
 
+def _build_dc_kelly_block(pick: dict) -> str:
+    """Build Dixon-Coles + Kelly section for Telegram message. Returns empty string if data unavailable."""
+    dc = pick.get("dixon_coles")
+    kelly = pick.get("kelly")
+    if not dc or dc.get("fallback_used"):
+        return ""
+    block = (
+        f"──────────────────────────────\n"
+        f"🧮 DIXON-COLES MODEL\n"
+        f"──────────────────────────────\n"
+        f"Home: {dc['home_win_prob']:.0%} | Draw: {dc['draw_prob']:.0%} | Away: {dc['away_win_prob']:.0%}\n"
+        f"BTTS: {dc['btts_prob']:.0%}\n"
+    )
+    if kelly and kelly.get("is_value_bet"):
+        block += (
+            f"💰 Kelly: {kelly['recommended_stake_pct']:.1f}u (Half-Kelly) | "
+            f"Edge: +{kelly['edge_pct']:.1f}% | {kelly['kelly_tier']}\n"
+        )
+    elif kelly:
+        block += f"⚠️ No value at current odds (edge: {kelly['edge_pct']:.1f}%)\n"
+    block += "\n"
+    return block
+
+
 def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) -> str:
     home   = pick.get("home_team") or pick.get("match", "?").split(" vs ")[0]
     away   = pick.get("away_team") or (pick.get("match", "?").split(" vs ")[-1])
@@ -2880,6 +2904,7 @@ def build_telegram_message(pick: dict, rank: int = 1, total_scanned: int = 0) ->
         f"Edge: +{edge:.2f}% | EV: +{ev:.2f}%\n"
         f"Score: {score:.2f} | Books: {books}\n"
         f"Scan: {scan} kamper analysert\n\n"
+        + _build_dc_kelly_block(pick) +
         f"──────────────────────────────\n"
         f"🎯 MODEL DECISION  {tier}\n"
         f"──────────────────────────────\n"
@@ -3464,6 +3489,54 @@ def enrich_pick(pick: dict) -> dict:
         "our_pick":market_label+" @ "+str(round(our_odds_val,2))})
     return pick
 
+async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
+    """
+    Enrich picks with Dixon-Coles probabilities and Kelly stake recommendations.
+    Runs after initial enrich_pick() processing. Never raises.
+    """
+    try:
+        from services.dixon_coles_engine import get_dixon_coles_probs
+        from services.kelly_calculator import calculate_kelly
+    except ImportError as e:
+        logger.warning("[DC] Failed to import Dixon-Coles/Kelly services: %s", e)
+        for pick in picks:
+            pick["dixon_coles"] = None
+            pick["kelly"] = None
+        return picks
+
+    for pick in picks:
+        try:
+            home = pick.get("home_team", "")
+            away = pick.get("away_team", "")
+            odds = float(pick.get("odds") or 2.0)
+
+            # Market home probability from existing Poisson-based calc
+            hw_pct = float(pick.get("home_win_prob") or 40)
+            market_home_prob = hw_pct / 100.0
+
+            dc_result = await get_dixon_coles_probs(home, away, market_home_prob)
+            pick["dixon_coles"] = dc_result.to_dict()
+
+            # Determine which probability to use for Kelly based on the pick type
+            pick_label = str(pick.get("our_pick") or pick.get("market_hint") or "").lower()
+            if "away" in pick_label or "borte" in pick_label:
+                model_prob = dc_result.away_win_prob
+            elif "draw" in pick_label or "uavgjort" in pick_label:
+                model_prob = dc_result.draw_prob
+            else:
+                model_prob = dc_result.home_win_prob
+
+            kelly_result = calculate_kelly(model_prob, odds)
+            pick["kelly"] = kelly_result.to_dict()
+
+        except Exception as e:
+            logger.warning("[DC] Failed for %s vs %s: %s", pick.get("home_team"), pick.get("away_team"), e)
+            pick["dixon_coles"] = None
+            pick["kelly"] = None
+
+    return picks
+
+
 _live_cache: dict = {"data": {}, "fetched_at": 0.0}
 
 async def fetch_live_scores() -> dict:
@@ -3547,6 +3620,7 @@ async def get_picks():
                 """
             )
         enriched = [enrich_pick(dict(r)) for r in rows]
+        enriched = await enrich_picks_with_dc(enriched)
         live_scores = await fetch_live_scores()
         for pick in enriched:
             match_key = pick.get("match_name", "")
@@ -3556,6 +3630,60 @@ async def get_picks():
             pick["is_live"] = bool(live)
         return {"status": "ok", "data": enriched, "count": len(enriched)}
     except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.get("/picks/analysis/{match_id}")
+async def get_pick_analysis(match_id: int):
+    """Detailed Dixon-Coles + Kelly analysis for a specific match."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"status": "offline", "error": "Database ikke tilgjengelig"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, match AS match_name, home_team, away_team, odds, edge, ev,
+                          atomic_score, tier AS omega_tier, market_hint, league,
+                          kickoff AS kickoff_time, confidence, signal_xg,
+                          xg_divergence_home, xg_divergence_away, pinnacle_h2h
+                   FROM dagens_kamp WHERE id = $1""",
+                match_id,
+            )
+        if not row:
+            return JSONResponse(status_code=404, content={"status": "error", "error": f"Match id={match_id} not found"})
+
+        pick = enrich_pick(dict(row))
+
+        try:
+            from services.dixon_coles_engine import get_dixon_coles_probs
+            from services.kelly_calculator import calculate_kelly
+
+            hw_pct = float(pick.get("home_win_prob") or 40)
+            market_home_prob = hw_pct / 100.0
+            dc_result = await get_dixon_coles_probs(pick["home_team"], pick["away_team"], market_home_prob)
+            odds = float(pick.get("odds") or 2.0)
+            pick_label = str(pick.get("our_pick") or "").lower()
+            if "away" in pick_label or "borte" in pick_label:
+                model_prob = dc_result.away_win_prob
+            elif "draw" in pick_label or "uavgjort" in pick_label:
+                model_prob = dc_result.draw_prob
+            else:
+                model_prob = dc_result.home_win_prob
+            kelly_result = calculate_kelly(model_prob, odds)
+
+            return {
+                "status": "ok",
+                "match_id": match_id,
+                "home_team": pick["home_team"],
+                "away_team": pick["away_team"],
+                "odds": odds,
+                "dixon_coles": dc_result.to_dict(),
+                "kelly": kelly_result.to_dict(),
+            }
+        except ImportError as e:
+            return JSONResponse(status_code=500, content={"status": "error", "error": f"Dixon-Coles services not available: {e}"})
+
+    except Exception as e:
+        logger.exception("[/picks/analysis] Error for match %s", match_id)
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
