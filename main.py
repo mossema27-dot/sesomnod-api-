@@ -2101,6 +2101,8 @@ async def run_analysis():
             )
             newly_inserted.append({"id": row_id, **pick, "total_scanned": total_scanned})
             logger.info(f"[Analyse] Ny pick (id={row_id}): {pick['pick']} @ {pick['odds']} SCORE={pick['score']}")
+            # Sync to picks_v2
+            await _sync_to_picks_v2({**pick, "match": f"{pick['home_team']} vs {pick['away_team']}", "kickoff": kickoff_dt}, row_id)
 
     if not newly_inserted:
         logger.info("[Analyse] Ingen nye picks (alle allerede i DB)")
@@ -2147,6 +2149,53 @@ async def run_analysis():
     skipped = len(postable) - posts_left
     if skipped > 0:
         logger.info(f"[Analyse] {skipped} picks lagret men ikke postet (grense {DAILY_POST_LIMIT} nådd)")
+
+
+# ─────────────────────────────────────────────────────────
+# SYNC dagens_kamp → picks_v2 (called after every INSERT into dagens_kamp)
+# ─────────────────────────────────────────────────────────
+async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
+    """Mirror a dagens_kamp row into picks_v2 so every pick is tracked."""
+    if not db_state.connected or not db_state.pool:
+        return
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO picks_v2 (
+                    match_name, home_team, away_team, league,
+                    kickoff_time, odds, soft_edge, soft_ev,
+                    atomic_score, tier, tier_label,
+                    kelly_stake, signals_triggered,
+                    telegram_posted, result, status,
+                    created_at, updated_at, timestamp
+                ) VALUES (
+                    $1, $2, $3, $4,
+                    $5, $6, $7, $8,
+                    $9, $10, $11,
+                    $12, $13,
+                    $14, $15, 'PENDING',
+                    NOW(), NOW(), NOW()
+                )
+            """,
+                pick.get("match") or f"{pick.get('home_team','')} vs {pick.get('away_team','')}",
+                pick.get("home_team", ""),
+                pick.get("away_team", ""),
+                pick.get("league", ""),
+                pick.get("kickoff") or pick.get("kickoff_dt"),
+                float(pick.get("odds") or 0),
+                float(pick.get("edge") or pick.get("soft_edge") or 0),
+                float(pick.get("ev") or pick.get("soft_ev") or 0),
+                int(pick.get("atomic_score") or 0),
+                pick.get("tier", "MONITORED"),
+                pick.get("tier_label", "📊 MONITORED"),
+                float(pick.get("kelly_stake") or 0),
+                json.dumps(pick.get("signals_triggered", [])) if isinstance(pick.get("signals_triggered"), list) else (pick.get("signals_triggered") or "[]"),
+                bool(pick.get("telegram_posted", False)),
+                pick.get("result"),
+            )
+        logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id}: {pick.get('match') or pick.get('home_team','?')}")
+    except Exception as e:
+        logger.warning(f"[picks_v2] Sync feil for dagens_kamp id={dagens_kamp_id}: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -2333,8 +2382,10 @@ async def pre_kickoff_check():
 
                     if row_id:
                         best["id"] = row_id
-                        # Notion
+                        # Sync to picks_v2
                         best_with_kickoff = {**best, "kickoff": kickoff_dt}
+                        await _sync_to_picks_v2(best_with_kickoff, row_id)
+                        # Notion
                         await _log_notion_pick(best_with_kickoff)
 
                         # Telegram
@@ -4548,6 +4599,15 @@ async def log_results_manual(results: list[dict]):
                     outcome, hs, aws
                 )
                 logged.append(f"INSERTED: {p['home']} vs {p['away']} → {outcome}")
+                # Sync to picks_v2
+                await _sync_to_picks_v2({
+                    "home_team": p["home"], "away_team": p["away"],
+                    "match": f"{p['home']} vs {p['away']}",
+                    "odds": float(p.get("odds", 3.5)),
+                    "edge": 15.0, "tier": "EDGE",
+                    "kickoff": datetime(2026, 3, 31, 20, 0, 0, tzinfo=timezone.utc),
+                    "result": outcome,
+                }, 0)
         total = await conn.fetchval("SELECT COUNT(*) FROM dagens_kamp WHERE result IS NOT NULL")
         return {"logged": logged, "total_settled": total, "phase0": f"{total}/30"}
 
@@ -4870,6 +4930,7 @@ async def add_pick(payload: dict):
                 float(payload.get("pinnacle_opening", 0)) if payload.get("pinnacle_opening") else None,
             )
         pick_data = {**payload, "id": row_id, "kickoff": kickoff_dt}
+        await _sync_to_picks_v2(pick_data, row_id)
         await _log_notion_pick(pick_data)
         return {
             "status": "ok", "id": row_id,
