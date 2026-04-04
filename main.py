@@ -4395,7 +4395,10 @@ async def _log_pick_to_mirofish(pick_row: dict) -> dict:
 
         home_slug = home_raw.lower().replace(" ", "-")
         away_slug = away_raw.lower().replace(" ", "-")
-        pick_id = f"{home_slug}-{away_slug}-{date_str}"
+        # Include market_type in pick_id to avoid collisions when
+        # multiple picks exist for the same match (e.g. h2h + over25)
+        market_type = str(pick_row.get("market_type") or "h2h").lower().replace(" ", "_")
+        pick_id = f"{home_slug}-{away_slug}-{date_str}-{market_type}"
 
         our_odds_raw = pick_row.get("odds")
         if our_odds_raw is None or float(our_odds_raw) <= 1.0:
@@ -4413,7 +4416,7 @@ async def _log_pick_to_mirofish(pick_row: dict) -> dict:
             "our_odds": our_odds,
             "kickoff": kickoff_iso,
             "edge_at_pick": edge_val,
-            "market": "h2h",
+            "market": market_type,
         }
 
         async with httpx.AsyncClient(timeout=10) as client:
