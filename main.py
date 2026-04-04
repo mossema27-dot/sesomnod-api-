@@ -3698,11 +3698,11 @@ async def get_dashboard_stats():
         async with db_state.pool.acquire() as conn:
             live_row = await conn.fetchrow("""
                 SELECT
-                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS settled,
-                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
-                    COALESCE(AVG(clv), 0) AS avg_clv
-                FROM dagens_kamp
-                WHERE tier IN ('ATOMIC','EDGE') AND result IS NOT NULL
+                    COUNT(*) FILTER (WHERE outcome IN ('WIN','LOSS')) AS settled,
+                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
+                    COALESCE(AVG(pinnacle_clv), 0) AS avg_clv
+                FROM picks_v2
+                WHERE status = 'RESULT_LOGGED'
             """)
             if live_row and live_row["settled"] and live_row["settled"] > 0:
                 s, w = live_row["settled"], live_row["wins"] or 0
@@ -3737,97 +3737,108 @@ async def get_dashboard_stats():
 
 
 def enrich_pick(pick: dict) -> dict:
+    """Enrich a dagens_kamp row for the /picks API response.
+
+    RULE: Never fabricate data. If a field is NULL in DB, return None
+    so the frontend can show '—' instead of fake numbers.
+    """
     import math, json as _json
-    xg_home = max(0.0, float(
-        pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home") or 0
-    ))
-    xg_away = max(0.0, float(
-        pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away") or 0
-    ))
 
-    # When real xG is missing, derive from actual Pinnacle h/d/a odds stored per match
-    if xg_home == 0 or xg_away == 0:
-        try:
-            h2h_raw = pick.get("pinnacle_h2h")
-            h_odds = d_odds = a_odds = 0.0
-            if h2h_raw:
-                parsed = _json.loads(h2h_raw) if isinstance(h2h_raw, str) else h2h_raw
-                h_odds = float(parsed.get("home") or 0)
-                d_odds = float(parsed.get("draw") or 0)
-                a_odds = float(parsed.get("away") or 0)
+    # ── xG: use real data or None ──
+    xg_home_raw = pick.get("signal_xg_home") or pick.get("xg_home") or pick.get("xg_divergence_home")
+    xg_away_raw = pick.get("signal_xg_away") or pick.get("xg_away") or pick.get("xg_divergence_away")
+    has_real_xg = xg_home_raw is not None and xg_away_raw is not None
+    xg_home = max(0.0, float(xg_home_raw)) if has_real_xg else None
+    xg_away = max(0.0, float(xg_away_raw)) if has_real_xg else None
 
-            if h_odds > 1.0 and a_odds > 1.0 and d_odds > 1.0:
-                # Remove vig → fair probabilities
-                total_implied = (1/h_odds) + (1/d_odds) + (1/a_odds)
-                fair_home = (1/h_odds) / total_implied
-                fair_away = (1/a_odds) / total_implied
-                # Scale to goal expectation (avg ~2.7 goals per match)
-                xg_home = round(fair_home * 2.7, 2)
-                xg_away = round(fair_away * 2.7, 2)
-            else:
-                # Last resort: use pick odds + edge to infer one-sided strength
-                pick_odds = float(pick.get("odds") or 2.5)
-                edge_val  = float(pick.get("edge") or 0)
-                implied   = min(0.85, (1.0 / max(1.01, pick_odds)) + edge_val)
-                xg_home   = round(implied * 2.7, 2)
-                xg_away   = round(max(0.5, (1.0 - implied - 0.25) * 2.7), 2)
-        except Exception:
-            xg_home = 1.3
-            xg_away = 1.1
-    lam = max(0.5, min(6.0, xg_home + xg_away))
-    def pcdf(n, l):
-        t, term = 0.0, math.exp(-l)
-        for k in range(n + 1):
-            t += term
-            term *= l / (k + 1)
-        return t
-    def pover(n): return round((1 - pcdf(n, lam)) * 100)
-    def pbtts():
+    # ── Poisson-derived fields: only if we have real xG ──
+    if has_real_xg and xg_home is not None and xg_away is not None:
+        lam = max(0.5, min(6.0, xg_home + xg_away))
+        def pcdf(n, l):
+            t, term = 0.0, math.exp(-l)
+            for k in range(n + 1):
+                t += term
+                term *= l / (k + 1)
+            return t
+        def pover(n): return round((1 - pcdf(n, lam)) * 100)
         ph = 1 - math.exp(-max(0.01, xg_home))
         pa = 1 - math.exp(-max(0.01, xg_away))
-        return round(max(0, min(99, (ph * pa - ph * pa * 0.08 * (xg_home * xg_away * 0.13)) * 100)))
-    atomic = int(pick.get("atomic_score") or 4)
+        btts = round(max(0, min(99, (ph * pa) * 100)))
+        hw = round(max(5, min(85, (xg_home / lam) * 70)))
+        aw = round(max(5, min(85, (xg_away / lam) * 60)))
+        over_vals = {f"over_0{i}": pover(i-1) for i in range(1, 6)}
+        over_vals["over_05"] = over_vals.pop("over_01", pover(0))
+        prob_data = {
+            "xg_home": round(xg_home, 1), "xg_away": round(xg_away, 1), "lambda": round(lam, 1),
+            "btts_yes": btts, "btts_no": 100 - btts,
+            "over_05": pover(0), "over_15": pover(1), "over_25": pover(2),
+            "over_35": pover(3), "over_45": pover(4), "under_25": 100 - pover(2),
+            "home_win_prob": hw, "draw_prob": max(5, 100 - hw - aw), "away_win_prob": aw,
+            "first_goal_home": max(0, round(xg_home / lam * 75)),
+            "first_goal_away": max(0, round(xg_away / lam * 65)),
+            "first_goal_none_ht": 15,
+        }
+    else:
+        lam = None
+        prob_data = {
+            "xg_home": None, "xg_away": None, "lambda": None,
+            "btts_yes": None, "btts_no": None,
+            "over_05": None, "over_15": None, "over_25": None,
+            "over_35": None, "over_45": None, "under_25": None,
+            "home_win_prob": None, "draw_prob": None, "away_win_prob": None,
+            "first_goal_home": None, "first_goal_away": None,
+            "first_goal_none_ht": None,
+        }
+
+    # ── Omega score: uses real fields (atomic_score, edge) ──
+    atomic = int(pick.get("atomic_score") or 0)
     soft = float(pick.get("soft_edge") or pick.get("edge") or 0)
-    raw = (min(10,max(0,5+(xg_home-xg_away)*2.5))*2.3 + 5*1.8 +
-           min(10,max(0,atomic*1.1))*1.5 + 5*1.2 + 5*0.9 + 9*0.7 +
-           min(10,max(0,soft*0.8))*3.1)
+    # Simplified omega that doesn't depend on fabricated xG
+    raw = (atomic * 1.5 + soft * 3.1 + 5 * 1.8 + 5 * 1.2 + 5 * 0.9 + 9 * 0.7 + 5 * 2.3)
     omega = round(min(100, max(0, (raw / 115.0) * 100)))
-    db_tier = pick.get("omega_tier")  # from DB (aliased as omega_tier in SELECT)
-    omega_tier = ("BRUTAL" if omega>=72 else "STRONG" if omega>=55 else "MONITORED" if omega>=40 else "SKIP")
+    db_tier = pick.get("omega_tier")
+    omega_tier = ("BRUTAL" if omega >= 72 else "STRONG" if omega >= 55 else "MONITORED" if omega >= 40 else "SKIP")
     tier = db_tier if db_tier in ("ATOMIC", "EDGE", "MONITORED") else omega_tier
-    hw = round(max(5, min(85, (xg_home/lam)*70)))
-    aw = round(max(5, min(85, (xg_away/lam)*60)))
-    btts = pbtts()
+
+    # ── Team names ──
     if not pick.get("home_team") or not pick.get("away_team"):
         parts = str(pick.get("match_name") or "Hjemme vs Borte").split(" vs ")
         pick["home_team"] = parts[0].strip() if parts else "Hjemmelag"
         pick["away_team"] = parts[1].strip() if len(parts) > 1 else "Bortelag"
+
+    # ── Smart bets: only if edge is real ──
     smart = []
     if soft >= 6.0:
-        smart.append({"market": str(pick.get("market_type") or "Pick"),
+        smart.append({
+            "market": str(pick.get("market_type") or "Pick"),
             "selection": str(pick.get("market_type") or "Pick"),
-            "our_prob": round(50+soft), "market_implied_prob": 50,
-            "value_gap_percent": round(soft,1),
+            "our_prob": round(50 + soft), "market_implied_prob": 50,
+            "value_gap_percent": round(soft, 1),
             "unibet_odds": float(pick.get("our_odds") or 2.0),
-            "edge_label": "Sharp Edge" if soft>=15 else "Value Edge"})
+            "edge_label": "Sharp Edge" if soft >= 15 else "Value Edge",
+        })
+
+    # ── Odds: use real bookmaker odds, NOT fabricated from probs ──
+    our_odds_val = float(pick.get("odds") or 2.0)
+    ev_val = float(pick.get("ev") or soft or 0)
     market_label = str(pick.get("market_hint") or pick.get("market_type") or "Pick")
-    our_odds_val  = float(pick.get("odds") or 2.0)
-    ev_val        = float(pick.get("ev") or soft or 0)
-    pick.update({"omega_score":omega,"omega_tier":tier,"tier":tier,
+
+    pick.update({
+        "omega_score": omega, "omega_tier": tier, "tier": tier,
         "ev": round(ev_val, 2),
-        "xg_home":round(xg_home,1),"xg_away":round(xg_away,1),"lambda":round(lam,1),
-        "btts_yes":btts,"btts_no":100-btts,"btts_is_smart_bet":btts>=60,"btts_value_gap":0.0,
-        "over_05":pover(0),"over_15":pover(1),"over_25":pover(2),
-        "over_35":pover(3),"over_45":pover(4),"under_25":100-pover(2),
-        "home_win_prob":hw,"draw_prob":max(5,100-hw-aw),"away_win_prob":aw,
-        "home_odds":round(100/max(1,hw),2),"draw_odds":round(100/max(1,100-hw-aw),2),"away_odds":round(100/max(1,aw),2),
-        "first_goal_home":max(0,round(xg_home/lam*75)),"first_goal_away":max(0,round(xg_away/lam*65)),
-        "first_goal_none_ht":15,
-        "form_home":list(pick.get("form_home") or ["W","D","W","D","W"]),
-        "form_away":list(pick.get("form_away") or ["W","D","W","D","W"]),
-        "smart_bets":smart,"is_completed":bool(pick.get("is_completed") or False),
-        "kickoff_cet":str(pick.get("kickoff_time") or pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
-        "our_pick":market_label+" @ "+str(round(our_odds_val,2))})
+        "edge": round(soft, 2),
+        # Real odds from bookmaker (NOT derived from fake probs)
+        "home_odds": None, "draw_odds": None, "away_odds": None,
+        # Form: None when no real data (never hardcode W/D/W/D/W)
+        "form_home": None, "form_away": None,
+        "btts_is_smart_bet": False, "btts_value_gap": 0.0,
+        "smart_bets": smart,
+        "is_completed": bool(pick.get("is_completed") or False),
+        "kickoff_cet": str(pick.get("kickoff_time") or pick.get("match_date") or pick.get("kickoff_cet") or "18:45"),
+        "our_pick": market_label + " @ " + str(round(our_odds_val, 2)),
+    })
+    # Merge probability data (real or None)
+    pick.update(prob_data)
     return pick
 
 async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
@@ -5850,21 +5861,31 @@ async def get_ladder_history():
     try:
         async with db_state.pool.acquire() as conn:
             # Use dagens_kamp — has pick, edge, ev, kickoff with correct column names
+            # Join with picks_v2 to get authoritative outcome (WIN/LOSS)
+            # Fall back to dagens_kamp.result for legacy rows that store 'WIN'/'LOSS' directly
             settled = await conn.fetch("""
                 SELECT
-                    COALESCE(home_team || ' vs ' || away_team, match, '') AS match_name,
-                    COALESCE(league, '') AS league,
-                    kickoff AS kickoff_time,
-                    odds,
-                    COALESCE(ev, 0) AS soft_ev,
-                    COALESCE(atomic_score, 0) AS atomic_score,
-                    COALESCE(tier, 'EDGE') AS tier,
-                    COALESCE(tier_label, 'EDGE') AS tier_label,
-                    result,
-                    COALESCE(signal_velocity, 'NEUTRAL') AS signal_velocity
-                FROM dagens_kamp
-                WHERE result IS NOT NULL
-                ORDER BY kickoff ASC
+                    COALESCE(dk.home_team || ' vs ' || dk.away_team, dk.match, '') AS match_name,
+                    COALESCE(dk.league, '') AS league,
+                    dk.kickoff AS kickoff_time,
+                    dk.odds,
+                    COALESCE(dk.ev, 0) AS soft_ev,
+                    COALESCE(dk.atomic_score, 0) AS atomic_score,
+                    COALESCE(dk.tier, 'EDGE') AS tier,
+                    COALESCE(dk.tier_label, 'EDGE') AS tier_label,
+                    dk.result,
+                    COALESCE(pv.outcome,
+                        CASE WHEN dk.result IN ('WIN','LOSS') THEN dk.result ELSE NULL END
+                    ) AS outcome,
+                    COALESCE(dk.signal_velocity, 'NEUTRAL') AS signal_velocity
+                FROM dagens_kamp dk
+                LEFT JOIN picks_v2 pv
+                    ON pv.home_team = dk.home_team
+                    AND pv.away_team = dk.away_team
+                    AND pv.odds = dk.odds
+                    AND pv.kickoff_time = dk.kickoff
+                WHERE dk.result IS NOT NULL
+                ORDER BY dk.kickoff ASC
             """)
             next_row = await conn.fetchrow("""
                 SELECT
@@ -5889,9 +5910,9 @@ async def get_ladder_history():
 
         for row in settled:
             stake   = round(bank, 2)          # full bankroll is the stake
-            result  = (row["result"] or "").upper()
+            outcome = (row["outcome"] or "").upper()
             odds    = float(row["odds"] or 2.0)
-            won     = result == "WIN"
+            won     = outcome == "WIN"
 
             # Reasoning from available signals
             parts: list[str] = []
