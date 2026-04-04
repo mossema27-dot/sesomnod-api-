@@ -3126,6 +3126,8 @@ async def post_dagens_kamp_telegram():
                             pick_data["id"]
                         )
                     logger.info(f"[Scheduler] Postet (09:00): {pick_data.get('pick')} — {pick_data.get('match')}")
+                    # Register with MiroFish for CLV tracking
+                    await _log_pick_to_mirofish(pick_data)
                 else:
                     logger.error(f"[Scheduler] Telegram feil {resp.status_code}: {resp.text[:200]}")
             except Exception as e:
