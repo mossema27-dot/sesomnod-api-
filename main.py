@@ -2219,6 +2219,12 @@ async def _log_notion_pick(pick: dict):
         if pick.get("league_flag"):
             league_name = league_name.replace(pick["league_flag"], "").strip()
 
+        # Notion's Confidence field is percent-format (expects 0.0–1.0).
+        # `dagens_kamp.confidence` is an INTEGER column holding 0–100.
+        # Normalize: pass through if already ≤ 1, else divide by 100.
+        conf_raw = float(pick.get("confidence") or 0)
+        conf_norm = conf_raw if conf_raw <= 1 else conf_raw / 100
+
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 "https://api.notion.com/v1/pages",
@@ -2244,7 +2250,7 @@ async def _log_notion_pick(pick: dict):
                         "Odds":       {"number": float(pick.get("odds") or 0)},
                         "Edge":       {"rich_text": [{"text": {"content": f"+{pick.get('edge', 0):.2f}%"}}]},
                         "EV":         {"rich_text": [{"text": {"content": f"+{pick.get('ev', 0):.2f}%"}}]},
-                        "Confidence": {"number": float(pick.get("confidence") or 0)},
+                        "Confidence": {"number": conf_norm},
                         "Stake":      {"rich_text": [{"text": {"content": "5.0"}}]},
                         "Status":     {"select": {"name": "PENDING"}},
                         # NOTE: "QUALIFIED" is not a valid Status option.
