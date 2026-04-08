@@ -3192,7 +3192,7 @@ async def _check_live_results():
                 ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
             """)
             pending = await conn.fetch(
-                """SELECT id, match, home_team, away_team, pick, odds, kickoff
+                """SELECT id, match, home_team, away_team, pick, odds, kickoff, market_type
                    FROM dagens_kamp
                    WHERE result IS NULL
                    AND kickoff::date = CURRENT_DATE"""
@@ -3283,6 +3283,9 @@ async def _check_live_results():
                 pick_dict = dict(pick)
                 pick_dict["match_name"] = pick_dict.get("match", "")
                 asyncio.create_task(_log_result_to_notion(pick_dict, outcome_str, None))
+                # Submit result to MiroFish /clv (fire-and-forget, never blocks).
+                # Same pick_id format as _log_pick_to_mirofish so the row matches.
+                asyncio.create_task(_submit_result_to_mirofish(pick_dict, outcome_str))
 
         # Trigger MiroFish close-clv once per run if any results were written
         if mirofish_needed:
@@ -4438,9 +4441,20 @@ async def _log_pick_to_mirofish(pick_row: dict) -> dict:
             "market": market_type,
         }
 
+        # v2.3 auth — send X-Internal-Key when env var is set. MiroFish is
+        # permissive until MIROFISH_INTERNAL_KEY is set on its end too, so
+        # this is safe to land before the key is flipped on.
+        headers = {}
+        mirofish_key = os.environ.get("MIROFISH_INTERNAL_KEY", "")
+        if mirofish_key:
+            headers["X-Internal-Key"] = mirofish_key
+
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{MIROFISH_URL}/track", json=payload)
+            r = await client.post(f"{MIROFISH_URL}/track", json=payload, headers=headers)
             if r.status_code == 200:
+                # v2.3 /track is upsert and always returns 200; "already tracked"
+                # 400s are a v2.2 artefact kept below for backward compatibility
+                # while the old version is still running.
                 logger.info(f"[MiroFish] Logged: {pick_id} | odds={our_odds}")
                 return {"logged": True, "pick_id": pick_id}
             elif r.status_code == 400 and "already tracked" in r.text:
@@ -4453,6 +4467,106 @@ async def _log_pick_to_mirofish(pick_row: dict) -> dict:
     except Exception as e:
         logger.warning(f"[MiroFish] Exception: {e}")
         return {"logged": False, "reason": str(e)}
+
+
+async def _submit_result_to_mirofish(pick_row: dict, outcome_str: str) -> dict:
+    """
+    Fire-and-forget: when a pick settles (WIN/LOSS/PUSH), send the result
+    to MiroFish POST /clv so Phase 1 gate tracking (hit_rate_pct,
+    settled_picks) updates live.
+
+    Flow:
+      1. Reconstruct the MiroFish pick_id using the SAME format as
+         _log_pick_to_mirofish — {home}-{away}-{YYYYMMDD}-{market_type}.
+      2. GET /clv/{pick_id} to read closing_odds that MiroFish populated
+         from its own 30-min Pinnacle poll + /close-clv pass. If closing
+         odds aren't in MiroFish yet, log + skip (next batch of settled
+         picks will still trigger /close-clv at the end of
+         _check_live_results, which fills closing_odds globally).
+      3. POST /clv with {pick_id, pinnacle_closing_odds, result}.
+
+    NEVER raises. Mirrors the _log_pick_to_mirofish fire-and-forget pattern
+    so _check_live_results can call this without try/except wrapping.
+    """
+    MIROFISH_URL = "https://mirofish-service-production.up.railway.app"
+
+    # VOID / unknown outcomes are not submittable — MiroFish /clv only
+    # accepts WIN|LOSS|PUSH per its Literal validation.
+    if outcome_str not in ("WIN", "LOSS", "PUSH"):
+        return {"submitted": False, "reason": f"outcome_not_submittable:{outcome_str}"}
+
+    try:
+        home_raw = str(pick_row.get("home_team") or "unknown")
+        away_raw = str(pick_row.get("away_team") or "unknown")
+
+        kickoff_raw = pick_row.get("kickoff")
+        if hasattr(kickoff_raw, "strftime"):
+            if kickoff_raw.tzinfo is None:
+                kickoff_raw = kickoff_raw.replace(tzinfo=timezone.utc)
+            date_str = kickoff_raw.strftime("%Y%m%d")
+        else:
+            try:
+                dt = datetime.fromisoformat(str(kickoff_raw).replace("Z", "+00:00"))
+                date_str = dt.strftime("%Y%m%d")
+            except Exception:
+                date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+        home_slug = home_raw.lower().replace(" ", "-")
+        away_slug = away_raw.lower().replace(" ", "-")
+        market_type = str(pick_row.get("market_type") or "h2h").lower().replace(" ", "_")
+        pick_id = f"{home_slug}-{away_slug}-{date_str}-{market_type}"
+
+        headers = {}
+        mirofish_key = os.environ.get("MIROFISH_INTERNAL_KEY", "")
+        if mirofish_key:
+            headers["X-Internal-Key"] = mirofish_key
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Step 1: read closing_odds that MiroFish has populated for this pick.
+            gr = await client.get(f"{MIROFISH_URL}/clv/{pick_id}")
+            if gr.status_code == 404:
+                logger.info(f"[MiroFish] Pick not tracked in MiroFish: {pick_id}")
+                return {"submitted": False, "reason": "pick_not_tracked"}
+            if gr.status_code != 200:
+                logger.warning(f"[MiroFish] GET /clv/{pick_id} HTTP {gr.status_code}")
+                return {"submitted": False, "reason": f"get_http_{gr.status_code}"}
+
+            body = gr.json() if gr.content else {}
+            pick_data = body.get("pick", {}) if isinstance(body, dict) else {}
+            closing_odds = pick_data.get("closing_odds")
+            if closing_odds is None:
+                logger.info(
+                    f"[MiroFish] No closing_odds yet for {pick_id}; "
+                    f"/clv POST deferred (next /close-clv will seed it)"
+                )
+                return {"submitted": False, "reason": "no_closing_odds_yet"}
+
+            # Step 2: POST result + closing_odds. MiroFish computes CLV server-side.
+            pr = await client.post(
+                f"{MIROFISH_URL}/clv",
+                json={
+                    "pick_id": pick_id,
+                    "pinnacle_closing_odds": float(closing_odds),
+                    "result": outcome_str,
+                },
+                headers=headers,
+            )
+            if pr.status_code == 200:
+                try:
+                    resp_clv = pr.json().get("clv_pct")
+                except Exception:
+                    resp_clv = None
+                logger.info(
+                    f"[MiroFish] Result submitted: {pick_id} → {outcome_str} "
+                    f"(clv={resp_clv}%)"
+                )
+                return {"submitted": True, "pick_id": pick_id, "result": outcome_str, "clv_pct": resp_clv}
+            logger.warning(f"[MiroFish] POST /clv HTTP {pr.status_code}: {pr.text[:200]}")
+            return {"submitted": False, "reason": f"post_http_{pr.status_code}"}
+
+    except Exception as e:
+        logger.warning(f"[MiroFish] _submit_result_to_mirofish exception: {e}")
+        return {"submitted": False, "reason": str(e)}
 
 
 @app.post("/post-telegram")
