@@ -100,11 +100,15 @@ async def fetch_todays_fixtures_api_football(
     """
 
     # ── CACHE-SJEKK ──────────────────────────────────────────────────
+    # asyncpg requires datetime.date for DATE columns, not a string
+    from datetime import date as _date
+    cache_date = _date.fromisoformat(date_str)
+
     async with db_pool.acquire() as conn:
         cached = await conn.fetchrow(
             "SELECT fixtures_json, fetched_at FROM api_football_cache "
             "WHERE cache_date = $1",
-            date_str,
+            cache_date,
         )
 
     if cached and not force_refresh:
@@ -210,7 +214,7 @@ async def fetch_todays_fixtures_api_football(
               fetched_at     = EXCLUDED.fetched_at,
               total_fixtures = EXCLUDED.total_fixtures
             """,
-            date_str,
+            cache_date,
             json.dumps(result),
             len(normalized),
         )
