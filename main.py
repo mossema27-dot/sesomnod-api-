@@ -4225,22 +4225,97 @@ async def run_full_scan(force_refresh: bool = False):
 
     all_fixtures = fixtures_data.get("fixtures", [])
 
+    # ── BIG CLUB CONFIG ──────────────────────────────────────────
+    # Oppdater ved sesongstart. Brukes KUN for TOP5-tier kamper.
+    # UCL_UEL flagges alltid som big_match uavhengig av lag.
+    BIG_CLUBS = {
+        # England
+        "manchester city", "arsenal", "liverpool", "chelsea",
+        "manchester united", "tottenham", "newcastle", "aston villa",
+        # Spania
+        "real madrid", "barcelona", "atletico madrid", "sevilla",
+        "real sociedad", "villarreal", "athletic bilbao",
+        # Tyskland
+        "bayern munich", "borussia dortmund", "bayer leverkusen",
+        "rb leipzig", "eintracht frankfurt",
+        # Italia
+        "juventus", "ac milan", "inter milan", "napoli", "roma", "lazio",
+        # Frankrike
+        "paris saint-germain", "psg", "marseille", "lyon", "monaco",
+        # Portugal
+        "benfica", "porto", "sporting cp", "sporting lisbon",
+        # Nederland
+        "ajax", "psv", "feyenoord",
+        # Belgia
+        "club brugge", "anderlecht",
+        # Skottland
+        "celtic", "rangers",
+        # Tyrkia
+        "galatasaray", "fenerbahce", "besiktas", "trabzonspor",
+        # Hellas
+        "olympiakos", "panathinaikos", "aek athens",
+        # Norge
+        "brann", "molde", "rosenborg", "viking", "bodo/glimt",
+        # Danmark
+        "copenhagen", "fc copenhagen", "midtjylland", "brondby",
+        # Sverige
+        "malmo", "malmo ff", "djurgarden", "hammarby",
+    }
+
+    def _normalize_team_name(name: str) -> str:
+        if not name:
+            return ""
+        normalized = name.lower().strip()
+        for suffix in [" fc", " afc", " f.c.", " a.f.c.", " s.a.", " sad"]:
+            if normalized.endswith(suffix):
+                normalized = normalized[:-len(suffix)].strip()
+        return normalized
+
+    def _is_big_club(team_name: str) -> bool:
+        normalized = _normalize_team_name(team_name)
+        if not normalized:
+            return False
+        if normalized in BIG_CLUBS:
+            return True
+        for club in BIG_CLUBS:
+            if (club in normalized or normalized in club) and len(club) >= 5 and len(normalized) >= 5:
+                return True
+        return False
+    # ── END BIG CLUB CONFIG ──────────────────────────────────────
+
     # ── NORMALISER HVERT FIXTURE ─────────────────────────────────
     def build_scan_item(f: dict) -> dict:
+        tier = f.get("competition_tier", "OTHER")
+        home = f.get("home_team", "")
+        away = f.get("away_team", "")
+
+        # Big match classification
+        if tier == "UCL_UEL":
+            is_big = True
+            big_reason = "UCL_UEL"
+        elif tier == "TOP5" and (_is_big_club(home) or _is_big_club(away)):
+            is_big = True
+            big_reason = "TOP5_BIG_CLUB"
+        else:
+            is_big = False
+            big_reason = None
+
         return {
             "api_football_id":  f.get("api_football_id"),
-            "home_team":        f.get("home_team", ""),
-            "away_team":        f.get("away_team", ""),
-            "match_label":      f"{f.get('home_team', '')} vs {f.get('away_team', '')}",
+            "home_team":        home,
+            "away_team":        away,
+            "match_label":      f"{home} vs {away}",
             "kickoff":          f.get("kickoff"),
             "league":           f.get("league", ""),
             "league_id":        f.get("league_id"),
             "league_country":   f.get("league_country", ""),
-            "competition_tier": f.get("competition_tier", "OTHER"),
+            "competition_tier": tier,
             "status":           f.get("status", "NS"),
             "omega_score":      None,
             "analysis_status":  "pending",
             "source":           "api-football",
+            "big_match":        is_big,
+            "big_match_reason": big_reason,
         }
 
     scanned_items = [build_scan_item(f) for f in all_fixtures]
@@ -4266,6 +4341,8 @@ async def run_full_scan(force_refresh: bool = False):
             "TOP5":    top5_count,
             "OTHER":   other_count,
         },
+        "big_match_count": sum(1 for f in scanned_items if f.get("big_match")),
+        "big_matches": [f for f in scanned_items if f.get("big_match")],
         "priority_fixtures": [
             f for f in scanned_items
             if f["competition_tier"] in ("UCL_UEL", "TOP5")
