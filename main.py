@@ -401,6 +401,19 @@ async def ensure_tables(pool: asyncpg.Pool):
                 );
                 CREATE INDEX IF NOT EXISTS idx_api_football_cache_date
                     ON api_football_cache(cache_date DESC);
+
+                CREATE TABLE IF NOT EXISTS scan_results_cache (
+                    id           SERIAL PRIMARY KEY,
+                    scan_date    DATE NOT NULL UNIQUE,
+                    scan_time    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    results_json JSONB NOT NULL,
+                    total_found  INT NOT NULL DEFAULT 0,
+                    ucl_uel      INT NOT NULL DEFAULT 0,
+                    top5         INT NOT NULL DEFAULT 0,
+                    other        INT NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_scan_results_cache_date
+                    ON scan_results_cache(scan_date DESC);
             """)
 
             # Migrer dagens_kamp med nye kolonner
@@ -4152,6 +4165,151 @@ async def get_fixtures_today(force_refresh: bool = False, tier: str = None):
         data["total"] = len(data["fixtures"])
 
     return data
+
+
+@app.get("/run-full-scan")
+async def run_full_scan(force_refresh: bool = False):
+    """
+    Scanner alle dagens fotballkamper fra API-Football cache,
+    prioriterer etter tier og returnerer strukturert liste.
+
+    Read-only: skriver IKKE til picks_v2, dagens_kamp eller mirofish_clv.
+    Omega-score beregnes IKKE her (krever odds velocity + xG + referee).
+    Cacher resultatet per dag; innebygd 5-min cooldown.
+
+    Query params:
+      force_refresh=true — tving ny prosessering (ignorerer cooldown)
+    """
+    from services.api_football import fetch_todays_fixtures_api_football
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_date = datetime.now(timezone.utc).date()
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "DB offline", "scan_date": today_str, "total_found": 0, "fixtures": []},
+        )
+
+    # ── COOLDOWN: return cached scan if <5 min old ────────────────
+    if not force_refresh:
+        try:
+            async with db_state.pool.acquire() as conn:
+                cached_scan = await conn.fetchrow(
+                    "SELECT results_json, scan_time FROM scan_results_cache WHERE scan_date = $1",
+                    today_date,
+                )
+            if cached_scan:
+                scan_time = cached_scan["scan_time"]
+                if scan_time.tzinfo is None:
+                    scan_time = scan_time.replace(tzinfo=timezone.utc)
+                minutes_since = (datetime.now(timezone.utc) - scan_time).total_seconds() / 60
+                if minutes_since < 5:
+                    result = json.loads(cached_scan["results_json"])
+                    result["source"] = "scan_cache"
+                    result["cached_minutes_ago"] = round(minutes_since, 1)
+                    return result
+        except Exception as e:
+            logger.warning(f"[/run-full-scan] Cache-sjekk feilet: {e}")
+
+    # ── HENT FIXTURES FRA API-FOOTBALL CACHE (aldri force API-kall) ──
+    try:
+        fixtures_data = await fetch_todays_fixtures_api_football(
+            date_str=today_str,
+            db_pool=db_state.pool,
+            force_refresh=False,  # aldri tving nytt API-Football-kall herfra
+        )
+    except Exception as e:
+        logger.error(f"[/run-full-scan] fetch_todays_fixtures feilet: {e}")
+        return {"error": str(e)[:200], "scan_date": today_str, "total_found": 0, "fixtures": []}
+
+    all_fixtures = fixtures_data.get("fixtures", [])
+
+    # ── NORMALISER HVERT FIXTURE ─────────────────────────────────
+    def build_scan_item(f: dict) -> dict:
+        return {
+            "api_football_id":  f.get("api_football_id"),
+            "home_team":        f.get("home_team", ""),
+            "away_team":        f.get("away_team", ""),
+            "match_label":      f"{f.get('home_team', '')} vs {f.get('away_team', '')}",
+            "kickoff":          f.get("kickoff"),
+            "league":           f.get("league", ""),
+            "league_id":        f.get("league_id"),
+            "league_country":   f.get("league_country", ""),
+            "competition_tier": f.get("competition_tier", "OTHER"),
+            "status":           f.get("status", "NS"),
+            "omega_score":      None,
+            "analysis_status":  "pending",
+            "source":           "api-football",
+        }
+
+    scanned_items = [build_scan_item(f) for f in all_fixtures]
+
+    # ── SORTERING: UCL_UEL → TOP5 → OTHER, alfabetisk innen tier ─
+    tier_order = {"UCL_UEL": 0, "TOP5": 1, "OTHER": 2}
+    scanned_items.sort(key=lambda x: (
+        tier_order.get(x["competition_tier"], 3),
+        x["match_label"],
+    ))
+
+    ucl_uel_count = sum(1 for f in scanned_items if f["competition_tier"] == "UCL_UEL")
+    top5_count    = sum(1 for f in scanned_items if f["competition_tier"] == "TOP5")
+    other_count   = sum(1 for f in scanned_items if f["competition_tier"] == "OTHER")
+
+    result = {
+        "scan_date":    today_str,
+        "scan_time":    datetime.now(timezone.utc).isoformat(),
+        "source":       "live_scan",
+        "total_found":  len(scanned_items),
+        "by_tier": {
+            "UCL_UEL": ucl_uel_count,
+            "TOP5":    top5_count,
+            "OTHER":   other_count,
+        },
+        "priority_fixtures": [
+            f for f in scanned_items
+            if f["competition_tier"] in ("UCL_UEL", "TOP5")
+        ],
+        "other_fixtures": [
+            f for f in scanned_items
+            if f["competition_tier"] == "OTHER"
+        ],
+        "note": (
+            "omega_score er null for alle fixtures. "
+            "Omega-beregning krever odds velocity + xG fra separate "
+            "datakilder og utføres i /run-analysis endepunktet."
+        ),
+    }
+
+    # ── LAGRE TIL SCAN-CACHE ─────────────────────────────────────
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO scan_results_cache
+                     (scan_date, scan_time, results_json, total_found, ucl_uel, top5, other)
+                   VALUES ($1, NOW(), $2, $3, $4, $5, $6)
+                   ON CONFLICT (scan_date) DO UPDATE SET
+                     scan_time    = NOW(),
+                     results_json = EXCLUDED.results_json,
+                     total_found  = EXCLUDED.total_found,
+                     ucl_uel      = EXCLUDED.ucl_uel,
+                     top5         = EXCLUDED.top5,
+                     other        = EXCLUDED.other""",
+                today_date,
+                json.dumps(result),
+                len(scanned_items),
+                ucl_uel_count,
+                top5_count,
+                other_count,
+            )
+    except Exception as e:
+        logger.warning(f"[/run-full-scan] Cache-lagring feilet: {e}")
+
+    logger.info(
+        f"[/run-full-scan] {today_str}: {len(scanned_items)} fixtures "
+        f"(UCL_UEL={ucl_uel_count}, TOP5={top5_count}, OTHER={other_count})"
+    )
+    return result
 
 
 @app.get("/clv")
