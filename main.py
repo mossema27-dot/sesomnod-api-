@@ -3999,6 +3999,90 @@ def enrich_pick(pick: dict) -> dict:
     pick.update(prob_data)
     return pick
 
+async def _fetch_xg_from_api_football(
+    home_team: str, away_team: str, kickoff_iso: str
+) -> dict | None:
+    """
+    Fetch xG stats from API-Football for a live/finished match.
+    Looks up fixture_id from api_football_cache, then calls
+    /fixtures/statistics?fixture={id}.
+
+    Returns {"xg_home": float, "xg_away": float} or None.
+    Only works for live/finished matches (not pre-match).
+    """
+    api_key = os.environ.get("FOOTBALL_API_KEY", "")
+    if not api_key:
+        return None
+    if not db_state.connected or not db_state.pool:
+        return None
+
+    try:
+        # 1. Read fixture list from today's cache
+        from datetime import date as _date
+        kickoff_date = kickoff_iso[:10] if kickoff_iso else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cache_date = _date.fromisoformat(kickoff_date)
+        async with db_state.pool.acquire() as conn:
+            cached = await conn.fetchrow(
+                "SELECT fixtures_json FROM api_football_cache WHERE cache_date = $1",
+                cache_date,
+            )
+        if not cached:
+            return None
+
+        fixtures = json.loads(cached["fixtures_json"]).get("fixtures", [])
+
+        # 2. Find fixture by matching team names (partial, case-insensitive)
+        home_lower = home_team[:12].lower().strip()
+        away_lower = away_team[:12].lower().strip()
+        fixture_id = None
+        for f in fixtures:
+            fh = f.get("home_team", "").lower()
+            fa = f.get("away_team", "").lower()
+            if home_lower in fh and away_lower in fa:
+                fixture_id = f.get("api_football_id")
+                break
+            if fh in home_lower and fa in away_lower:
+                fixture_id = f.get("api_football_id")
+                break
+        if not fixture_id:
+            return None
+
+        # 3. Call API-Football statistics endpoint
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures/statistics",
+                headers={
+                    "X-RapidAPI-Key": api_key,
+                    "X-RapidAPI-Host": "v3.football.api-sports.io",
+                },
+                params={"fixture": str(fixture_id)},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+
+        # 4. Parse xG from response
+        xg_home = None
+        xg_away = None
+        for team_stats in data.get("response", []):
+            team_name = team_stats.get("team", {}).get("name", "").lower()
+            for stat in team_stats.get("statistics", []):
+                if stat.get("type") == "Expected Goals" and stat.get("value") is not None:
+                    val = float(stat["value"])
+                    if home_lower in team_name or team_name in home_lower:
+                        xg_home = val
+                    else:
+                        xg_away = val
+
+        if xg_home is not None and xg_away is not None:
+            return {"xg_home": xg_home, "xg_away": xg_away}
+        return None
+
+    except Exception as e:
+        logger.warning(f"[API-Football xG] {home_team} vs {away_team}: {e}")
+        return None
+
+
 async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
     """
     Enrich picks with Dixon-Coles probabilities and Kelly stake recommendations.
@@ -4061,6 +4145,45 @@ async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
         except Exception as xgb_err:
             logger.warning("[XGB] Failed for %s vs %s: %s", pick.get("home_team"), pick.get("away_team"), xgb_err)
             pick["xgboost"] = None
+
+        # API-Football xG fallback — only when our own pipeline returned no xG
+        if pick.get("xg_home") is None and pick.get("xg_away") is None:
+            try:
+                xg_fb = await _fetch_xg_from_api_football(
+                    pick.get("home_team", ""),
+                    pick.get("away_team", ""),
+                    str(pick.get("kickoff_time") or pick.get("kickoff_cet") or ""),
+                )
+                if xg_fb and xg_fb.get("xg_home") is not None:
+                    import math
+                    xh = float(xg_fb["xg_home"])
+                    xa = float(xg_fb["xg_away"])
+                    pick["xg_home"] = round(xh, 1)
+                    pick["xg_away"] = round(xa, 1)
+                    lam = max(0.5, min(6.0, xh + xa))
+                    pick["lambda"] = round(lam, 1)
+                    # Derive Poisson-based fields from live xG
+                    def pcdf(n, l):
+                        t, term = 0.0, math.exp(-l)
+                        for k in range(n + 1):
+                            t += term
+                            term *= l / (k + 1)
+                        return t
+                    ph = 1 - math.exp(-max(0.01, xh))
+                    pa = 1 - math.exp(-max(0.01, xa))
+                    pick["btts_yes"] = round(max(0, min(99, (ph * pa) * 100)))
+                    pick["btts_no"] = 100 - pick["btts_yes"]
+                    pick["over_15"] = round((1 - pcdf(1, lam)) * 100)
+                    pick["over_25"] = round((1 - pcdf(2, lam)) * 100)
+                    pick["over_35"] = round((1 - pcdf(3, lam)) * 100)
+                    hw = round(max(5, min(85, (xh / lam) * 70)))
+                    aw = round(max(5, min(85, (xa / lam) * 60)))
+                    pick["home_win_prob"] = hw
+                    pick["draw_prob"] = max(5, 100 - hw - aw)
+                    pick["away_win_prob"] = aw
+                    logger.info(f"[API-Football xG] {pick.get('home_team')} vs {pick.get('away_team')}: xG={xh:.1f}-{xa:.1f}")
+            except Exception as af_err:
+                logger.warning(f"[API-Football xG] Fallback failed: {af_err}")
 
     return picks
 
