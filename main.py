@@ -455,6 +455,32 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS reason TEXT;
             """)
 
+            # Dedup dagens_kamp + add UNIQUE constraint (idempotent)
+            await conn.execute("""
+                -- Remove exact duplicates (keep newest id)
+                DELETE FROM dagens_kamp a
+                USING dagens_kamp b
+                WHERE a.id < b.id
+                  AND a.home_team IS NOT DISTINCT FROM b.home_team
+                  AND a.away_team IS NOT DISTINCT FROM b.away_team
+                  AND a.kickoff::date = b.kickoff::date
+                  AND COALESCE(a.market_type, '') = COALESCE(b.market_type, '')
+                  AND a.odds = b.odds;
+            """)
+            # UNIQUE constraint — idempotent via DO block
+            await conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'uq_dagens_kamp_match'
+                    ) THEN
+                        ALTER TABLE dagens_kamp ADD CONSTRAINT uq_dagens_kamp_match
+                            UNIQUE (home_team, away_team, market_type, odds);
+                    END IF;
+                END $$;
+            """)
+
             # Migrer picks-tabell — rename bet365_* → soft_*, legg til soft_book
             await conn.execute("""
                 DO $$ BEGIN
@@ -3324,6 +3350,55 @@ async def _check_live_results():
 
 
 # ─────────────────────────────────────────────────────────
+# OMEGA LOOKUP FOR API-FOOTBALL FIXTURES (read-only)
+# ─────────────────────────────────────────────────────────
+async def _get_omega_for_fixture(
+    conn,
+    home_team: str,
+    away_team: str,
+    kickoff_date: str,
+) -> dict | None:
+    """
+    Read-only lookup of Omega-score from dagens_kamp for a fixture.
+    Uses first 12 chars of each team name for partial match — robust
+    against API-Football suffixes like 'FC', 'CF', 'United'.
+    Returns None if not found.
+    """
+    if not home_team or not away_team or not kickoff_date:
+        return None
+    home_prefix = home_team[:12].strip()
+    away_prefix = away_team[:12].strip()
+    try:
+        rows = await conn.fetch(
+            """SELECT atomic_score AS omega_score,
+                      tier         AS omega_tier,
+                      edge         AS soft_edge,
+                      odds
+               FROM dagens_kamp
+               WHERE LOWER(home_team) LIKE LOWER($1)
+                 AND LOWER(away_team) LIKE LOWER($2)
+                 AND kickoff::date = $3::date
+               ORDER BY id DESC
+               LIMIT 1""",
+            f"%{home_prefix}%",
+            f"%{away_prefix}%",
+            kickoff_date[:10],
+        )
+    except Exception as e:
+        logger.warning(f"[_get_omega_for_fixture] DB-feil: {e}")
+        return None
+    if rows:
+        r = rows[0]
+        return {
+            "omega_score": r["omega_score"],
+            "omega_tier":  r["omega_tier"],
+            "soft_edge":   float(r["soft_edge"]) if r["soft_edge"] is not None else None,
+            "odds":        float(r["odds"]) if r["odds"] is not None else None,
+        }
+    return None
+
+
+# ─────────────────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -3778,11 +3853,40 @@ async def get_dashboard_stats():
                     "qualified_picks": bt_row["qualified_picks"] or 0,
                     "avg_brier": round(bt_row["avg_brier"] or 0, 4),
                 }
+
+            # Live operational stats for frontend
+            ops_row = await conn.fetchrow("""
+                SELECT
+                    (SELECT COALESCE(total_found, 0) FROM scan_results_cache
+                     WHERE scan_date = CURRENT_DATE LIMIT 1)           AS kamper_skannet_i_dag,
+                    (SELECT COUNT(*) FROM dagens_kamp
+                     WHERE result IS NULL
+                       AND kickoff > NOW() - INTERVAL '3 hours'
+                       AND kickoff < NOW() + INTERVAL '36 hours')      AS aktive_picks,
+                    (SELECT COUNT(*) FROM dagens_kamp
+                     WHERE tier = 'ATOMIC' AND result IS NULL)         AS brutal_picks,
+                    (SELECT COUNT(*) FROM dagens_kamp
+                     WHERE tier IN ('EDGE','ATOMIC') AND result IS NULL) AS strong_picks,
+                    (SELECT COUNT(*) FROM picks_v2
+                     WHERE status = 'RESULT_LOGGED')                   AS phase0_picks,
+                    (SELECT COUNT(*) FROM picks_v2
+                     WHERE status = 'RESULT_LOGGED'
+                       AND outcome = 'WIN')                            AS won_picks
+            """)
+
         hit_ok = live_data["hit_rate"] > 0.55
         clv_ok = live_data["avg_clv"] > 2.0
+        ops = dict(ops_row) if ops_row else {}
         return {
             "live": live_data, "backtest": backtest_data,
             "phase1_gate": {"hit_rate_ok": hit_ok, "clv_ok": clv_ok, "gate_passed": all([hit_ok, clv_ok])},
+            # New operational fields for frontend (HeroSection + TickerBar)
+            "kamper_skannet_i_dag": int(ops.get("kamper_skannet_i_dag") or 0),
+            "aktive_picks":        int(ops.get("aktive_picks") or 0),
+            "brutal_picks":        int(ops.get("brutal_picks") or 0),
+            "strong_picks":        int(ops.get("strong_picks") or 0),
+            "phase0_picks":        int(ops.get("phase0_picks") or 0),
+            "won_picks":           int(ops.get("won_picks") or 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
@@ -4014,7 +4118,10 @@ async def get_picks():
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT
+                SELECT DISTINCT ON (
+                    COALESCE(home_team, ''), COALESCE(away_team, ''),
+                    COALESCE(market_type, ''), odds
+                )
                     id,
                     match                 AS match_name,
                     home_team,
@@ -4039,7 +4146,9 @@ async def get_picks():
                 FROM dagens_kamp
                 WHERE kickoff > NOW() - INTERVAL '1 hour'
                   AND kickoff <= NOW() + INTERVAL '36 hours'
-                ORDER BY kickoff ASC
+                ORDER BY COALESCE(home_team, ''), COALESCE(away_team, ''),
+                         COALESCE(market_type, ''), odds,
+                         id DESC
                 LIMIT 100
                 """
             )
@@ -4319,6 +4428,24 @@ async def run_full_scan(force_refresh: bool = False):
         }
 
     scanned_items = [build_scan_item(f) for f in all_fixtures]
+
+    # ── OMEGA-BERIKELSE — read-only fra dagens_kamp ──────────────
+    try:
+        async with db_state.pool.acquire() as conn:
+            for item in scanned_items:
+                omega_data = await _get_omega_for_fixture(
+                    conn,
+                    item.get("home_team", ""),
+                    item.get("away_team", ""),
+                    (item.get("kickoff") or "")[:10],
+                )
+                if omega_data:
+                    item["omega_score"]     = omega_data["omega_score"]
+                    item["omega_tier"]      = omega_data["omega_tier"]
+                    item["soft_edge"]       = omega_data["soft_edge"]
+                    item["analysis_status"] = "scored"
+    except Exception as e:
+        logger.warning(f"[/run-full-scan] Omega-berikelse feilet: {e}")
 
     # ── SORTERING: UCL_UEL → TOP5 → OTHER, alfabetisk innen tier ─
     tier_order = {"UCL_UEL": 0, "TOP5": 1, "OTHER": 2}
