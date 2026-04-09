@@ -391,6 +391,16 @@ async def ensure_tables(pool: asyncpg.Pool):
                     kickoff TIMESTAMPTZ,
                     tracked_at TIMESTAMPTZ DEFAULT NOW()
                 );
+
+                CREATE TABLE IF NOT EXISTS api_football_cache (
+                    id              SERIAL PRIMARY KEY,
+                    cache_date      DATE NOT NULL UNIQUE,
+                    fixtures_json   JSONB NOT NULL,
+                    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    total_fixtures  INT NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_football_cache_date
+                    ON api_football_cache(cache_date DESC);
             """)
 
             # Migrer dagens_kamp med nye kolonner
@@ -3391,6 +3401,28 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # API-Football fixture-cache refresh — 06:30 UTC, 1 req/dag (100 frie)
+    async def _refresh_api_football_cache():
+        from services.api_football import fetch_todays_fixtures_api_football
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        logger.info(f"[Cron] Refresher API-Football cache for {today}")
+        try:
+            await fetch_todays_fixtures_api_football(
+                date_str=today,
+                db_pool=db_state.pool,
+                force_refresh=True,
+            )
+        except Exception as e:
+            logger.warning(f"[Cron] API-Football refresh feilet: {e}")
+
+    scheduler.add_job(
+        _refresh_api_football_cache,
+        trigger=CronTrigger(hour=6, minute=30, timezone="UTC"),
+        id="api_football_refresh",
+        misfire_grace_time=600,
+        replace_existing=True,
+    )
+
     # Live results hvert 15. minutt 24/7
     scheduler.add_job(
         _check_live_results,
@@ -4082,6 +4114,44 @@ async def get_dagens_kamp():
         return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.get("/fixtures/today")
+async def get_fixtures_today(force_refresh: bool = False, tier: str = None):
+    """
+    Alle fotballkamper for i dag fra API-Football.
+    Bruker cache — maks 1 API-Football-kall per dag.
+    Query params:
+      - force_refresh=true: tving ny henting fra API-Football (bruker 1 request)
+      - tier=UCL_UEL|TOP5|OTHER: filtrer på tier
+    """
+    from services.api_football import fetch_todays_fixtures_api_football
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "DB offline", "date": today, "total": 0, "fixtures": []},
+        )
+    try:
+        data = await fetch_todays_fixtures_api_football(
+            date_str=today,
+            db_pool=db_state.pool,
+            force_refresh=force_refresh,
+        )
+    except Exception as e:
+        logger.error(f"[/fixtures/today] Uventet feil: {e}")
+        return {"error": str(e)[:200], "date": today, "total": 0, "fixtures": []}
+
+    if tier and tier in ("UCL_UEL", "TOP5", "OTHER"):
+        data["fixtures"] = [
+            f for f in data["fixtures"]
+            if f.get("competition_tier") == tier
+        ]
+        data["total"] = len(data["fixtures"])
+
+    return data
 
 
 @app.get("/clv")
