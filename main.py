@@ -40,6 +40,12 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from services.mirofish_client import (
+    mirofish_track_pick,
+    mirofish_close_clv,
+    mirofish_get_summary,
+    MIROFISH_BASE_URL,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2189,6 +2195,11 @@ async def run_analysis():
                         pick["id"]
                     )
                 logger.info(f"[Analyse] Postet til Telegram: {pick['pick']} — {pick['home_team']} vs {pick['away_team']} [{pick.get('tier','?')}]")
+                # MiroFish CLV tracking — fire-and-forget, fails silently
+                try:
+                    asyncio.create_task(_log_pick_to_mirofish(pick))
+                except Exception as _e:
+                    logger.warning(f"[Analyse] MiroFish tracking ikke kritisk: {_e}")
             else:
                 logger.error(f"[Analyse] Telegram feil {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
@@ -4665,6 +4676,16 @@ async def get_clv():
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
+
+
+@app.get("/mirofish/summary")
+async def get_mirofish_summary():
+    """Phase 0 CLV-status fra MiroFish."""
+    data = await mirofish_get_summary()
+    if data is None:
+        return {"error": "MiroFish utilgjengelig",
+                "url": MIROFISH_BASE_URL}
+    return data
 
 
 @app.get("/scan-alle-kamper")
