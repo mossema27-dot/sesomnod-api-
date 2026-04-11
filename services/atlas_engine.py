@@ -117,6 +117,28 @@ async def atlas_run_clv_closer(db) -> dict:
     }
 
     try:
+        # Ensure DQS table exists (idempotent safety net)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS decision_quality_scores (
+                id SERIAL PRIMARY KEY,
+                receipt_id INTEGER UNIQUE REFERENCES pick_receipts(id) ON DELETE CASCADE,
+                pick_id INTEGER REFERENCES picks_v2(id),
+                dqs_score NUMERIC(5,1),
+                dqs_grade CHAR(1),
+                dqs_verdict TEXT,
+                clv_component NUMERIC(5,2),
+                edge_component NUMERIC(5,2),
+                kelly_component BOOLEAN,
+                calculated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_dqs_receipt ON decision_quality_scores(receipt_id);
+            CREATE INDEX IF NOT EXISTS idx_dqs_grade ON decision_quality_scores(dqs_grade);
+        """)
+        # Ensure clv_source column exists
+        await db.execute("""
+            ALTER TABLE pick_receipts ADD COLUMN IF NOT EXISTS clv_source VARCHAR(32);
+        """)
+
         # Find settled picks with receipts but no DQS yet
         rows = await db.fetch("""
             SELECT

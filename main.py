@@ -7079,21 +7079,44 @@ async def get_proof_wall(limit: int = 20, status: str = None):
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
     async with db_state.pool.acquire() as conn:
-        query = """
-            SELECT
-                r.receipt_slug, r.match_name,
-                r.league, r.kickoff,
-                r.posted_odds, r.edge_pct,
-                r.edge_status, r.synergy_status,
-                r.result_outcome, r.clv_pct,
-                r.brier_score, r.phase,
-                r.created_at,
-                d.dqs_score, d.dqs_grade, d.dqs_verdict
-            FROM pick_receipts r
-            LEFT JOIN decision_quality_scores d ON d.receipt_id = r.id
-            ORDER BY r.created_at DESC
-            LIMIT $1
-        """
+        # Check if DQS table exists for graceful degradation
+        dqs_table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'decision_quality_scores'
+            )
+        """)
+
+        if dqs_table_exists:
+            query = """
+                SELECT
+                    r.receipt_slug, r.match_name,
+                    r.league, r.kickoff,
+                    r.posted_odds, r.edge_pct,
+                    r.edge_status, r.synergy_status,
+                    r.result_outcome, r.clv_pct,
+                    r.brier_score, r.phase,
+                    r.created_at,
+                    d.dqs_score, d.dqs_grade, d.dqs_verdict
+                FROM pick_receipts r
+                LEFT JOIN decision_quality_scores d ON d.receipt_id = r.id
+                ORDER BY r.created_at DESC
+                LIMIT $1
+            """
+        else:
+            query = """
+                SELECT
+                    r.receipt_slug, r.match_name,
+                    r.league, r.kickoff,
+                    r.posted_odds, r.edge_pct,
+                    r.edge_status, r.synergy_status,
+                    r.result_outcome, r.clv_pct,
+                    r.brier_score, r.phase,
+                    r.created_at
+                FROM pick_receipts r
+                ORDER BY r.created_at DESC
+                LIMIT $1
+            """
         rows = await conn.fetch(query, min(limit, 50))
 
         stats = await conn.fetchrow("""
@@ -7105,16 +7128,31 @@ async def get_proof_wall(limit: int = 20, status: str = None):
             WHERE result_outcome IS NOT NULL
         """)
 
-        dqs_stats = await conn.fetchrow("""
-            SELECT
-                COUNT(*) as scored,
-                AVG(dqs_score) as avg_dqs,
-                COUNT(CASE WHEN dqs_grade = 'A' THEN 1 END) as grade_a,
-                COUNT(CASE WHEN dqs_grade = 'B' THEN 1 END) as grade_b,
-                COUNT(CASE WHEN dqs_grade = 'C' THEN 1 END) as grade_c,
-                COUNT(CASE WHEN dqs_grade = 'D' THEN 1 END) as grade_d
-            FROM decision_quality_scores
-        """)
+        dqs_summary = {
+            "total_scored": 0, "avg_dqs": 0.0,
+            "grade_distribution": {"A": 0, "B": 0, "C": 0, "D": 0},
+        }
+        if dqs_table_exists:
+            dqs_stats = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) as scored,
+                    AVG(dqs_score) as avg_dqs,
+                    COUNT(CASE WHEN dqs_grade = 'A' THEN 1 END) as grade_a,
+                    COUNT(CASE WHEN dqs_grade = 'B' THEN 1 END) as grade_b,
+                    COUNT(CASE WHEN dqs_grade = 'C' THEN 1 END) as grade_c,
+                    COUNT(CASE WHEN dqs_grade = 'D' THEN 1 END) as grade_d
+                FROM decision_quality_scores
+            """)
+            dqs_summary = {
+                "total_scored": dqs_stats['scored'] or 0,
+                "avg_dqs": round(float(dqs_stats['avg_dqs'] or 0), 1),
+                "grade_distribution": {
+                    "A": dqs_stats['grade_a'] or 0,
+                    "B": dqs_stats['grade_b'] or 0,
+                    "C": dqs_stats['grade_c'] or 0,
+                    "D": dqs_stats['grade_d'] or 0,
+                },
+            }
 
         hit_rate = 0.0
         if stats['total'] and stats['total'] > 0:
@@ -7126,16 +7164,7 @@ async def get_proof_wall(limit: int = 20, status: str = None):
             "avg_clv": round(float(stats['avg_clv'] or 0), 2),
             "phase": "Phase 0",
             "phase0_note": "Kalibreringsfase",
-            "dqs_summary": {
-                "total_scored": dqs_stats['scored'] or 0,
-                "avg_dqs": round(float(dqs_stats['avg_dqs'] or 0), 1),
-                "grade_distribution": {
-                    "A": dqs_stats['grade_a'] or 0,
-                    "B": dqs_stats['grade_b'] or 0,
-                    "C": dqs_stats['grade_c'] or 0,
-                    "D": dqs_stats['grade_d'] or 0,
-                },
-            },
+            "dqs_summary": dqs_summary,
             "picks": [dict(r) for r in rows]
         }
 
