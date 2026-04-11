@@ -6649,7 +6649,7 @@ async def get_control_wall():
                     COALESCE(atomic_score, 0)       AS omega_score,
                     COALESCE(edge, 0)               AS edge,
                     COALESCE(ev, 0)                 AS ev,
-                    COALESCE(confidence, '')        AS confidence,
+                    COALESCE(confidence::text, '')  AS confidence,
                     COALESCE(xg_divergence_home, 0) AS xg_home,
                     COALESCE(xg_divergence_away, 0) AS xg_away,
                     result
