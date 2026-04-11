@@ -47,6 +47,7 @@ from services.mirofish_client import (
     MIROFISH_BASE_URL,
 )
 from services.receipt_engine import create_or_update_receipt
+from services.atlas_engine import atlas_run_clv_closer, atlas_calculate_dqs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -767,6 +768,30 @@ async def ensure_tables(pool: asyncpg.Pool):
                 "ON pick_receipts(pick_id)"
             )
         logger.info("[DB] pick_receipts table OK")
+
+        # ── ATLAS DQS (Decision Quality Score) table ──────────
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS decision_quality_scores (
+                    id SERIAL PRIMARY KEY,
+                    receipt_id INTEGER UNIQUE REFERENCES pick_receipts(id) ON DELETE CASCADE,
+                    pick_id INTEGER REFERENCES picks_v2(id),
+                    dqs_score NUMERIC(5,1),
+                    dqs_grade CHAR(1),
+                    dqs_verdict TEXT,
+                    clv_component NUMERIC(5,2),
+                    edge_component NUMERIC(5,2),
+                    kelly_component BOOLEAN,
+                    calculated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_dqs_receipt ON decision_quality_scores(receipt_id);
+                CREATE INDEX IF NOT EXISTS idx_dqs_grade ON decision_quality_scores(dqs_grade);
+            """)
+            # Add clv_source to pick_receipts if missing
+            await conn.execute("""
+                ALTER TABLE pick_receipts ADD COLUMN IF NOT EXISTS clv_source VARCHAR(32);
+            """)
+        logger.info("[DB] decision_quality_scores + clv_source OK")
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
@@ -3592,6 +3617,33 @@ async def lifespan(app: FastAPI):
         id="live_results",
         max_instances=1,
         coalesce=True,
+    )
+
+    # ATLAS CLV auto-closer + DQS — 14:05 + 22:05 UTC daily
+    async def _atlas_job():
+        if not db_state.connected or not db_state.pool:
+            logger.info("[ATLAS] SKIP: DB offline")
+            return
+        try:
+            async with db_state.pool.acquire() as conn:
+                result = await atlas_run_clv_closer(conn)
+            logger.info(f"[ATLAS] Cron complete: {result}")
+        except Exception as e:
+            logger.error(f"[ATLAS] Cron error: {e}")
+
+    scheduler.add_job(
+        _atlas_job,
+        trigger=CronTrigger(hour=14, minute=5, timezone="UTC"),
+        id="atlas_clv_closer_afternoon",
+        misfire_grace_time=600,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _atlas_job,
+        trigger=CronTrigger(hour=22, minute=5, timezone="UTC"),
+        id="atlas_clv_closer_evening",
+        misfire_grace_time=600,
+        replace_existing=True,
     )
 
     scheduler.start()
@@ -6999,9 +7051,31 @@ async def _ladder_history_compat():
 # DECISION RECEIPT ENGINE — PUBLIC PROOF ENDPOINTS
 # ─────────────────────────────────────────────────────────
 
+@app.post("/atlas/run-now")
+async def atlas_run_now():
+    """Manual trigger for ATLAS CLV closer + DQS scoring."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            result = await atlas_run_clv_closer(conn)
+        return {
+            "status": "ok",
+            "engine": "ATLAS v1.0",
+            "processed": result["processed"],
+            "scored": result["scored"],
+            "clv_synced": result["clv_synced"],
+            "errors": result["errors"],
+            "details": result["details"][:10],  # cap detail output
+        }
+    except Exception as e:
+        logger.error(f"[ATLAS] Manual run error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.get("/proof/wall")
 async def get_proof_wall(limit: int = 20, status: str = None):
-    """Public proof wall — no auth required."""
+    """Public proof wall — no auth required. Includes DQS grades."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
     async with db_state.pool.acquire() as conn:
@@ -7013,8 +7087,10 @@ async def get_proof_wall(limit: int = 20, status: str = None):
                 r.edge_status, r.synergy_status,
                 r.result_outcome, r.clv_pct,
                 r.brier_score, r.phase,
-                r.created_at
+                r.created_at,
+                d.dqs_score, d.dqs_grade, d.dqs_verdict
             FROM pick_receipts r
+            LEFT JOIN decision_quality_scores d ON d.receipt_id = r.id
             ORDER BY r.created_at DESC
             LIMIT $1
         """
@@ -7029,6 +7105,17 @@ async def get_proof_wall(limit: int = 20, status: str = None):
             WHERE result_outcome IS NOT NULL
         """)
 
+        dqs_stats = await conn.fetchrow("""
+            SELECT
+                COUNT(*) as scored,
+                AVG(dqs_score) as avg_dqs,
+                COUNT(CASE WHEN dqs_grade = 'A' THEN 1 END) as grade_a,
+                COUNT(CASE WHEN dqs_grade = 'B' THEN 1 END) as grade_b,
+                COUNT(CASE WHEN dqs_grade = 'C' THEN 1 END) as grade_c,
+                COUNT(CASE WHEN dqs_grade = 'D' THEN 1 END) as grade_d
+            FROM decision_quality_scores
+        """)
+
         hit_rate = 0.0
         if stats['total'] and stats['total'] > 0:
             hit_rate = (stats['wins'] / stats['total']) * 100
@@ -7039,6 +7126,16 @@ async def get_proof_wall(limit: int = 20, status: str = None):
             "avg_clv": round(float(stats['avg_clv'] or 0), 2),
             "phase": "Phase 0",
             "phase0_note": "Kalibreringsfase",
+            "dqs_summary": {
+                "total_scored": dqs_stats['scored'] or 0,
+                "avg_dqs": round(float(dqs_stats['avg_dqs'] or 0), 1),
+                "grade_distribution": {
+                    "A": dqs_stats['grade_a'] or 0,
+                    "B": dqs_stats['grade_b'] or 0,
+                    "C": dqs_stats['grade_c'] or 0,
+                    "D": dqs_stats['grade_d'] or 0,
+                },
+            },
             "picks": [dict(r) for r in rows]
         }
 
