@@ -6644,7 +6644,7 @@ async def get_control_wall():
             rows = await conn.fetch("""
                 SELECT
                     id,
-                    COALESCE(match, match_name, '') AS match_name,
+                    COALESCE(match, '') AS match_name,
                     COALESCE(market_hint, pick, '') AS market,
                     COALESCE(atomic_score, 0)       AS omega_score,
                     COALESCE(edge, 0)               AS edge,
@@ -6705,7 +6705,7 @@ async def get_pick_receipt(pick_id: int):
             row = await conn.fetchrow("""
                 SELECT
                     id,
-                    COALESCE(match, match_name, '') AS match_name,
+                    COALESCE(match, '') AS match_name,
                     COALESCE(market_hint, pick, '') AS market,
                     COALESCE(odds, 0)               AS placed_odds,
                     COALESCE(atomic_score, 0)       AS omega_score,
