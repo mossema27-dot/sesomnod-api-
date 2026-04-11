@@ -455,6 +455,9 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_weather VARCHAR(30);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_home FLOAT;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_away FLOAT;
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS draw_odds_raw NUMERIC(5,2);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS away_odds_raw NUMERIC(5,2);
 
                 ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS trigger_type VARCHAR(50) DEFAULT 'scheduled';
                 ALTER TABLE daily_summaries ADD COLUMN IF NOT EXISTS match_id TEXT;
@@ -2064,6 +2067,10 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
                         soft_edge, target_odds, tier=atomic_result["tier"]
                     ),
                     "post_telegram": atomic_result["post_telegram"],
+                    # H2H odds for implied probability fallback
+                    "home_odds_raw": round(best_home, 2) if best_home else None,
+                    "draw_odds_raw": round(best_draw, 2) if best_draw else None,
+                    "away_odds_raw": round(best_away, 2) if best_away else None,
                 })
                 match_pick_count += 1
                 league_pick_count += 1
@@ -2168,9 +2175,10 @@ async def run_analysis():
                      signals_triggered, signal_streak_home, signal_streak_away,
                      streak_home_count, streak_away_count, market_hint,
                      signal_velocity, signal_xg, signal_weather,
-                     xg_divergence_home, xg_divergence_away)
+                     xg_divergence_home, xg_divergence_away,
+                     home_odds_raw, draw_odds_raw, away_odds_raw)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15,$16,
-                        $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+                        $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
                 RETURNING id
             """,
                 f"{pick['home_team']} vs {pick['away_team']}",
@@ -2204,6 +2212,9 @@ async def run_analysis():
                 pick.get("signal_weather"),
                 pick.get("xg_divergence_home"),
                 pick.get("xg_divergence_away"),
+                pick.get("home_odds_raw"),
+                pick.get("draw_odds_raw"),
+                pick.get("away_odds_raw"),
             )
             newly_inserted.append({"id": row_id, **pick, "total_scanned": total_scanned})
             logger.info(f"[Analyse] Ny pick (id={row_id}): {pick['pick']} @ {pick['odds']} SCORE={pick['score']}")
@@ -3956,6 +3967,34 @@ async def get_dashboard_stats():
 
 
 
+def implied_probs_from_odds(
+    home_odds: float | None,
+    draw_odds: float | None,
+    away_odds: float | None
+) -> tuple[float, float, float]:
+    """Convert decimal odds to implied probabilities.  Removes vig by normalizing to sum = 1."""
+    def safe_imp(o):
+        try:
+            return 1 / float(o) if o and float(o) > 1 else 0.33
+        except Exception:
+            return 0.33
+    h = safe_imp(home_odds)
+    d = safe_imp(draw_odds)
+    a = safe_imp(away_odds)
+    total = h + d + a
+    if total <= 0:
+        return 0.40, 0.27, 0.33
+    return (round(h / total, 3), round(d / total, 3), round(a / total, 3))
+
+
+def calc_score_probability(goals: int, matches: int) -> float:
+    """Scorer probability from goals/matches ratio."""
+    if not matches or matches == 0:
+        return 0.0
+    raw = goals / matches
+    return round(min(raw, 0.95), 2)
+
+
 def enrich_pick(pick: dict) -> dict:
     """Enrich a dagens_kamp row for the /picks API response.
 
@@ -3997,18 +4036,37 @@ def enrich_pick(pick: dict) -> dict:
             "first_goal_home": max(0, round(xg_home / lam * 75)),
             "first_goal_away": max(0, round(xg_away / lam * 65)),
             "first_goal_none_ht": 15,
+            "prob_source": "poisson",
         }
     else:
         lam = None
-        prob_data = {
-            "xg_home": None, "xg_away": None, "lambda": None,
-            "btts_yes": None, "btts_no": None,
-            "over_05": None, "over_15": None, "over_25": None,
-            "over_35": None, "over_45": None, "under_25": None,
-            "home_win_prob": None, "draw_prob": None, "away_win_prob": None,
-            "first_goal_home": None, "first_goal_away": None,
-            "first_goal_none_ht": None,
-        }
+        # Implied probabilities from bookmaker odds when no xG available
+        _h_odds = pick.get("home_odds_raw") or pick.get("pinnacle_opening")
+        _d_odds = pick.get("draw_odds_raw")
+        _a_odds = pick.get("away_odds_raw")
+        if _h_odds and _d_odds and _a_odds:
+            _ih, _id, _ia = implied_probs_from_odds(_h_odds, _d_odds, _a_odds)
+            prob_data = {
+                "xg_home": None, "xg_away": None, "lambda": None,
+                "btts_yes": None, "btts_no": None,
+                "over_05": None, "over_15": None, "over_25": None,
+                "over_35": None, "over_45": None, "under_25": None,
+                "home_win_prob": round(_ih * 100), "draw_prob": round(_id * 100), "away_win_prob": round(_ia * 100),
+                "first_goal_home": None, "first_goal_away": None,
+                "first_goal_none_ht": None,
+            }
+            prob_data["prob_source"] = "implied"
+        else:
+            prob_data = {
+                "xg_home": None, "xg_away": None, "lambda": None,
+                "btts_yes": None, "btts_no": None,
+                "over_05": None, "over_15": None, "over_25": None,
+                "over_35": None, "over_45": None, "under_25": None,
+                "home_win_prob": None, "draw_prob": None, "away_win_prob": None,
+                "first_goal_home": None, "first_goal_away": None,
+                "first_goal_none_ht": None,
+            }
+            prob_data["prob_source"] = None
 
     # ── Omega score: uses real fields (atomic_score, edge) ──
     atomic = int(pick.get("atomic_score") or 0)
@@ -6394,6 +6452,57 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+@app.get("/picks/{pick_id}/scorers")
+async def get_pick_scorers(pick_id: int):
+    """Get top scorers for a pick's teams. Non-critical — returns empty if unavailable."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            pick = await conn.fetchrow("SELECT * FROM picks_v2 WHERE id = $1", pick_id)
+        if not pick:
+            from fastapi import HTTPException
+            raise HTTPException(404, "Pick not found")
+        p = dict(pick)
+        home_team = p.get('home_team', '')
+        away_team = p.get('away_team', '')
+        try:
+            scorers = _get_scorers(home_team, away_team)
+        except Exception as e:
+            logger.warning(f"Scorers failed for pick {pick_id}: {e}")
+            scorers = []
+
+        def best_scorer(team: str):
+            team_scorers = [
+                s for s in scorers
+                if str(s.get('team', '')).lower() in team.lower()
+                or team.lower() in str(s.get('team', '')).lower()
+            ]
+            if not team_scorers:
+                return None
+            top = team_scorers[0]
+            goals = int(top.get('goals', 0) or 0)
+            appearances = max(5, goals * 2)  # estimate from scorer list
+            return {
+                "name": top.get('name', ''),
+                "team": team,
+                "goals_last_5": goals,
+                "appearances": appearances,
+                "score_probability": calc_score_probability(goals, appearances),
+            }
+
+        return {
+            "pick_id": pick_id,
+            "home_team": home_team,
+            "away_team": away_team,
+            "home_top_scorer": best_scorer(home_team),
+            "away_top_scorer": best_scorer(away_team),
+            "source": "football-data.org"
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Fyrer opp Uvicorn på port {cfg.PORT}...")
@@ -6566,11 +6675,19 @@ async def get_control_wall():
         accepted = [r for r in all_rows if (r["ev"] or 0) >= 8 and (r["confidence"] or "") in ("HIGH", "VERY HIGH")]
         rejected = [r for r in all_rows if not ((r["ev"] or 0) >= 8 and (r["confidence"] or "") in ("HIGH", "VERY HIGH"))]
 
+        scanned_total = len(all_rows)
+        accepted_total = len(accepted)
+        acceptance_rate = round((accepted_total / scanned_total) * 100, 1) if scanned_total > 0 else 0.0
+        message = None if scanned_total > 0 else "Neste skan starter 07:00 UTC"
+
         return {
             "date": datetime.utcnow().date().isoformat(),
-            "scanned": len(all_rows),
-            "accepted": len(accepted),
+            "scanned": scanned_total,
+            "accepted": accepted_total,
             "rejected_count": len(rejected),
+            "acceptance_rate": acceptance_rate,
+            "last_scan_time": datetime.utcnow().isoformat() + "Z",
+            "message": message,
             "rejected_picks": [
                 {**r, "veto_reason": veto(r)} for r in rejected[:30]
             ],
