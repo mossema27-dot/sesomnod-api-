@@ -46,6 +46,7 @@ from services.mirofish_client import (
     mirofish_get_summary,
     MIROFISH_BASE_URL,
 )
+from services.receipt_engine import create_or_update_receipt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -713,6 +714,56 @@ async def ensure_tables(pool: asyncpg.Pool):
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_picks_v2_atomic "
                 "ON picks_v2(atomic_score) WHERE atomic_score >= 1"
             )
+
+        # ── DECISION RECEIPT ENGINE table ──────────────────────
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS pick_receipts (
+                    id SERIAL PRIMARY KEY,
+                    pick_id BIGINT,
+                    receipt_slug VARCHAR(64) UNIQUE NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    posted_at TIMESTAMPTZ,
+                    settled_at TIMESTAMPTZ,
+                    match_name VARCHAR(255),
+                    league VARCHAR(128),
+                    kickoff TIMESTAMPTZ,
+                    pick_description VARCHAR(255),
+                    opening_odds NUMERIC(6,3),
+                    posted_odds NUMERIC(6,3),
+                    closing_odds NUMERIC(6,3),
+                    edge_pct NUMERIC(5,2),
+                    ev_pct NUMERIC(5,2),
+                    clv_pct NUMERIC(5,2),
+                    clv_verified BOOLEAN DEFAULT FALSE,
+                    omega_score NUMERIC(5,2),
+                    btts_yes NUMERIC(4,3),
+                    xg_home NUMERIC(4,2),
+                    xg_away NUMERIC(4,2),
+                    kelly_fraction NUMERIC(4,3),
+                    kelly_units NUMERIC(5,2),
+                    kelly_verified BOOLEAN DEFAULT FALSE,
+                    shap_top3 JSONB,
+                    synergy_status VARCHAR(16),
+                    synergy_score NUMERIC(4,2),
+                    edge_status VARCHAR(16),
+                    edge_status_reason TEXT,
+                    result_outcome VARCHAR(8),
+                    brier_score NUMERIC(5,4),
+                    process_correct BOOLEAN,
+                    receipt_hash VARCHAR(64),
+                    phase VARCHAR(32) DEFAULT 'Phase 0'
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receipts_slug "
+                "ON pick_receipts(receipt_slug)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receipts_pick_id "
+                "ON pick_receipts(pick_id)"
+            )
+        logger.info("[DB] pick_receipts table OK")
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
@@ -5214,6 +5265,43 @@ async def trigger_post_telegram():
                     )
                 logger.info(f"[/post-telegram] Postet pick id={pick_data['id']}: {pick_data.get('pick')}")
                 mirofish_result = await _log_pick_to_mirofish(pick_data)
+                # Create receipt after Telegram post (fire-and-forget pattern)
+                receipt_result = None
+                try:
+                    async with db_state.pool.acquire() as rconn:
+                        # Find corresponding picks_v2 id
+                        v2_id = await rconn.fetchval(
+                            "SELECT id FROM picks_v2 "
+                            "WHERE home_team = $1 AND away_team = $2 "
+                            "AND kickoff_time = $3 "
+                            "ORDER BY id DESC LIMIT 1",
+                            pick_data.get("home_team", ""),
+                            pick_data.get("away_team", ""),
+                            pick_data.get("kickoff"),
+                        )
+                        receipt_pick_id = v2_id or pick_data["id"]
+                        receipt_result = await create_or_update_receipt(
+                            rconn, receipt_pick_id, {
+                                'home_team': pick_data.get("home_team", ""),
+                                'away_team': pick_data.get("away_team", ""),
+                                'match': pick_data.get("match", ""),
+                                'league': pick_data.get("league", ""),
+                                'kickoff': pick_data.get("kickoff"),
+                                'odds': pick_data.get("odds"),
+                                'edge': pick_data.get("edge"),
+                                'ev': pick_data.get("ev"),
+                                'omega_score': pick_data.get("score") or pick_data.get("atomic_score"),
+                                'pick': pick_data.get("pick", ""),
+                                'xg_home': pick_data.get("xg_home"),
+                                'xg_away': pick_data.get("xg_away"),
+                                'btts_yes': pick_data.get("btts_yes"),
+                                'kelly_fraction': pick_data.get("kelly_fraction"),
+                            }
+                        )
+                    if receipt_result:
+                        logger.info(f"[Receipt] Created: {receipt_result['slug']}")
+                except Exception as re:
+                    logger.warning(f"[Receipt] Creation failed (non-critical): {re}")
                 results.append({
                     "status": "posted",
                     "pick_id": pick_data["id"],
@@ -5225,6 +5313,7 @@ async def trigger_post_telegram():
                     "tier": pick_data.get("tier"),
                     "telegram_status": resp.status_code,
                     "mirofish": mirofish_result,
+                    "receipt": receipt_result.get("slug") if receipt_result else None,
                 })
             else:
                 logger.warning(f"[/post-telegram] Telegram feil {resp.status_code} for pick id={pick_data['id']}")
@@ -6787,3 +6876,212 @@ async def _ladder_history_compat():
             "milestones": [],
             "next_pick": None,
         }
+
+
+# ─────────────────────────────────────────────────────────
+# DECISION RECEIPT ENGINE — PUBLIC PROOF ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+@app.get("/proof/wall")
+async def get_proof_wall(limit: int = 20, status: str = None):
+    """Public proof wall — no auth required."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    async with db_state.pool.acquire() as conn:
+        query = """
+            SELECT
+                r.receipt_slug, r.match_name,
+                r.league, r.kickoff,
+                r.posted_odds, r.edge_pct,
+                r.edge_status, r.synergy_status,
+                r.result_outcome, r.clv_pct,
+                r.brier_score, r.phase,
+                r.created_at
+            FROM pick_receipts r
+            ORDER BY r.created_at DESC
+            LIMIT $1
+        """
+        rows = await conn.fetch(query, min(limit, 50))
+
+        stats = await conn.fetchrow("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(CASE WHEN result_outcome = 'WIN' THEN 1 END) as wins,
+                AVG(clv_pct) as avg_clv
+            FROM pick_receipts
+            WHERE result_outcome IS NOT NULL
+        """)
+
+        hit_rate = 0.0
+        if stats['total'] and stats['total'] > 0:
+            hit_rate = (stats['wins'] / stats['total']) * 100
+
+        return {
+            "total_settled": stats['total'] or 0,
+            "hit_rate": round(hit_rate, 1),
+            "avg_clv": round(float(stats['avg_clv'] or 0), 2),
+            "phase": "Phase 0",
+            "phase0_note": "Kalibreringsfase",
+            "picks": [dict(r) for r in rows]
+        }
+
+
+@app.get("/proof/{slug}")
+async def get_proof_receipt(slug: str):
+    """Public single receipt — no auth required."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    async with db_state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM pick_receipts WHERE receipt_slug = $1", slug
+        )
+        if not row:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Receipt ikke funnet")
+        result = dict(row)
+        result['disclaimer'] = (
+            "Kun analyse og beslutningsstøtte. "
+            "Ingen garanti for fremtidig avkastning."
+        )
+        result['phase_note'] = (
+            "Phase 0 — Kalibreringsfase. "
+            "Alle picks loggføres før kampstart."
+        )
+        return result
+
+
+@app.patch("/proof/{slug}/settle")
+async def settle_receipt(slug: str, body: dict):
+    """Settle a receipt after match result."""
+    outcome = body.get('result_outcome')
+    closing_odds = body.get('closing_odds')
+
+    if outcome not in ['WIN', 'LOSS', 'VOID']:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail="outcome must be WIN, LOSS or VOID"
+        )
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    async with db_state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM pick_receipts WHERE receipt_slug = $1", slug
+        )
+        if not row:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Receipt ikke funnet")
+
+        clv_pct = None
+        if closing_odds and row['posted_odds']:
+            clv_pct = round(
+                (float(row['posted_odds']) / float(closing_odds) - 1) * 100, 2
+            )
+
+        process_correct = None
+        if clv_pct is not None:
+            process_correct = clv_pct > 0
+
+        await conn.execute("""
+            UPDATE pick_receipts SET
+                result_outcome = $1,
+                closing_odds = $2,
+                clv_pct = $3,
+                clv_verified = $4,
+                process_correct = $5,
+                settled_at = NOW()
+            WHERE receipt_slug = $6
+        """,
+            outcome, closing_odds, clv_pct,
+            clv_pct is not None, process_correct,
+            slug
+        )
+
+        return {
+            "slug": slug,
+            "result_outcome": outcome,
+            "clv_pct": clv_pct,
+            "process_correct": process_correct
+        }
+
+
+@app.post("/admin/backfill-receipts")
+async def admin_backfill_receipts():
+    """Backfill pick_receipts from picks_v2. Idempotent — skips existing."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            picks = await conn.fetch("""
+                SELECT id, match_name, home_team, away_team,
+                       odds, soft_edge, soft_ev, soft_book,
+                       atomic_score, tier,
+                       signal_xg_home, signal_xg_away,
+                       kickoff_time, league,
+                       result, outcome, status,
+                       kelly_stake, brier_score,
+                       created_at
+                FROM picks_v2
+                ORDER BY id
+            """)
+
+        created = 0
+        skipped = 0
+        failed = 0
+
+        for pick in picks:
+            pick_dict = dict(pick)
+            pick_id = pick_dict['id']
+
+            # Check if receipt already exists
+            async with db_state.pool.acquire() as conn:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM pick_receipts WHERE pick_id = $1",
+                    pick_id
+                )
+                if exists:
+                    skipped += 1
+                    continue
+
+                result = await create_or_update_receipt(
+                    conn, pick_id, {
+                        'home_team': pick_dict.get('home_team', ''),
+                        'away_team': pick_dict.get('away_team', ''),
+                        'match_name': pick_dict.get('match_name', ''),
+                        'league': pick_dict.get('league', ''),
+                        'kickoff_time': pick_dict.get('kickoff_time'),
+                        'odds': pick_dict.get('odds'),
+                        'edge': pick_dict.get('soft_edge'),
+                        'ev': pick_dict.get('soft_ev'),
+                        'omega_score': pick_dict.get('atomic_score'),
+                        'signal_xg_home': pick_dict.get('signal_xg_home'),
+                        'signal_xg_away': pick_dict.get('signal_xg_away'),
+                        'kelly_stake': pick_dict.get('kelly_stake'),
+                    }
+                )
+                if result:
+                    created += 1
+                else:
+                    failed += 1
+
+        # Sample output
+        async with db_state.pool.acquire() as conn:
+            sample = await conn.fetch(
+                "SELECT receipt_slug, match_name, edge_status "
+                "FROM pick_receipts ORDER BY id LIMIT 5"
+            )
+            total = await conn.fetchval("SELECT COUNT(*) FROM pick_receipts")
+
+        return {
+            "status": "done",
+            "created": created,
+            "skipped": skipped,
+            "failed": failed,
+            "total_receipts": total,
+            "sample": [dict(r) for r in sample]
+        }
+    except Exception as e:
+        logger.error(f"/admin/backfill-receipts error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
