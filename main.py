@@ -797,64 +797,68 @@ async def ensure_tables(pool: asyncpg.Pool):
         logger.info("[DB] decision_quality_scores + clv_source OK")
 
         # ── picks_v2: add prob_source + raw odds columns ──────────
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS prob_source VARCHAR(32);
-                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
-                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS draw_odds_raw NUMERIC(5,2);
-                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS away_odds_raw NUMERIC(5,2);
-            """)
-        logger.info("[DB] picks_v2 prob_source + raw odds columns OK")
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS prob_source VARCHAR(32);
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS draw_odds_raw NUMERIC(5,2);
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS away_odds_raw NUMERIC(5,2);
+                """)
+            logger.info("[DB] picks_v2 prob_source + raw odds columns OK")
 
-        # ── Backfill: copy raw odds from dagens_kamp → picks_v2 ──
-        async with pool.acquire() as conn:
-            backfilled_odds = await conn.execute("""
-                UPDATE picks_v2 p2
-                SET home_odds_raw = dk.home_odds_raw,
-                    draw_odds_raw = dk.draw_odds_raw,
-                    away_odds_raw = dk.away_odds_raw
-                FROM dagens_kamp dk
-                WHERE p2.match_name = dk.match
-                  AND dk.home_odds_raw IS NOT NULL
-                  AND p2.home_odds_raw IS NULL
-            """)
-            logger.info(f"[DB] Backfilled raw odds from dagens_kamp: {backfilled_odds}")
+            # ── Backfill: copy raw odds from dagens_kamp → picks_v2 ──
+            async with pool.acquire() as conn:
+                backfilled_odds = await conn.execute("""
+                    UPDATE picks_v2 p2
+                    SET home_odds_raw = dk.home_odds_raw,
+                        draw_odds_raw = dk.draw_odds_raw,
+                        away_odds_raw = dk.away_odds_raw
+                    FROM dagens_kamp dk
+                    WHERE p2.match_name = dk.match
+                      AND dk.home_odds_raw IS NOT NULL
+                      AND p2.home_odds_raw IS NULL
+                """)
+                logger.info(f"[DB] Backfilled raw odds from dagens_kamp: {backfilled_odds}")
 
-            # Backfill prob_source from raw odds where available
-            backfilled_prob = await conn.execute("""
-                UPDATE picks_v2
-                SET prob_source = 'implied_backfill'
-                WHERE home_odds_raw IS NOT NULL
-                  AND draw_odds_raw IS NOT NULL
-                  AND away_odds_raw IS NOT NULL
-                  AND prob_source IS NULL
-            """)
-            logger.info(f"[DB] Backfilled prob_source (implied_backfill): {backfilled_prob}")
+                backfilled_prob = await conn.execute("""
+                    UPDATE picks_v2
+                    SET prob_source = 'implied_backfill'
+                    WHERE home_odds_raw IS NOT NULL
+                      AND draw_odds_raw IS NOT NULL
+                      AND away_odds_raw IS NOT NULL
+                      AND prob_source IS NULL
+                """)
+                logger.info(f"[DB] Backfilled prob_source (implied_backfill): {backfilled_prob}")
 
-            # Mark remaining picks without any odds as 'no_data'
-            backfilled_nodata = await conn.execute("""
-                UPDATE picks_v2
-                SET prob_source = 'no_data'
-                WHERE home_odds_raw IS NULL
-                  AND prob_source IS NULL
-            """)
-            logger.info(f"[DB] Backfilled prob_source (no_data): {backfilled_nodata}")
+                backfilled_nodata = await conn.execute("""
+                    UPDATE picks_v2
+                    SET prob_source = 'no_data'
+                    WHERE home_odds_raw IS NULL
+                      AND prob_source IS NULL
+                """)
+                logger.info(f"[DB] Backfilled prob_source (no_data): {backfilled_nodata}")
+        except Exception as e:
+            logger.warning(f"[DB] prob_source backfill feil (non-fatal): {e}")
 
         # ── Waitlist table ────────────────────────────────────────
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS waitlist (
-                    id SERIAL PRIMARY KEY,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    approved BOOLEAN DEFAULT FALSE,
-                    approved_at TIMESTAMPTZ,
-                    source VARCHAR(64) DEFAULT 'waitlist_page',
-                    activated BOOLEAN DEFAULT FALSE
-                );
-                CREATE INDEX IF NOT EXISTS idx_waitlist_email ON waitlist(email);
-            """)
-        logger.info("[DB] waitlist table OK")
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS waitlist (
+                        id SERIAL PRIMARY KEY,
+                        email VARCHAR(255) UNIQUE NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        approved BOOLEAN DEFAULT FALSE,
+                        approved_at TIMESTAMPTZ,
+                        source VARCHAR(64) DEFAULT 'waitlist_page',
+                        activated BOOLEAN DEFAULT FALSE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_waitlist_email ON waitlist(email);
+                """)
+            logger.info("[DB] waitlist table OK")
+        except Exception as e:
+            logger.warning(f"[DB] waitlist table feil (non-fatal): {e}")
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
@@ -7504,8 +7508,31 @@ async def waitlist_join(body: WaitlistJoin):
             )
             return {"status": "registered", "email": email}
     except Exception as e:
-        logger.error(f"[Waitlist] Join error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Internal error"})
+        logger.error(f"[Waitlist] Join error for {email}: {e}")
+        # Check if table doesn't exist — create it on-the-fly
+        if "waitlist" in str(e).lower() and "does not exist" in str(e).lower():
+            try:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS waitlist (
+                            id SERIAL PRIMARY KEY,
+                            email VARCHAR(255) UNIQUE NOT NULL,
+                            created_at TIMESTAMPTZ DEFAULT NOW(),
+                            approved BOOLEAN DEFAULT FALSE,
+                            approved_at TIMESTAMPTZ,
+                            source VARCHAR(64) DEFAULT 'waitlist_page',
+                            activated BOOLEAN DEFAULT FALSE
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_waitlist_email ON waitlist(email);
+                    """)
+                    await conn.execute(
+                        "INSERT INTO waitlist (email, source) VALUES ($1, $2)",
+                        email, "waitlist_page"
+                    )
+                    return {"status": "registered", "email": email}
+            except Exception as e2:
+                logger.error(f"[Waitlist] Recovery failed: {e2}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
 @app.get("/waitlist/stats")
