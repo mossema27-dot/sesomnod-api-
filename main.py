@@ -17,6 +17,9 @@ class ResultUpdate(BaseModel):
     result: str
     closing_odds: Optional[float] = None
 
+class WaitlistJoin(BaseModel):
+    email: str
+
 _original_exit = sys.exit
 def _safe_exit(code=0):
     import logging
@@ -792,6 +795,66 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE pick_receipts ADD COLUMN IF NOT EXISTS clv_source VARCHAR(32);
             """)
         logger.info("[DB] decision_quality_scores + clv_source OK")
+
+        # ── picks_v2: add prob_source + raw odds columns ──────────
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS prob_source VARCHAR(32);
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS draw_odds_raw NUMERIC(5,2);
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS away_odds_raw NUMERIC(5,2);
+            """)
+        logger.info("[DB] picks_v2 prob_source + raw odds columns OK")
+
+        # ── Backfill: copy raw odds from dagens_kamp → picks_v2 ──
+        async with pool.acquire() as conn:
+            backfilled_odds = await conn.execute("""
+                UPDATE picks_v2 p2
+                SET home_odds_raw = dk.home_odds_raw,
+                    draw_odds_raw = dk.draw_odds_raw,
+                    away_odds_raw = dk.away_odds_raw
+                FROM dagens_kamp dk
+                WHERE p2.match_name = dk.match
+                  AND dk.home_odds_raw IS NOT NULL
+                  AND p2.home_odds_raw IS NULL
+            """)
+            logger.info(f"[DB] Backfilled raw odds from dagens_kamp: {backfilled_odds}")
+
+            # Backfill prob_source from raw odds where available
+            backfilled_prob = await conn.execute("""
+                UPDATE picks_v2
+                SET prob_source = 'implied_backfill'
+                WHERE home_odds_raw IS NOT NULL
+                  AND draw_odds_raw IS NOT NULL
+                  AND away_odds_raw IS NOT NULL
+                  AND prob_source IS NULL
+            """)
+            logger.info(f"[DB] Backfilled prob_source (implied_backfill): {backfilled_prob}")
+
+            # Mark remaining picks without any odds as 'no_data'
+            backfilled_nodata = await conn.execute("""
+                UPDATE picks_v2
+                SET prob_source = 'no_data'
+                WHERE home_odds_raw IS NULL
+                  AND prob_source IS NULL
+            """)
+            logger.info(f"[DB] Backfilled prob_source (no_data): {backfilled_nodata}")
+
+        # ── Waitlist table ────────────────────────────────────────
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS waitlist (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    approved BOOLEAN DEFAULT FALSE,
+                    approved_at TIMESTAMPTZ,
+                    source VARCHAR(64) DEFAULT 'waitlist_page',
+                    activated BOOLEAN DEFAULT FALSE
+                );
+                CREATE INDEX IF NOT EXISTS idx_waitlist_email ON waitlist(email);
+            """)
+        logger.info("[DB] waitlist table OK")
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
@@ -2314,6 +2377,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                     atomic_score, tier, tier_label,
                     kelly_stake, signals_triggered,
                     telegram_posted, result, status,
+                    home_odds_raw, draw_odds_raw, away_odds_raw, prob_source,
                     created_at, updated_at, timestamp
                 ) VALUES (
                     $1, $2, $3, $4,
@@ -2321,6 +2385,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                     $9, $10, $11,
                     $12, $13,
                     $14, $15, 'PENDING',
+                    $16, $17, $18, $19,
                     NOW(), NOW(), NOW()
                 )
             """,
@@ -2339,6 +2404,10 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                 json.dumps(pick.get("signals_triggered", [])) if isinstance(pick.get("signals_triggered"), list) else (pick.get("signals_triggered") or "[]"),
                 bool(pick.get("telegram_posted", False)),
                 pick.get("result"),
+                float(pick.get("home_odds_raw")) if pick.get("home_odds_raw") else None,
+                float(pick.get("draw_odds_raw")) if pick.get("draw_odds_raw") else None,
+                float(pick.get("away_odds_raw")) if pick.get("away_odds_raw") else None,
+                "implied" if pick.get("home_odds_raw") and pick.get("draw_odds_raw") and pick.get("away_odds_raw") else None,
             )
         logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id}: {pick.get('match') or pick.get('home_team','?')}")
     except Exception as e:
@@ -7399,3 +7468,76 @@ async def admin_backfill_receipts():
     except Exception as e:
         logger.error(f"/admin/backfill-receipts error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ─────────────────────────────────────────────────────────
+# WAITLIST — public endpoints (no email list for privacy)
+# ─────────────────────────────────────────────────────────
+import re as _re
+_EMAIL_RE = _re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+
+@app.post("/waitlist/join")
+async def waitlist_join(body: WaitlistJoin):
+    """Public: join the waitlist. Validates email, handles duplicates."""
+    email = (body.email or "").strip().lower()
+    if not email or not _EMAIL_RE.match(email):
+        return JSONResponse(status_code=400, content={"error": "Invalid email"})
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Check if already exists
+            existing = await conn.fetchrow(
+                "SELECT approved FROM waitlist WHERE email = $1", email
+            )
+            if existing:
+                if existing["approved"]:
+                    return {"status": "already_approved", "email": email}
+                return {"status": "already_registered", "email": email}
+
+            await conn.execute(
+                "INSERT INTO waitlist (email, source) VALUES ($1, $2)",
+                email, "waitlist_page"
+            )
+            return {"status": "registered", "email": email}
+    except Exception as e:
+        logger.error(f"[Waitlist] Join error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Internal error"})
+
+
+@app.get("/waitlist/stats")
+async def waitlist_stats():
+    """Public: waitlist stats — total applicants, spots info."""
+    spots_per_month = 100
+
+    if not db_state.connected or not db_state.pool:
+        return {
+            "total_applicants": 0,
+            "spots_per_month": spots_per_month,
+            "spots_remaining": spots_per_month,
+        }
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM waitlist") or 0
+            approved_this_month = await conn.fetchval("""
+                SELECT COUNT(*) FROM waitlist
+                WHERE approved = TRUE
+                  AND approved_at >= date_trunc('month', NOW())
+            """) or 0
+
+        return {
+            "total_applicants": total,
+            "spots_per_month": spots_per_month,
+            "spots_remaining": max(0, spots_per_month - approved_this_month),
+        }
+    except Exception as e:
+        logger.error(f"[Waitlist] Stats error: {e}")
+        return {
+            "total_applicants": 0,
+            "spots_per_month": spots_per_month,
+            "spots_remaining": spots_per_month,
+        }
