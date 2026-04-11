@@ -7007,11 +7007,82 @@ async def settle_receipt(slug: str, body: dict):
         }
 
 
+async def _ensure_receipts_table():
+    """Create pick_receipts table if it doesn't exist. Idempotent."""
+    if not db_state.connected or not db_state.pool:
+        return False
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS pick_receipts (
+                    id SERIAL PRIMARY KEY,
+                    pick_id BIGINT,
+                    receipt_slug VARCHAR(64) UNIQUE NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    posted_at TIMESTAMPTZ,
+                    settled_at TIMESTAMPTZ,
+                    match_name VARCHAR(255),
+                    league VARCHAR(128),
+                    kickoff TIMESTAMPTZ,
+                    pick_description VARCHAR(255),
+                    opening_odds NUMERIC(6,3),
+                    posted_odds NUMERIC(6,3),
+                    closing_odds NUMERIC(6,3),
+                    edge_pct NUMERIC(5,2),
+                    ev_pct NUMERIC(5,2),
+                    clv_pct NUMERIC(5,2),
+                    clv_verified BOOLEAN DEFAULT FALSE,
+                    omega_score NUMERIC(5,2),
+                    btts_yes NUMERIC(4,3),
+                    xg_home NUMERIC(4,2),
+                    xg_away NUMERIC(4,2),
+                    kelly_fraction NUMERIC(4,3),
+                    kelly_units NUMERIC(5,2),
+                    kelly_verified BOOLEAN DEFAULT FALSE,
+                    shap_top3 JSONB,
+                    synergy_status VARCHAR(16),
+                    synergy_score NUMERIC(4,2),
+                    edge_status VARCHAR(16),
+                    edge_status_reason TEXT,
+                    result_outcome VARCHAR(8),
+                    brier_score NUMERIC(5,4),
+                    process_correct BOOLEAN,
+                    receipt_hash VARCHAR(64),
+                    phase VARCHAR(32) DEFAULT 'Phase 0'
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receipts_slug "
+                "ON pick_receipts(receipt_slug)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receipts_pick_id "
+                "ON pick_receipts(pick_id)"
+            )
+        return True
+    except Exception as e:
+        logger.error(f"[Receipts] Table creation failed: {e}")
+        return False
+
+
+@app.post("/admin/create-receipts-table")
+async def admin_create_receipts_table():
+    """Force-create pick_receipts table. Idempotent."""
+    ok = await _ensure_receipts_table()
+    if ok:
+        async with db_state.pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM pick_receipts")
+        return {"status": "OK", "table": "pick_receipts", "rows": count}
+    return JSONResponse(status_code=500, content={"error": "Table creation failed"})
+
+
 @app.post("/admin/backfill-receipts")
 async def admin_backfill_receipts():
     """Backfill pick_receipts from picks_v2. Idempotent — skips existing."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
+    # Ensure table exists before backfill
+    await _ensure_receipts_table()
     try:
         async with db_state.pool.acquire() as conn:
             picks = await conn.fetch("""
