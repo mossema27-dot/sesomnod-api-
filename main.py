@@ -52,6 +52,15 @@ from services.mirofish_client import (
 from services.receipt_engine import create_or_update_receipt
 from services.atlas_engine import atlas_run_clv_closer, atlas_calculate_dqs
 from services.no_bet_verdict import log_rejected_pick, fill_no_bet_verdicts
+from services.the_operator import (
+    get_today_state as operator_get_today_state,
+    can_send as operator_can_send,
+    mark_sent as operator_mark_sent,
+    mark_result as operator_mark_result,
+    build_pick_message as operator_build_pick_message,
+    build_no_pick_message as operator_build_no_pick_message,
+    MAX_DAILY as OPERATOR_MAX_DAILY,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -895,6 +904,25 @@ async def ensure_tables(pool: asyncpg.Pool):
             logger.info("[DB] no_bet_log table OK")
         except Exception as e:
             logger.warning(f"[DB] no_bet_log table feil (non-fatal): {e}")
+
+        # ── Operator State table (The Operator daily tracking) ────
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS operator_state (
+                        id SERIAL PRIMARY KEY,
+                        state_date DATE UNIQUE DEFAULT CURRENT_DATE,
+                        messages_sent_today INTEGER DEFAULT 0,
+                        last_pick_id INTEGER,
+                        last_message_at TIMESTAMPTZ,
+                        consecutive_losses INTEGER DEFAULT 0,
+                        total_wins_all_time INTEGER DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+            logger.info("[DB] operator_state table OK")
+        except Exception as e:
+            logger.warning(f"[DB] operator_state table feil (non-fatal): {e}")
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
@@ -3823,6 +3851,14 @@ async def _auto_settle_results():
                     f"{result_str} -> {outcome_str} (pick: {dk_pick}, brier: {brier})"
                 )
 
+                # The Operator: track consecutive losses
+                try:
+                    kickoff_dt = pick.get("kickoff_time")
+                    if kickoff_dt:
+                        await operator_mark_result(db_state.pool, outcome_str, kickoff_dt)
+                except Exception as op_err:
+                    logger.warning(f"[Operator] mark_result failed (non-fatal): {op_err}")
+
             except Exception as pick_err:
                 logger.warning(f"[AutoSettle] Error settling pick {pick.get('pv_id')}: {pick_err}")
                 continue
@@ -5825,11 +5861,54 @@ async def trigger_post_telegram():
             reason = "all qualified picks already posted today"
         else:
             reason = "no picks meet quality threshold (EDGE/ATOMIC + edge >= 6%)"
-        return {"status": "no_qualified_picks", "reason": reason}
+
+        # The Operator: send no-pick message if allowed
+        operator_no_pick_sent = False
+        try:
+            if await operator_can_send(db_state.pool):
+                # Find highest edge from today's scan
+                async with db_state.pool.acquire() as conn:
+                    highest_edge_row = await conn.fetchval("""
+                        SELECT MAX(edge) FROM dagens_kamp
+                        WHERE kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
+                    """)
+                highest_edge = float(highest_edge_row or 0) * 100  # edge stored as decimal
+                total_scanned = 0
+                async with db_state.pool.acquire() as conn:
+                    scan_row = await conn.fetchval("""
+                        SELECT MAX(total_scanned) FROM dagens_kamp
+                        WHERE kickoff BETWEEN NOW() - INTERVAL '3 hours' AND NOW() + INTERVAL '36 hours'
+                    """)
+                    total_scanned = int(scan_row or 200)
+
+                no_pick_msg = operator_build_no_pick_message(
+                    total_scanned=total_scanned,
+                    highest_edge=highest_edge,
+                )
+                async with httpx.AsyncClient(timeout=15) as client:
+                    op_resp = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": no_pick_msg, "parse_mode": "Markdown"},
+                    )
+                if op_resp.status_code == 200:
+                    await operator_mark_sent(db_state.pool, 0)
+                    operator_no_pick_sent = True
+                    logger.info("[Operator] No-pick message sent")
+        except Exception as op_e:
+            logger.warning(f"[Operator] No-pick message failed (non-fatal): {op_e}")
+
+        return {"status": "no_qualified_picks", "reason": reason, "operator_no_pick_sent": operator_no_pick_sent}
 
     already_posted = int(daily_posted)
     remaining_slots = DAILY_POST_LIMIT - already_posted
     results = []
+
+    # The Operator: check if we can send additional operator messages
+    operator_allowed = False
+    try:
+        operator_allowed = await operator_can_send(db_state.pool)
+    except Exception as op_err:
+        logger.warning(f"[Operator] can_send check failed (non-fatal): {op_err}")
 
     for row in rows[:remaining_slots]:
         pick_data = dict(row)
@@ -5886,6 +5965,32 @@ async def trigger_post_telegram():
                         logger.info(f"[Receipt] Created: {receipt_result['slug']}")
                 except Exception as re:
                     logger.warning(f"[Receipt] Creation failed (non-critical): {re}")
+
+                # ── THE OPERATOR: send concise WHY message ──
+                operator_sent = False
+                if operator_allowed:
+                    try:
+                        receipt_slug = receipt_result.get("slug") if receipt_result else None
+                        op_msg = operator_build_pick_message(
+                            pick_data,
+                            total_scanned=int(pick_data.get("total_scanned") or 0),
+                            receipt_slug=receipt_slug,
+                        )
+                        async with httpx.AsyncClient(timeout=15) as op_client:
+                            op_resp = await op_client.post(
+                                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": op_msg, "parse_mode": "Markdown"},
+                            )
+                        if op_resp.status_code == 200:
+                            await operator_mark_sent(db_state.pool, pick_data["id"])
+                            operator_sent = True
+                            operator_allowed = await operator_can_send(db_state.pool)
+                            logger.info(f"[Operator] Pick message sent for id={pick_data['id']}")
+                        else:
+                            logger.warning(f"[Operator] Telegram error {op_resp.status_code}: {op_resp.text[:200]}")
+                    except Exception as op_e:
+                        logger.warning(f"[Operator] Send failed (non-fatal): {op_e}")
+
                 results.append({
                     "status": "posted",
                     "pick_id": pick_data["id"],
@@ -5897,6 +6002,7 @@ async def trigger_post_telegram():
                     "tier": pick_data.get("tier"),
                     "telegram_status": resp.status_code,
                     "mirofish": mirofish_result,
+                    "operator_sent": operator_sent,
                     "receipt": receipt_result.get("slug") if receipt_result else None,
                 })
             else:
@@ -6380,6 +6486,30 @@ async def db_schema(table: str = "picks"):
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:300]})
+
+
+@app.get("/operator/status")
+async def operator_status():
+    """The Operator status — daily message tracking, consecutive losses, limits."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        state = await operator_get_today_state(db_state.pool)
+        msgs_today = int(state.get("messages_sent_today", 0))
+        return {
+            "operator": "THE OPERATOR",
+            "state_date": str(state.get("state_date")),
+            "messages_sent_today": msgs_today,
+            "can_send_today": msgs_today < OPERATOR_MAX_DAILY,
+            "max_daily": OPERATOR_MAX_DAILY,
+            "remaining": max(0, OPERATOR_MAX_DAILY - msgs_today),
+            "last_pick_id": state.get("last_pick_id"),
+            "last_message_at": str(state.get("last_message_at")) if state.get("last_message_at") else None,
+            "consecutive_losses": int(state.get("consecutive_losses", 0)),
+            "total_wins_all_time": int(state.get("total_wins_all_time", 0)),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
 @app.get("/db/retry")
