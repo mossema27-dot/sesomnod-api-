@@ -8439,6 +8439,27 @@ async def waitlist_stats():
 # STRIPE PAYMENT INFRASTRUCTURE
 # ─────────────────────────────────────────────────────────
 
+@app.post("/admin/migrate-stripe")
+async def admin_migrate_stripe():
+    """One-shot: add Stripe columns to waitlist table (idempotent)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_token VARCHAR(64) UNIQUE;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_sent_at TIMESTAMPTZ;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(128);
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(128);
+            """)
+        return {"status": "migrated", "columns": ["checkout_token", "checkout_sent_at", "paid", "paid_at", "stripe_customer_id", "stripe_subscription_id"]}
+    except Exception as e:
+        logger.error(f"[Stripe Migration] Error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.get("/waitlist/admin")
 async def waitlist_admin():
     """Admin: list all waitlist applicants with approval status."""
