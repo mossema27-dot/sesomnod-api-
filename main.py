@@ -6512,6 +6512,30 @@ async def operator_status():
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
+@app.post("/admin/create-operator-table")
+async def admin_create_operator_table():
+    """Force-create operator_state table. Idempotent."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS operator_state (
+                    id SERIAL PRIMARY KEY,
+                    state_date DATE UNIQUE DEFAULT CURRENT_DATE,
+                    messages_sent_today INTEGER DEFAULT 0,
+                    last_pick_id INTEGER,
+                    last_message_at TIMESTAMPTZ,
+                    consecutive_losses INTEGER DEFAULT 0,
+                    total_wins_all_time INTEGER DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        return {"status": "OK", "table": "operator_state"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 @app.get("/db/retry")
 async def db_retry():
     logger.info("[DB] Manuell retry...")
