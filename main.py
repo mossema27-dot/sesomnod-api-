@@ -7061,6 +7061,46 @@ async def no_bet_fill_verdicts():
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
+@app.post("/no-bet/init-table")
+async def no_bet_init_table():
+    """One-time table creation if ensure_tables missed it."""
+    if not db_state.connected or db_state.pool is None:
+        return JSONResponse(status_code=503, content={"error": "Database ikke tilgjengelig"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS no_bet_log (
+                    id SERIAL PRIMARY KEY,
+                    scan_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    home_team VARCHAR(128) NOT NULL,
+                    away_team VARCHAR(128) NOT NULL,
+                    league VARCHAR(128),
+                    kickoff_time TIMESTAMPTZ,
+                    market_type VARCHAR(64),
+                    edge_pct NUMERIC(5,2),
+                    omega_score NUMERIC(5,2),
+                    rejection_reason VARCHAR(255) NOT NULL,
+                    match_result VARCHAR(16),
+                    verdict VARCHAR(32),
+                    verdict_explanation TEXT,
+                    verdict_filled_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(scan_date, home_team, away_team, market_type)
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_no_bet_date
+                ON no_bet_log(scan_date DESC)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_no_bet_verdict
+                ON no_bet_log(verdict) WHERE verdict IS NULL
+            """)
+        return {"status": "ok", "message": "no_bet_log table created"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 @app.get("/picks/{pick_id}/receipt")
 async def get_pick_receipt(pick_id: int):
     if not db_state.connected or db_state.pool is None:
