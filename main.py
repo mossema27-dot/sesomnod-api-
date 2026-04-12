@@ -4443,14 +4443,29 @@ async def get_dashboard_stats():
                        AND outcome = 'WIN')                            AS won_picks
             """)
 
+        # Fetch real CLV from MiroFish (source of truth)
+        _mirofish_clv = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as _hx:
+                _mf = await _hx.get("https://mirofish-service-production.up.railway.app/summary")
+                if _mf.status_code == 200:
+                    _mf_data = _mf.json()
+                    _raw = _mf_data.get("avg_clv")
+                    if _raw is not None:
+                        _mirofish_clv = round(float(_raw), 2)
+        except Exception as _e:
+            logger.warning(f"MiroFish CLV fetch failed: {_e}")
+
         hit_ok = live_data["hit_rate"] > 0.55
-        clv_ok = live_data["avg_clv"] > 2.0
+        clv_ok = _mirofish_clv is not None and _mirofish_clv >= 2.0
         ops = dict(ops_row) if ops_row else {}
 
         total_settled = int(ops.get("phase0_picks") or 0)
         total_wins = int(ops.get("won_picks") or 0)
         hit_rate_pct = round(total_wins * 100.0 / total_settled, 1) if total_settled > 0 else 0.0
-        avg_clv_val = live_data.get("avg_clv", 0)
+
+        # Override live_data avg_clv with MiroFish value
+        live_data["avg_clv"] = float(_mirofish_clv or 0)
 
         return {
             "live": live_data, "backtest": backtest_data,
@@ -4461,7 +4476,9 @@ async def get_dashboard_stats():
             "hit_rate":            hit_rate_pct,
             "hit_rate_target":     55.0,
             "total_wins":          total_wins,
-            "avg_clv":             avg_clv_val,
+            "avg_clv":             _mirofish_clv,
+            "avg_clv_source":      "mirofish" if _mirofish_clv is not None else "unavailable",
+            "clv_gate_passed":     _mirofish_clv is not None and _mirofish_clv >= 2.0,
             "total_logged":        total_logged_all,
             # Operational fields for frontend (HeroSection + TickerBar)
             "kamper_skannet_i_dag": int(ops.get("kamper_skannet_i_dag") or 0),
