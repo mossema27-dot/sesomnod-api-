@@ -51,6 +51,7 @@ from services.mirofish_client import (
 )
 from services.receipt_engine import create_or_update_receipt
 from services.atlas_engine import atlas_run_clv_closer, atlas_calculate_dqs
+from services.no_bet_verdict import log_rejected_pick, fill_no_bet_verdicts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -859,6 +860,35 @@ async def ensure_tables(pool: asyncpg.Pool):
             logger.info("[DB] waitlist table OK")
         except Exception as e:
             logger.warning(f"[DB] waitlist table feil (non-fatal): {e}")
+
+        # ── No-Bet Log table ──────────────────────────────────────
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS no_bet_log (
+                        id SERIAL PRIMARY KEY,
+                        scan_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                        home_team VARCHAR(128) NOT NULL,
+                        away_team VARCHAR(128) NOT NULL,
+                        league VARCHAR(128),
+                        kickoff_time TIMESTAMPTZ,
+                        market_type VARCHAR(64),
+                        edge_pct NUMERIC(5,2),
+                        omega_score NUMERIC(5,2),
+                        rejection_reason VARCHAR(255) NOT NULL,
+                        match_result VARCHAR(16),
+                        verdict VARCHAR(32),
+                        verdict_explanation TEXT,
+                        verdict_filled_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(scan_date, home_team, away_team, market_type)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_no_bet_date ON no_bet_log(scan_date DESC);
+                    CREATE INDEX IF NOT EXISTS idx_no_bet_verdict ON no_bet_log(verdict) WHERE verdict IS NULL;
+                """)
+            logger.info("[DB] no_bet_log table OK")
+        except Exception as e:
+            logger.warning(f"[DB] no_bet_log table feil (non-fatal): {e}")
 
         logger.info("[DB] Tabeller OK — picks_v2 shadow table aktiv")
     except Exception as e:
@@ -2010,10 +2040,28 @@ async def _analyse_snapshot(league: dict, matches: list, now: datetime, conn=Non
 
                 # Dual Benchmark gate (legacy — alltid aktiv)
                 if soft_ev < SOFT_EV_MIN:
+                    if db_state.pool:
+                        asyncio.create_task(log_rejected_pick(
+                            db_state.pool, m["home_team"], m["away_team"], league["name"],
+                            m.get("commence_time"), market_type, soft_edge, None,
+                            f"EV +{soft_ev:.1f}% under terskel (>={SOFT_EV_MIN}% kreves)",
+                        ))
                     continue
                 if soft_edge < SOFT_EDGE_MIN:
+                    if db_state.pool:
+                        asyncio.create_task(log_rejected_pick(
+                            db_state.pool, m["home_team"], m["away_team"], league["name"],
+                            m.get("commence_time"), market_type, soft_edge, None,
+                            f"Edge +{soft_edge:.1f}% under terskel (>={SOFT_EDGE_MIN}% kreves)",
+                        ))
                     continue
                 if 75 < CONFIDENCE_MIN:
+                    if db_state.pool:
+                        asyncio.create_task(log_rejected_pick(
+                            db_state.pool, m["home_team"], m["away_team"], league["name"],
+                            m.get("commence_time"), market_type, soft_edge, None,
+                            f"Konfidens 75 under terskel ({CONFIDENCE_MIN} kreves)",
+                        ))
                     continue
 
                 # ── Atomic Signals (ADDITIVE — aldri blokkerende) ────────────
@@ -3570,6 +3618,22 @@ async def _get_omega_for_fixture(
 
 
 # ─────────────────────────────────────────────────────────
+# NO-BET VERDICT JOB (defined before scheduler setup)
+# ─────────────────────────────────────────────────────────
+async def _no_bet_verdict_job():
+    logger.info("[NoBet] No-bet verdict job: starting")
+    try:
+        if not db_state.connected or not db_state.pool:
+            logger.info("[NoBet] SKIP: DB offline")
+            return
+        async with db_state.pool.acquire() as db:
+            results = await fill_no_bet_verdicts(db)
+        logger.info(f"[NoBet] Verdicts done: {results}")
+    except Exception as e:
+        logger.error(f"[NoBet] Verdict job error: {e}")
+
+
+# ─────────────────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -3719,11 +3783,22 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # No-Bet Verdict filler — 23:30 UTC daily
+    if not scheduler.get_job("no_bet_verdicts"):
+        scheduler.add_job(
+            _no_bet_verdict_job,
+            trigger=CronTrigger(hour=23, minute=30, timezone="UTC"),
+            id="no_bet_verdicts",
+            misfire_grace_time=600,
+            replace_existing=True,
+            name="No-Bet Verdict Filler",
+        )
+
     scheduler.start()
     logger.info(
         "[Scheduler] Startet — "
         "3-vindu: Early 07:00 (8L) | Evening 18:00 (4L) | Pre-KO 20:00 (cache) | "
-        "Post: 09:00 | CLV: 30min | CLV-rapport: man 08:00 UTC"
+        "Post: 09:00 | CLV: 30min | CLV-rapport: man 08:00 | NoBet-verdict: 23:30 UTC"
     )
 
     if db_state.connected:
@@ -6869,6 +6944,113 @@ async def get_control_wall():
                 {**r, "veto_reason": veto(r)} for r in rejected[:30]
             ],
         }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+# ─────────────────────────────────────────────────────────
+# NO-BET LOG ENDPOINTS
+# ─────────────────────────────────────────────────────────
+@app.get("/no-bet/today")
+async def no_bet_today():
+    """Today's rejected picks with stats."""
+    if not db_state.connected or db_state.pool is None:
+        return JSONResponse(status_code=503, content={"error": "Database ikke tilgjengelig"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, home_team, away_team, league, kickoff_time,
+                       market_type, edge_pct, omega_score, rejection_reason,
+                       verdict, verdict_explanation, created_at
+                FROM no_bet_log
+                WHERE scan_date = CURRENT_DATE
+                ORDER BY created_at DESC
+            """)
+
+            total = len(rows)
+            verdicts = {}
+            picks = []
+            for r in rows:
+                v = r["verdict"] or "PENDING"
+                verdicts[v] = verdicts.get(v, 0) + 1
+                picks.append({
+                    "id": r["id"],
+                    "home_team": r["home_team"],
+                    "away_team": r["away_team"],
+                    "league": r["league"],
+                    "kickoff_time": r["kickoff_time"].isoformat() if r["kickoff_time"] else None,
+                    "market_type": r["market_type"],
+                    "edge_pct": float(r["edge_pct"]) if r["edge_pct"] is not None else None,
+                    "omega_score": float(r["omega_score"]) if r["omega_score"] is not None else None,
+                    "rejection_reason": r["rejection_reason"],
+                    "verdict": r["verdict"],
+                    "verdict_explanation": r["verdict_explanation"],
+                })
+
+        return {
+            "date": datetime.utcnow().date().isoformat(),
+            "total_rejected": total,
+            "verdict_summary": verdicts,
+            "picks": picks,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+@app.get("/no-bet/history")
+async def no_bet_history(days: int = 7):
+    """Recent no-bet history. Max 30 days."""
+    if not db_state.connected or db_state.pool is None:
+        return JSONResponse(status_code=503, content={"error": "Database ikke tilgjengelig"})
+    days = min(max(days, 1), 30)
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT scan_date, COUNT(*) as total,
+                       COUNT(*) FILTER (WHERE verdict = 'CORRECT_PASS') as correct_pass,
+                       COUNT(*) FILTER (WHERE verdict = 'WRONG_PASS') as wrong_pass,
+                       COUNT(*) FILTER (WHERE verdict = 'CORRECT_BLOCK') as correct_block,
+                       COUNT(*) FILTER (WHERE verdict = 'INCONCLUSIVE') as inconclusive,
+                       COUNT(*) FILTER (WHERE verdict IS NULL) as pending
+                FROM no_bet_log
+                WHERE scan_date >= CURRENT_DATE - $1 * INTERVAL '1 day'
+                GROUP BY scan_date
+                ORDER BY scan_date DESC
+            """, days)
+
+        history = []
+        for r in rows:
+            total = r["total"]
+            correct = r["correct_pass"] + r["correct_block"]
+            accuracy = round((correct / total) * 100, 1) if total > 0 else 0.0
+            history.append({
+                "date": r["scan_date"].isoformat(),
+                "total": total,
+                "correct_pass": r["correct_pass"],
+                "wrong_pass": r["wrong_pass"],
+                "correct_block": r["correct_block"],
+                "inconclusive": r["inconclusive"],
+                "pending": r["pending"],
+                "accuracy_pct": accuracy,
+            })
+
+        return {
+            "days": days,
+            "history": history,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+@app.post("/no-bet/fill-verdicts")
+async def no_bet_fill_verdicts():
+    """Manual trigger for verdict fill."""
+    if not db_state.connected or db_state.pool is None:
+        return JSONResponse(status_code=503, content={"error": "Database ikke tilgjengelig"})
+    try:
+        async with db_state.pool.acquire() as db:
+            results = await fill_no_bet_verdicts(db)
+        return {"status": "ok", **results}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
