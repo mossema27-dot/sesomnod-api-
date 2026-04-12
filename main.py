@@ -3888,6 +3888,47 @@ async def lifespan(app: FastAPI):
 
 
 # ─────────────────────────────────────────────────────────
+# SENTRY ERROR TRACKING (graceful skip if SENTRY_DSN unset)
+# ─────────────────────────────────────────────────────────
+import sentry_sdk as _sentry_sdk
+
+_SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+
+if _SENTRY_DSN:
+    _sentry_integrations = []
+    try:
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        _sentry_integrations.append(FastApiIntegration(transaction_style="endpoint"))
+    except ImportError:
+        pass
+    try:
+        from sentry_sdk.integrations.asyncpg import AsyncPGIntegration
+        _sentry_integrations.append(AsyncPGIntegration())
+    except ImportError:
+        pass
+
+    def _sentry_filter(event, hint):
+        sensitive = ("DATABASE", "TOKEN", "KEY", "SECRET", "PASSWORD", "DSN")
+        for section in ("extra", "tags"):
+            if section in event:
+                event[section] = {
+                    k: v for k, v in event[section].items()
+                    if not any(s in k.upper() for s in sensitive)
+                }
+        return event
+
+    _sentry_sdk.init(
+        dsn=_SENTRY_DSN,
+        integrations=_sentry_integrations,
+        traces_sample_rate=0.05,
+        environment=os.getenv("RAILWAY_ENVIRONMENT", "production"),
+        before_send=_sentry_filter,
+    )
+    logger.info("[Sentry] Initialized with FastAPI + asyncpg integrations.")
+else:
+    logger.info("[Sentry] SENTRY_DSN not set — skipping.")
+
+# ─────────────────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────────────────
 app = FastAPI(
@@ -3895,6 +3936,17 @@ app = FastAPI(
     version="10.0.1",
     lifespan=lifespan,
 )
+
+# ── SlowAPI Rate Limiting ──
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi import _rate_limit_exceeded_handler
+
+_limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = _limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+logger.info("[SlowAPI] Rate limiter mounted.")
 
 try:
     from prometheus_fastapi_instrumentator import Instrumentator
@@ -7125,7 +7177,8 @@ async def _ladder_history_compat():
 # ─────────────────────────────────────────────────────────
 
 @app.post("/atlas/run-now")
-async def atlas_run_now():
+@_limiter.limit("5/minute")
+async def atlas_run_now(request: Request):
     """Manual trigger for ATLAS CLV closer + DQS scoring."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
@@ -7482,7 +7535,8 @@ _EMAIL_RE = _re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
 
 
 @app.post("/waitlist/join")
-async def waitlist_join(body: WaitlistJoin):
+@_limiter.limit("3/minute")
+async def waitlist_join(request: Request, body: WaitlistJoin):
     """Public: join the waitlist. Validates email, handles duplicates."""
     email = (body.email or "").strip().lower()
     if not email or not _EMAIL_RE.match(email):
