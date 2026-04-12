@@ -4391,18 +4391,23 @@ async def get_dashboard_stats():
         async with db_state.pool.acquire() as conn:
             live_row = await conn.fetchrow("""
                 SELECT
-                    COUNT(*) FILTER (WHERE outcome IN ('WIN','LOSS')) AS settled,
-                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
-                    COALESCE(AVG(pinnacle_clv), 0) AS avg_clv
+                    COUNT(*) FILTER (WHERE status = 'RESULT_LOGGED') AS settled,
+                    COUNT(*) FILTER (WHERE status = 'RESULT_LOGGED' AND outcome = 'WIN') AS wins,
+                    ROUND(
+                        COUNT(*) FILTER (WHERE status = 'RESULT_LOGGED' AND outcome = 'WIN') * 100.0
+                        / NULLIF(COUNT(*) FILTER (WHERE status = 'RESULT_LOGGED'), 0), 1
+                    ) AS hit_rate_pct,
+                    ROUND(AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL), 2) AS avg_clv,
+                    COUNT(*) AS total_logged
                 FROM picks_v2
-                WHERE status = 'RESULT_LOGGED'
             """)
+            total_logged_all = int(live_row["total_logged"]) if live_row and live_row["total_logged"] else 0
             if live_row and live_row["settled"] and live_row["settled"] > 0:
                 s, w = live_row["settled"], live_row["wins"] or 0
                 live_data = {
                     "phase0_picks": int(s),
                     "hit_rate": round(w / s, 4) if s > 0 else 0.0,
-                    "avg_clv": round(float(live_row["avg_clv"]), 2),
+                    "avg_clv": round(float(live_row["avg_clv"] or 0), 2),
                     "profit_units": 0.0,
                 }
             bt_row = await conn.fetchrow("""
@@ -4441,16 +4446,29 @@ async def get_dashboard_stats():
         hit_ok = live_data["hit_rate"] > 0.55
         clv_ok = live_data["avg_clv"] > 2.0
         ops = dict(ops_row) if ops_row else {}
+
+        total_settled = int(ops.get("phase0_picks") or 0)
+        total_wins = int(ops.get("won_picks") or 0)
+        hit_rate_pct = round(total_wins * 100.0 / total_settled, 1) if total_settled > 0 else 0.0
+        avg_clv_val = live_data.get("avg_clv", 0)
+
         return {
             "live": live_data, "backtest": backtest_data,
             "phase1_gate": {"hit_rate_ok": hit_ok, "clv_ok": clv_ok, "gate_passed": all([hit_ok, clv_ok])},
-            # New operational fields for frontend (HeroSection + TickerBar)
+            # Settled stats for frontend
+            "phase0_picks":        total_settled,
+            "phase0_target":       30,
+            "hit_rate":            hit_rate_pct,
+            "hit_rate_target":     55.0,
+            "total_wins":          total_wins,
+            "avg_clv":             avg_clv_val,
+            "total_logged":        total_logged_all,
+            # Operational fields for frontend (HeroSection + TickerBar)
             "kamper_skannet_i_dag": int(ops.get("kamper_skannet_i_dag") or 0),
             "aktive_picks":        int(ops.get("aktive_picks") or 0),
             "brutal_picks":        int(ops.get("brutal_picks") or 0),
             "strong_picks":        int(ops.get("strong_picks") or 0),
-            "phase0_picks":        int(ops.get("phase0_picks") or 0),
-            "won_picks":           int(ops.get("won_picks") or 0),
+            "won_picks":           total_wins,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
