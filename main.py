@@ -882,9 +882,15 @@ async def ensure_tables(pool: asyncpg.Pool):
                         verdict_filled_at TIMESTAMPTZ,
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         UNIQUE(scan_date, home_team, away_team, market_type)
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_no_bet_date ON no_bet_log(scan_date DESC);
-                    CREATE INDEX IF NOT EXISTS idx_no_bet_verdict ON no_bet_log(verdict) WHERE verdict IS NULL;
+                    )
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_no_bet_date
+                    ON no_bet_log(scan_date DESC)
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_no_bet_verdict
+                    ON no_bet_log(verdict) WHERE verdict IS NULL
                 """)
             logger.info("[DB] no_bet_log table OK")
         except Exception as e:
