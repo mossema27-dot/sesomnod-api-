@@ -165,6 +165,34 @@ class Config:
 
 cfg = Config()
 
+# ─────────────────────────────────────────────────────────
+# STRIPE — Lazy config (safe if keys missing)
+# ─────────────────────────────────────────────────────────
+import stripe as _stripe_mod
+import secrets as _secrets
+
+
+def _get_stripe():
+    """Returns configured stripe module, or None if keys not set."""
+    key = os.getenv("STRIPE_SECRET_KEY", "")
+    if not key:
+        return None
+    _stripe_mod.api_key = key
+    return _stripe_mod
+
+
+def _get_price_id():
+    return os.getenv("STRIPE_PRICE_ID", "")
+
+
+def _get_webhook_secret():
+    return os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+
+def _stripe_configured():
+    return bool(os.getenv("STRIPE_SECRET_KEY", "") and os.getenv("STRIPE_PRICE_ID", ""))
+
+
 # Signal-klasser — aldri blokkerende ved import-feil
 try:
     from signals.weather_signal import WeatherSignal
@@ -869,6 +897,21 @@ async def ensure_tables(pool: asyncpg.Pool):
             logger.info("[DB] waitlist table OK")
         except Exception as e:
             logger.warning(f"[DB] waitlist table feil (non-fatal): {e}")
+
+        # ── Waitlist: Stripe payment columns ─────────────────────
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_token VARCHAR(64) UNIQUE;
+                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_sent_at TIMESTAMPTZ;
+                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE;
+                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(128);
+                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(128);
+                """)
+            logger.info("[DB] waitlist Stripe columns OK")
+        except Exception as e:
+            logger.warning(f"[DB] waitlist Stripe columns feil (non-fatal): {e}")
 
         # ── No-Bet Log table ──────────────────────────────────────
         try:
@@ -8390,3 +8433,250 @@ async def waitlist_stats():
             "spots_per_month": spots_per_month,
             "spots_remaining": spots_per_month,
         }
+
+
+# ─────────────────────────────────────────────────────────
+# STRIPE PAYMENT INFRASTRUCTURE
+# ─────────────────────────────────────────────────────────
+
+@app.get("/waitlist/admin")
+async def waitlist_admin():
+    """Admin: list all waitlist applicants with approval status."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, email, created_at, approved, approved_at,
+                       checkout_token, checkout_sent_at, paid, paid_at,
+                       stripe_customer_id, stripe_subscription_id
+                FROM waitlist
+                ORDER BY created_at DESC
+                LIMIT 200
+            """)
+            total = await conn.fetchval("SELECT COUNT(*) FROM waitlist") or 0
+            paid_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM waitlist WHERE paid = TRUE"
+            ) or 0
+            approved_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM waitlist WHERE approved = TRUE"
+            ) or 0
+
+        applicants = []
+        for r in rows:
+            applicants.append({
+                "id": r["id"],
+                "email": r["email"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "approved": r["approved"],
+                "approved_at": r["approved_at"].isoformat() if r["approved_at"] else None,
+                "checkout_token": r["checkout_token"],
+                "checkout_sent_at": r["checkout_sent_at"].isoformat() if r["checkout_sent_at"] else None,
+                "paid": r["paid"],
+                "paid_at": r["paid_at"].isoformat() if r["paid_at"] else None,
+                "stripe_customer_id": r["stripe_customer_id"],
+                "stripe_subscription_id": r["stripe_subscription_id"],
+                "approve_url": f"/waitlist/approve/{r['id']}",
+            })
+
+        return {
+            "total": total,
+            "approved": approved_count,
+            "paid": paid_count,
+            "applicants": applicants,
+        }
+    except Exception as e:
+        logger.error(f"[Waitlist Admin] Error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/waitlist/approve/{waitlist_id}")
+@_limiter.limit("10/minute")
+async def waitlist_approve(request: Request, waitlist_id: int):
+    """Admin: approve a waitlist applicant and generate checkout token."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, email, approved, paid, checkout_token FROM waitlist WHERE id = $1",
+                waitlist_id,
+            )
+            if not row:
+                return JSONResponse(status_code=404, content={"error": "Applicant not found"})
+
+            if row["paid"]:
+                return {"status": "already_paid", "email": row["email"]}
+
+            # Generate or reuse checkout token
+            token = row["checkout_token"] or _secrets.token_urlsafe(32)
+
+            await conn.execute("""
+                UPDATE waitlist
+                SET approved = TRUE,
+                    approved_at = NOW(),
+                    checkout_token = $1,
+                    checkout_sent_at = NOW()
+                WHERE id = $2
+            """, token, waitlist_id)
+
+        checkout_url = f"https://sesomnod.netlify.app/checkout?token={token}"
+
+        return {
+            "status": "approved",
+            "email": row["email"],
+            "checkout_token": token,
+            "checkout_url": checkout_url,
+            "stripe_configured": _stripe_configured(),
+        }
+    except Exception as e:
+        logger.error(f"[Waitlist Approve] Error for id={waitlist_id}: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+class CheckoutRequest(BaseModel):
+    token: str
+
+
+@app.post("/checkout/create-session")
+@_limiter.limit("5/minute")
+async def checkout_create_session(request: Request, body: CheckoutRequest):
+    """Create a Stripe Checkout session for an approved waitlist applicant."""
+    stripe = _get_stripe()
+    price_id = _get_price_id()
+
+    if not stripe or not price_id:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Payment system not configured"},
+        )
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    token = (body.token or "").strip()
+    if not token:
+        return JSONResponse(status_code=400, content={"error": "Token required"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, email, approved, paid FROM waitlist WHERE checkout_token = $1",
+                token,
+            )
+            if not row:
+                return JSONResponse(status_code=404, content={"error": "Invalid token"})
+            if not row["approved"]:
+                return JSONResponse(status_code=403, content={"error": "Not approved"})
+            if row["paid"]:
+                return {"status": "already_paid", "email": row["email"]}
+
+        # Create Stripe Checkout Session
+        # NOTE: {CHECKOUT_SESSION_ID} is a Stripe template variable, NOT a Python f-string
+        success_url = "https://sesomnod.netlify.app/welcome?session={CHECKOUT_SESSION_ID}"
+        cancel_url = "https://sesomnod.netlify.app/checkout?token=" + token + "&cancelled=1"
+
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer_email=row["email"],
+            metadata={
+                "waitlist_id": str(row["id"]),
+                "checkout_token": token,
+            },
+        )
+
+        return {
+            "status": "session_created",
+            "checkout_url": session.url,
+            "session_id": session.id,
+        }
+    except Exception as e:
+        logger.error(f"[Checkout] Session creation error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Stripe webhook handler — marks waitlist entry as paid after checkout."""
+    stripe = _get_stripe()
+    if not stripe:
+        return JSONResponse(status_code=503, content={"error": "Stripe not configured"})
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    webhook_secret = _get_webhook_secret()
+
+    event = None
+
+    # Validate signature if webhook secret is configured
+    if webhook_secret:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, webhook_secret
+            )
+        except stripe.error.SignatureVerificationError:
+            logger.warning("[Stripe Webhook] Invalid signature")
+            return JSONResponse(status_code=400, content={"error": "Invalid signature"})
+        except Exception as e:
+            logger.warning(f"[Stripe Webhook] Signature error: {e}")
+            return JSONResponse(status_code=400, content={"error": str(e)[:200]})
+    else:
+        # No webhook secret — parse payload directly (dev mode)
+        try:
+            import json as _json
+            event = _json.loads(payload)
+        except Exception as e:
+            logger.warning(f"[Stripe Webhook] Parse error: {e}")
+            return JSONResponse(status_code=400, content={"error": "Invalid payload"})
+
+    event_type = event.get("type") if isinstance(event, dict) else event.type
+    logger.info(f"[Stripe Webhook] Received: {event_type}")
+
+    # Handle checkout.session.completed
+    if event_type == "checkout.session.completed":
+        session_data = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data.object
+        metadata = session_data.get("metadata", {}) if isinstance(session_data, dict) else getattr(session_data, "metadata", {})
+        customer_id = session_data.get("customer", "") if isinstance(session_data, dict) else getattr(session_data, "customer", "")
+        subscription_id = session_data.get("subscription", "") if isinstance(session_data, dict) else getattr(session_data, "subscription", "")
+
+        waitlist_id_str = metadata.get("waitlist_id", "")
+        checkout_token = metadata.get("checkout_token", "")
+
+        if not db_state.connected or not db_state.pool:
+            logger.error("[Stripe Webhook] DB offline — cannot mark paid")
+            return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+        try:
+            async with db_state.pool.acquire() as conn:
+                if waitlist_id_str:
+                    await conn.execute("""
+                        UPDATE waitlist
+                        SET paid = TRUE,
+                            paid_at = NOW(),
+                            stripe_customer_id = $1,
+                            stripe_subscription_id = $2
+                        WHERE id = $3
+                    """, str(customer_id), str(subscription_id), int(waitlist_id_str))
+                    logger.info(f"[Stripe Webhook] Waitlist #{waitlist_id_str} marked as paid")
+                elif checkout_token:
+                    await conn.execute("""
+                        UPDATE waitlist
+                        SET paid = TRUE,
+                            paid_at = NOW(),
+                            stripe_customer_id = $1,
+                            stripe_subscription_id = $2
+                        WHERE checkout_token = $3
+                    """, str(customer_id), str(subscription_id), checkout_token)
+                    logger.info(f"[Stripe Webhook] Token {checkout_token[:8]}... marked as paid")
+                else:
+                    logger.warning("[Stripe Webhook] No waitlist_id or token in metadata")
+        except Exception as e:
+            logger.error(f"[Stripe Webhook] DB update error: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+    return {"status": "ok"}
