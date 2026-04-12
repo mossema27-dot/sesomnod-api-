@@ -3882,8 +3882,8 @@ async def _auto_settle_results():
                           AND (status IS NULL OR status != 'RESULT_LOGGED')
                     """, result_str, outcome_str, brier, pick["pv_id"])
 
-                    # Update pick_receipts
-                    await conn.execute("""
+                    # Update pick_receipts (try pick_id first, then match_name+kickoff fallback)
+                    updated_receipt = await conn.execute("""
                         UPDATE pick_receipts SET
                             result_outcome = $1,
                             brier_score = $2,
@@ -3891,6 +3891,18 @@ async def _auto_settle_results():
                         WHERE pick_id = $3
                           AND result_outcome IS NULL
                     """, outcome_str, brier, pick["pv_id"])
+                    # Fallback: match by team names + kickoff if pick_id didn't match
+                    if updated_receipt == "UPDATE 0":
+                        match_name = f"{pick['home_team']} vs {pick['away_team']}"
+                        await conn.execute("""
+                            UPDATE pick_receipts SET
+                                result_outcome = $1,
+                                brier_score = $2,
+                                settled_at = NOW()
+                            WHERE match_name = $3
+                              AND kickoff = $4
+                              AND result_outcome IS NULL
+                        """, outcome_str, brier, match_name, pick["kickoff_time"])
 
                 settled_count += 1
                 logger.info(
@@ -8235,7 +8247,7 @@ async def manual_settle(body: dict):
                         WHERE home_team = $4 AND away_team = $5 AND kickoff = $6 AND result IS NULL
                     """, outcome, home_score, away_score, pv_full["home_team"], pv_full["away_team"], pv_full["kickoff_time"])
 
-            # Update pick_receipts
+            # Update pick_receipts (try pick_id, then match_name+kickoff fallback)
             r2 = "no receipt"
             if pv_id:
                 r2 = await conn.execute("""
@@ -8243,6 +8255,18 @@ async def manual_settle(body: dict):
                         result_outcome = $1, brier_score = $2, settled_at = NOW()
                     WHERE pick_id = $3 AND result_outcome IS NULL
                 """, outcome, brier, pv_id)
+                # Fallback: match by team names + kickoff if pick_id didn't match
+                if r2 == "UPDATE 0":
+                    pv_full_r = await conn.fetchrow(
+                        "SELECT home_team, away_team, kickoff_time FROM picks_v2 WHERE id = $1", pv_id
+                    )
+                    if pv_full_r:
+                        match_name_r = f"{pv_full_r['home_team']} vs {pv_full_r['away_team']}"
+                        r2 = await conn.execute("""
+                            UPDATE pick_receipts SET
+                                result_outcome = $1, brier_score = $2, settled_at = NOW()
+                            WHERE match_name = $3 AND kickoff = $4 AND result_outcome IS NULL
+                        """, outcome, brier, match_name_r, pv_full_r["kickoff_time"])
 
         return {
             "pick_id": pick_id,
@@ -8339,6 +8363,67 @@ async def admin_backfill_receipts():
         }
     except Exception as e:
         logger.error(f"/admin/backfill-receipts error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/backfill-receipt-settlements")
+async def admin_backfill_receipt_settlements():
+    """Backfill receipt settlements from picks_v2 rows that have RESULT_LOGGED.
+    Matches receipts by match_name + kickoff when pick_id doesn't match."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Find all settled picks_v2 rows
+            settled = await conn.fetch("""
+                SELECT id, home_team, away_team, kickoff_time, outcome, brier_score, result
+                FROM picks_v2
+                WHERE status = 'RESULT_LOGGED' AND outcome IS NOT NULL
+            """)
+            updated_by_id = 0
+            updated_by_name = 0
+            skipped = 0
+
+            for row in settled:
+                pv_id = row["id"]
+                outcome = row["outcome"]
+                brier = row["brier_score"]
+
+                # Try by pick_id first
+                r = await conn.execute("""
+                    UPDATE pick_receipts SET
+                        result_outcome = $1, brier_score = $2, settled_at = NOW()
+                    WHERE pick_id = $3 AND result_outcome IS NULL
+                """, outcome, brier, pv_id)
+
+                if r == "UPDATE 0":
+                    # Fallback: match_name + kickoff
+                    match_name = f"{row['home_team']} vs {row['away_team']}"
+                    r2 = await conn.execute("""
+                        UPDATE pick_receipts SET
+                            result_outcome = $1, brier_score = $2, settled_at = NOW()
+                        WHERE match_name = $3 AND kickoff = $4 AND result_outcome IS NULL
+                    """, outcome, brier, match_name, row["kickoff_time"])
+                    if r2 != "UPDATE 0":
+                        updated_by_name += 1
+                    else:
+                        skipped += 1
+                else:
+                    updated_by_id += 1
+
+            total_unsettled = await conn.fetchval(
+                "SELECT COUNT(*) FROM pick_receipts WHERE result_outcome IS NULL"
+            )
+
+        return {
+            "status": "done",
+            "updated_by_pick_id": updated_by_id,
+            "updated_by_match_name": updated_by_name,
+            "skipped_no_match": skipped,
+            "remaining_unsettled": total_unsettled,
+        }
+    except Exception as e:
+        logger.error(f"/admin/backfill-receipt-settlements error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
