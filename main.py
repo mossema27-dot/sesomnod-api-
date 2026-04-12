@@ -3624,6 +3624,225 @@ async def _get_omega_for_fixture(
 
 
 # ─────────────────────────────────────────────────────────
+# AUTO-SETTLEMENT: picks_v2 + pick_receipts (defined before scheduler setup)
+# ─────────────────────────────────────────────────────────
+async def _auto_settle_results():
+    """
+    Runs every 60 minutes. Settles picks_v2 rows using football-data.org results.
+    - Fetches FINISHED matches from yesterday + today
+    - Matches unsettled picks_v2 rows via fuzzy team name matching
+    - Determines WIN/LOSS from linked dagens_kamp.pick field
+    - Updates picks_v2 (result, outcome, status, brier_score) AND pick_receipts
+    - Calls ATLAS CLV closer directly after settling
+    - Skips Argentina (not in free API tier)
+    - Never crashes — all errors logged and swallowed
+    """
+    FOOTBALL_API_KEY = cfg.FOOTBALL_DATA_API_KEY
+
+    if not FOOTBALL_API_KEY:
+        logger.info("[AutoSettle] SKIP: No FOOTBALL_DATA_API_KEY")
+        return
+
+    if not db_state.connected or not db_state.pool:
+        logger.info("[AutoSettle] SKIP: DB offline")
+        return
+
+    try:
+        today = datetime.now(timezone.utc).date()
+        yesterday = (today - timedelta(days=1)).isoformat()
+        today_str = today.isoformat()
+
+        # Fetch finished matches for yesterday + today
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.football-data.org/v4/matches",
+                headers={"X-Auth-Token": FOOTBALL_API_KEY},
+                params={"dateFrom": yesterday, "dateTo": today_str, "status": "FINISHED"},
+            )
+
+        if r.status_code != 200:
+            logger.warning(f"[AutoSettle] football-data.org returned {r.status_code}: {r.text[:150]}")
+            return
+
+        finished = r.json().get("matches", [])
+        if not finished:
+            logger.info("[AutoSettle] No finished matches")
+            return
+
+        logger.info(f"[AutoSettle] {len(finished)} finished matches from football-data.org")
+
+        # Find unsettled picks_v2 from last 48 hours, joined with dagens_kamp for pick field
+        async with db_state.pool.acquire() as conn:
+            # Ensure outcome/status/brier_score columns exist (idempotent)
+            await conn.execute("""
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS outcome VARCHAR(10);
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'PENDING';
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS brier_score NUMERIC(5,4);
+            """)
+
+            pending = await conn.fetch("""
+                SELECT
+                    pv.id AS pv_id,
+                    pv.home_team, pv.away_team,
+                    pv.odds, pv.soft_edge,
+                    pv.kickoff_time, pv.league,
+                    dk.pick AS dk_pick,
+                    dk.market_hint AS dk_market_hint
+                FROM picks_v2 pv
+                LEFT JOIN dagens_kamp dk
+                    ON pv.home_team = dk.home_team
+                    AND pv.away_team = dk.away_team
+                    AND pv.kickoff_time = dk.kickoff
+                WHERE (pv.status IS NULL OR pv.status != 'RESULT_LOGGED')
+                  AND pv.outcome IS NULL
+                  AND pv.kickoff_time > NOW() - INTERVAL '48 hours'
+                  AND pv.kickoff_time < NOW() - INTERVAL '90 minutes'
+            """)
+
+        if not pending:
+            logger.info("[AutoSettle] No pending picks to settle")
+            return
+
+        logger.info(f"[AutoSettle] {len(pending)} unsettled picks to check")
+        settled_count = 0
+
+        for pick in pending:
+            try:
+                pick_home = str(pick["home_team"] or "").lower().strip()
+                pick_away = str(pick["away_team"] or "").lower().strip()
+                pick_league = str(pick["league"] or "").lower().strip()
+
+                # Skip Argentina (not in free API tier)
+                if "argentin" in pick_league:
+                    logger.info(f"[AutoSettle] SKIP Argentina: {pick['home_team']} vs {pick['away_team']}")
+                    continue
+
+                # Fuzzy match: 6-char prefix + full/short name
+                matched = None
+                for attempt in ("name", "shortName"):
+                    for m in finished:
+                        api_home = m.get("homeTeam", {}).get(attempt, "").lower().strip()
+                        api_away = m.get("awayTeam", {}).get(attempt, "").lower().strip()
+                        home_ok = (
+                            pick_home[:6] in api_home
+                            or api_home[:6] in pick_home
+                            or pick_home in api_home
+                            or api_home in pick_home
+                        )
+                        away_ok = (
+                            pick_away[:6] in api_away
+                            or api_away[:6] in pick_away
+                            or pick_away in api_away
+                            or api_away in pick_away
+                        )
+                        if home_ok and away_ok:
+                            matched = m
+                            break
+                    if matched:
+                        break
+
+                if not matched:
+                    continue
+
+                score = matched.get("score", {}).get("fullTime", {})
+                home_score = score.get("home")
+                away_score = score.get("away")
+                if home_score is None or away_score is None:
+                    continue
+
+                result_str = f"{home_score}-{away_score}"
+                total_goals = home_score + away_score
+                btts = home_score > 0 and away_score > 0
+
+                # Determine outcome from dagens_kamp.pick field
+                dk_pick = str(pick["dk_pick"] or pick.get("dk_market_hint") or "").lower().strip()
+                pick_won = None
+
+                if dk_pick == "draw":
+                    pick_won = home_score == away_score
+                elif dk_pick in ("home", "home win", "1"):
+                    pick_won = home_score > away_score
+                elif dk_pick in ("away", "away win", "2"):
+                    pick_won = away_score > home_score
+                elif "over 3.5" in dk_pick:
+                    pick_won = total_goals > 3
+                elif "over 2.5" in dk_pick or "over2.5" in dk_pick:
+                    pick_won = total_goals > 2
+                elif "over 1.5" in dk_pick:
+                    pick_won = total_goals > 1
+                elif "over 0.5" in dk_pick:
+                    pick_won = total_goals > 0
+                elif "btts no" in dk_pick:
+                    pick_won = not btts
+                elif "btts" in dk_pick:
+                    pick_won = btts
+                elif "under 2.5" in dk_pick:
+                    pick_won = total_goals < 3
+                elif "under 3.5" in dk_pick:
+                    pick_won = total_goals < 4
+
+                if pick_won is None:
+                    logger.info(f"[AutoSettle] Could not determine outcome for pick {pick['pv_id']}: dk_pick='{dk_pick}'")
+                    continue
+
+                outcome_str = "WIN" if pick_won else "LOSS"
+
+                # Brier score: using soft_edge as confidence proxy
+                # confidence = min(0.9, 0.5 + soft_edge/100) for positive edge
+                soft_edge = float(pick["soft_edge"] or 0)
+                confidence = min(0.9, max(0.5, 0.5 + soft_edge / 100.0))
+                actual = 1.0 if pick_won else 0.0
+                brier = round((confidence - actual) ** 2, 4)
+
+                # Update picks_v2
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE picks_v2 SET
+                            result = $1,
+                            outcome = $2,
+                            status = 'RESULT_LOGGED',
+                            brier_score = $3,
+                            updated_at = NOW()
+                        WHERE id = $4
+                          AND (status IS NULL OR status != 'RESULT_LOGGED')
+                    """, result_str, outcome_str, brier, pick["pv_id"])
+
+                    # Update pick_receipts
+                    await conn.execute("""
+                        UPDATE pick_receipts SET
+                            result_outcome = $1,
+                            brier_score = $2,
+                            settled_at = NOW()
+                        WHERE pick_id = $3
+                          AND result_outcome IS NULL
+                    """, outcome_str, brier, pick["pv_id"])
+
+                settled_count += 1
+                logger.info(
+                    f"[AutoSettle] {pick['home_team']} vs {pick['away_team']}: "
+                    f"{result_str} -> {outcome_str} (pick: {dk_pick}, brier: {brier})"
+                )
+
+            except Exception as pick_err:
+                logger.warning(f"[AutoSettle] Error settling pick {pick.get('pv_id')}: {pick_err}")
+                continue
+
+        logger.info(f"[AutoSettle] Settled {settled_count} picks")
+
+        # Run ATLAS CLV closer directly if we settled anything
+        if settled_count > 0:
+            try:
+                async with db_state.pool.acquire() as conn:
+                    atlas_result = await atlas_run_clv_closer(conn)
+                logger.info(f"[AutoSettle] ATLAS post-settle: {atlas_result.get('scored', 0)} DQS scored, {atlas_result.get('clv_synced', 0)} CLV synced")
+            except Exception as atlas_err:
+                logger.warning(f"[AutoSettle] ATLAS post-settle error (non-fatal): {atlas_err}")
+
+    except Exception as e:
+        logger.warning(f"[AutoSettle] Top-level exception: {e}")
+
+
+# ─────────────────────────────────────────────────────────
 # NO-BET VERDICT JOB (defined before scheduler setup)
 # ─────────────────────────────────────────────────────────
 async def _no_bet_verdict_job():
@@ -3798,6 +4017,20 @@ async def lifespan(app: FastAPI):
             misfire_grace_time=600,
             replace_existing=True,
             name="No-Bet Verdict Filler",
+        )
+
+    # Auto-settlement: picks_v2 + pick_receipts — every 60 minutes
+    if not scheduler.get_job("auto_settlement"):
+        scheduler.add_job(
+            _auto_settle_results,
+            "interval",
+            minutes=60,
+            id="auto_settlement",
+            replace_existing=True,
+            name="Auto Result Settlement",
+            misfire_grace_time=300,
+            max_instances=1,
+            coalesce=True,
         )
 
     scheduler.start()
@@ -7671,6 +7904,66 @@ async def admin_create_receipts_table():
             count = await conn.fetchval("SELECT COUNT(*) FROM pick_receipts")
         return {"status": "OK", "table": "pick_receipts", "rows": count}
     return JSONResponse(status_code=500, content={"error": "Table creation failed"})
+
+
+@app.post("/admin/manual-settle")
+async def manual_settle(body: dict):
+    """Manual settlement for specific picks_v2 rows. Updates picks_v2 + pick_receipts."""
+    pick_id = body.get("pick_id")
+    result = body.get("result")
+    outcome = body.get("outcome")
+    if not all([pick_id, result, outcome]):
+        return JSONResponse(status_code=400, content={"error": "Missing fields: pick_id, result, outcome"})
+    if outcome not in ("WIN", "LOSS", "VOID"):
+        return JSONResponse(status_code=400, content={"error": "outcome must be WIN, LOSS, or VOID"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Ensure columns exist
+            await conn.execute("""
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS outcome VARCHAR(10);
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'PENDING';
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS brier_score NUMERIC(5,4);
+            """)
+
+            # Get soft_edge for Brier calculation
+            row = await conn.fetchrow("SELECT soft_edge FROM picks_v2 WHERE id = $1", pick_id)
+            if not row:
+                return JSONResponse(status_code=404, content={"error": f"Pick {pick_id} not found"})
+
+            soft_edge = float(row["soft_edge"] or 0)
+            confidence = min(0.9, max(0.5, 0.5 + soft_edge / 100.0))
+            actual = 1.0 if outcome == "WIN" else 0.0
+            brier = round((confidence - actual) ** 2, 4)
+
+            # Update picks_v2
+            r1 = await conn.execute("""
+                UPDATE picks_v2 SET
+                    result = $1, outcome = $2,
+                    brier_score = $3,
+                    status = 'RESULT_LOGGED', updated_at = NOW()
+                WHERE id = $4 AND (status IS NULL OR status != 'RESULT_LOGGED')
+            """, result, outcome, brier, pick_id)
+
+            # Update pick_receipts
+            r2 = await conn.execute("""
+                UPDATE pick_receipts SET
+                    result_outcome = $1, brier_score = $2, settled_at = NOW()
+                WHERE pick_id = $3 AND result_outcome IS NULL
+            """, outcome, brier, pick_id)
+
+        return {
+            "pick_id": pick_id,
+            "result": result,
+            "outcome": outcome,
+            "brier_score": brier,
+            "picks_v2": r1,
+            "receipts": r2,
+        }
+    except Exception as e:
+        logger.error(f"[ManualSettle] Error settling pick {pick_id}: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
 @app.post("/admin/backfill-receipts")
