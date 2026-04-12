@@ -8516,6 +8516,24 @@ async def waitlist_admin():
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.post("/admin/cleanup-test-waitlist")
+async def cleanup_test_waitlist():
+    """TEMPORARY: delete test/ratelimit rows from waitlist."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            deleted = await conn.execute(
+                "DELETE FROM waitlist WHERE email LIKE '%ratelimit%' OR email LIKE 'test@%'"
+            )
+        count = int(deleted.split()[-1]) if deleted else 0
+        logger.info(f"[Cleanup] Deleted {count} test waitlist rows")
+        return {"deleted": count}
+    except Exception as e:
+        logger.error(f"[Cleanup] Error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/waitlist/approve/{waitlist_id}")
 @_limiter.limit("10/minute")
 async def waitlist_approve(request: Request, waitlist_id: int):
