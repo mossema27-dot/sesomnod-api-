@@ -901,14 +901,18 @@ async def ensure_tables(pool: asyncpg.Pool):
         # ── Waitlist: Stripe payment columns ─────────────────────
         try:
             async with pool.acquire() as conn:
-                await conn.execute("""
-                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_token VARCHAR(64) UNIQUE;
-                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_sent_at TIMESTAMPTZ;
-                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE;
-                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
-                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(128);
-                    ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(128);
-                """)
+                for col_sql in [
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_token VARCHAR(64) UNIQUE",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS checkout_sent_at TIMESTAMPTZ",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(128)",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(128)",
+                ]:
+                    try:
+                        await conn.execute(col_sql)
+                    except Exception as col_err:
+                        logger.warning(f"[DB] waitlist column feil: {col_err}")
             logger.info("[DB] waitlist Stripe columns OK")
         except Exception as e:
             logger.warning(f"[DB] waitlist Stripe columns feil (non-fatal): {e}")
