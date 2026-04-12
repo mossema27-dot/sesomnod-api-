@@ -7908,7 +7908,10 @@ async def admin_create_receipts_table():
 
 @app.post("/admin/manual-settle")
 async def manual_settle(body: dict):
-    """Manual settlement for specific picks_v2 rows. Updates picks_v2 + pick_receipts."""
+    """
+    Manual settlement. Accepts pick_id (tries picks_v2 first, then dagens_kamp).
+    Updates picks_v2, dagens_kamp, and pick_receipts.
+    """
     pick_id = body.get("pick_id")
     result = body.get("result")
     outcome = body.get("outcome")
@@ -7927,39 +7930,94 @@ async def manual_settle(body: dict):
                 ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS brier_score NUMERIC(5,4);
             """)
 
-            # Get soft_edge for Brier calculation
-            row = await conn.fetchrow("SELECT soft_edge FROM picks_v2 WHERE id = $1", pick_id)
-            if not row:
-                return JSONResponse(status_code=404, content={"error": f"Pick {pick_id} not found"})
+            # Try picks_v2 first
+            pv_row = await conn.fetchrow("SELECT id, soft_edge FROM picks_v2 WHERE id = $1", pick_id)
 
-            soft_edge = float(row["soft_edge"] or 0)
+            # If not found in picks_v2, try matching via dagens_kamp
+            pv_id = None
+            dk_id = None
+            if pv_row:
+                pv_id = pv_row["id"]
+                soft_edge = float(pv_row["soft_edge"] or 0)
+            else:
+                # Lookup dagens_kamp row and find matching picks_v2
+                dk_row = await conn.fetchrow(
+                    "SELECT id, home_team, away_team, kickoff, edge FROM dagens_kamp WHERE id = $1",
+                    pick_id,
+                )
+                if not dk_row:
+                    return JSONResponse(status_code=404, content={"error": f"Pick {pick_id} not found in picks_v2 or dagens_kamp"})
+                dk_id = dk_row["id"]
+                soft_edge = float(dk_row["edge"] or 0)
+
+                # Find picks_v2 row via team + kickoff match
+                pv_match = await conn.fetchrow("""
+                    SELECT id, soft_edge FROM picks_v2
+                    WHERE home_team = $1 AND away_team = $2 AND kickoff_time = $3
+                    ORDER BY id DESC LIMIT 1
+                """, dk_row["home_team"], dk_row["away_team"], dk_row["kickoff"])
+                if pv_match:
+                    pv_id = pv_match["id"]
+                    soft_edge = float(pv_match["soft_edge"] or soft_edge)
+
+            # Brier calculation
             confidence = min(0.9, max(0.5, 0.5 + soft_edge / 100.0))
             actual = 1.0 if outcome == "WIN" else 0.0
             brier = round((confidence - actual) ** 2, 4)
 
-            # Update picks_v2
-            r1 = await conn.execute("""
-                UPDATE picks_v2 SET
-                    result = $1, outcome = $2,
-                    brier_score = $3,
-                    status = 'RESULT_LOGGED', updated_at = NOW()
-                WHERE id = $4 AND (status IS NULL OR status != 'RESULT_LOGGED')
-            """, result, outcome, brier, pick_id)
+            # Parse score for home_score/away_score
+            score_parts = result.split("-")
+            home_score = int(score_parts[0]) if len(score_parts) == 2 else None
+            away_score = int(score_parts[1]) if len(score_parts) == 2 else None
+
+            # Update picks_v2 if found
+            r1 = "no picks_v2 row"
+            if pv_id:
+                r1 = await conn.execute("""
+                    UPDATE picks_v2 SET
+                        result = $1, outcome = $2,
+                        brier_score = $3,
+                        status = 'RESULT_LOGGED', updated_at = NOW()
+                    WHERE id = $4 AND (status IS NULL OR status != 'RESULT_LOGGED')
+                """, result, outcome, brier, pv_id)
+
+            # Update dagens_kamp
+            r_dk = "no dagens_kamp row"
+            if dk_id:
+                r_dk = await conn.execute("""
+                    UPDATE dagens_kamp SET
+                        result = $1, home_score = $2, away_score = $3, updated_at = NOW()
+                    WHERE id = $4 AND result IS NULL
+                """, outcome, home_score, away_score, dk_id)
+            elif pv_id:
+                # Try to find and update dagens_kamp via picks_v2 match
+                pv_full = await conn.fetchrow("SELECT home_team, away_team, kickoff_time FROM picks_v2 WHERE id = $1", pv_id)
+                if pv_full:
+                    r_dk = await conn.execute("""
+                        UPDATE dagens_kamp SET
+                            result = $1, home_score = $2, away_score = $3, updated_at = NOW()
+                        WHERE home_team = $4 AND away_team = $5 AND kickoff = $6 AND result IS NULL
+                    """, outcome, home_score, away_score, pv_full["home_team"], pv_full["away_team"], pv_full["kickoff_time"])
 
             # Update pick_receipts
-            r2 = await conn.execute("""
-                UPDATE pick_receipts SET
-                    result_outcome = $1, brier_score = $2, settled_at = NOW()
-                WHERE pick_id = $3 AND result_outcome IS NULL
-            """, outcome, brier, pick_id)
+            r2 = "no receipt"
+            if pv_id:
+                r2 = await conn.execute("""
+                    UPDATE pick_receipts SET
+                        result_outcome = $1, brier_score = $2, settled_at = NOW()
+                    WHERE pick_id = $3 AND result_outcome IS NULL
+                """, outcome, brier, pv_id)
 
         return {
             "pick_id": pick_id,
+            "picks_v2_id": pv_id,
+            "dagens_kamp_id": dk_id,
             "result": result,
             "outcome": outcome,
             "brier_score": brier,
-            "picks_v2": r1,
-            "receipts": r2,
+            "picks_v2": str(r1),
+            "dagens_kamp": str(r_dk),
+            "receipts": str(r2),
         }
     except Exception as e:
         logger.error(f"[ManualSettle] Error settling pick {pick_id}: {e}")
