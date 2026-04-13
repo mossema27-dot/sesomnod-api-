@@ -4740,9 +4740,9 @@ def enrich_pick(pick: dict) -> dict:
     pick.update(prob_data)
 
     # ── NEW: Implied probabilities from odds (vig-removed, always available) ──
-    _ho = float(pick.get('home_odds_raw') or 0)
-    _do = float(pick.get('draw_odds_raw') or 0)
-    _ao = float(pick.get('away_odds_raw') or 0)
+    _ho = float(pick.get('home_odds') or pick.get('home_odds_raw') or 0)
+    _do = float(pick.get('draw_odds') or pick.get('draw_odds_raw') or 0)
+    _ao = float(pick.get('away_odds') or pick.get('away_odds_raw') or 0)
     if _ho > 1.01 and _do > 1.01 and _ao > 1.01:
         raw_h = 1.0 / _ho
         raw_d = 1.0 / _do
@@ -4783,17 +4783,20 @@ def enrich_pick(pick: dict) -> dict:
         pick['poisson_over_35'] = None
         pick['poisson_under_25'] = None
 
-    # ── NEW: Form streak text from signal_streak fields ──
+    # ── NEW: Form streak text from form_home/form_away arrays ──
     for _side in ('home', 'away'):
-        streak_signal = pick.get(f'signal_streak_{_side}') or ''
-        streak_count = int(pick.get(f'streak_{_side}_count') or 0)
-        if streak_signal and streak_signal != 'NEUTRAL' and streak_count >= 2:
-            # streak_signal is like "W3", "L2", "D4" or just "W"/"L"/"D"
-            result_char = streak_signal[0].upper() if streak_signal else ''
-            labels = {'W': 'seire', 'D': 'uavgjort', 'L': 'tap'}
-            label = labels.get(result_char, '')
-            if label:
-                pick[f'form_{_side}_streak'] = f"{streak_count} {label} på rad"
+        _form = pick.get(f'form_{_side}') or []
+        if isinstance(_form, list) and len(_form) >= 2:
+            _first = str(_form[0]).upper() if _form[0] else ''
+            _streak_count = 1
+            for _fi in range(1, len(_form)):
+                if str(_form[_fi]).upper() == _first:
+                    _streak_count += 1
+                else:
+                    break
+            if _streak_count >= 2 and _first in ('W', 'D', 'L'):
+                _labels = {'W': 'seire', 'D': 'uavgjort', 'L': 'tap'}
+                pick[f'form_{_side}_streak'] = f"{_streak_count} {_labels[_first]} på rad"
             else:
                 pick[f'form_{_side}_streak'] = None
         else:
