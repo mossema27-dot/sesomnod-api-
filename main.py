@@ -4740,12 +4740,17 @@ def enrich_pick(pick: dict) -> dict:
     pick.update(prob_data)
 
     # ── Copy raw odds to standard fields for frontend compatibility ──
-    if not pick.get('home_odds') and pick.get('home_odds_raw'):
-        pick['home_odds'] = float(pick['home_odds_raw'])
-    if not pick.get('draw_odds') and pick.get('draw_odds_raw'):
-        pick['draw_odds'] = float(pick['draw_odds_raw'])
-    if not pick.get('away_odds') and pick.get('away_odds_raw'):
-        pick['away_odds'] = float(pick['away_odds_raw'])
+    # Force-set home_odds/draw_odds/away_odds from raw when missing
+    _hor = pick.get('home_odds_raw')
+    _dor = pick.get('draw_odds_raw')
+    _aor = pick.get('away_odds_raw')
+    if _hor and not pick.get('home_odds'):
+        pick['home_odds'] = round(float(_hor), 2)
+    if _dor and not pick.get('draw_odds'):
+        pick['draw_odds'] = round(float(_dor), 2)
+    if _aor and not pick.get('away_odds'):
+        pick['away_odds'] = round(float(_aor), 2)
+    pick['_enrich_version'] = 'v2'
 
     # ── NEW: Implied probabilities from odds (vig-removed, always available) ──
     _ho = float(pick.get('home_odds') or pick.get('home_odds_raw') or 0)
