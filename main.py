@@ -4738,6 +4738,67 @@ def enrich_pick(pick: dict) -> dict:
     })
     # Merge probability data (real or None)
     pick.update(prob_data)
+
+    # ── NEW: Implied probabilities from odds (vig-removed, always available) ──
+    _ho = float(pick.get('home_odds_raw') or 0)
+    _do = float(pick.get('draw_odds_raw') or 0)
+    _ao = float(pick.get('away_odds_raw') or 0)
+    if _ho > 1.01 and _do > 1.01 and _ao > 1.01:
+        raw_h = 1.0 / _ho
+        raw_d = 1.0 / _do
+        raw_a = 1.0 / _ao
+        vig_total = raw_h + raw_d + raw_a
+        pick['implied_home_prob'] = round((raw_h / vig_total) * 100, 1)
+        pick['implied_draw_prob'] = round((raw_d / vig_total) * 100, 1)
+        pick['implied_away_prob'] = round((raw_a / vig_total) * 100, 1)
+        pick['implied_total_margin'] = round((vig_total - 1) * 100, 1)
+    else:
+        pick['implied_home_prob'] = None
+        pick['implied_draw_prob'] = None
+        pick['implied_away_prob'] = None
+        pick['implied_total_margin'] = None
+
+    # ── NEW: BTTS estimate from xG (Poisson-based) ──
+    _xg_h = float(pick.get('xg_home') or 0)
+    _xg_a = float(pick.get('xg_away') or 0)
+    if _xg_h > 0 and _xg_a > 0:
+        p_home_score = 1 - math.exp(-_xg_h)   # P(home scores >= 1)
+        p_away_score = 1 - math.exp(-_xg_a)   # P(away scores >= 1)
+        pick['btts_xg_estimate'] = round(p_home_score * p_away_score * 100, 1)
+    else:
+        pick['btts_xg_estimate'] = None
+
+    # ── NEW: Poisson over/under from xG ──
+    _xg_lam = _xg_h + _xg_a
+    if _xg_lam > 0:
+        def _poisson_cdf(k, l):
+            return sum(math.exp(-l) * (l**i) / math.factorial(i) for i in range(k + 1))
+        pick['poisson_over_15'] = round((1 - _poisson_cdf(1, _xg_lam)) * 100, 1)
+        pick['poisson_over_25'] = round((1 - _poisson_cdf(2, _xg_lam)) * 100, 1)
+        pick['poisson_over_35'] = round((1 - _poisson_cdf(3, _xg_lam)) * 100, 1)
+        pick['poisson_under_25'] = round(_poisson_cdf(2, _xg_lam) * 100, 1)
+    else:
+        pick['poisson_over_15'] = None
+        pick['poisson_over_25'] = None
+        pick['poisson_over_35'] = None
+        pick['poisson_under_25'] = None
+
+    # ── NEW: Form streak text from signal_streak fields ──
+    for _side in ('home', 'away'):
+        streak_signal = pick.get(f'signal_streak_{_side}') or ''
+        streak_count = int(pick.get(f'streak_{_side}_count') or 0)
+        if streak_signal and streak_signal != 'NEUTRAL' and streak_count >= 2:
+            # streak_signal is like "W3", "L2", "D4" or just "W"/"L"/"D"
+            result_char = streak_signal[0].upper() if streak_signal else ''
+            labels = {'W': 'seire', 'D': 'uavgjort', 'L': 'tap'}
+            label = labels.get(result_char, '')
+            if label:
+                pick[f'form_{_side}_streak'] = f"{streak_count} {label} på rad"
+            else:
+                pick[f'form_{_side}_streak'] = None
+        else:
+            pick[f'form_{_side}_streak'] = None
+
     return pick
 
 async def _fetch_xg_from_api_football(
@@ -5006,7 +5067,14 @@ async def get_picks():
                     result,
                     closing_odds,
                     clv,
-                    pinnacle_h2h
+                    pinnacle_h2h,
+                    home_odds_raw,
+                    draw_odds_raw,
+                    away_odds_raw,
+                    signal_streak_home,
+                    signal_streak_away,
+                    streak_home_count,
+                    streak_away_count
                 FROM dagens_kamp
                 WHERE kickoff > NOW() - INTERVAL '1 hour'
                   AND kickoff <= NOW() + INTERVAL '36 hours'
