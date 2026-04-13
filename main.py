@@ -4739,6 +4739,14 @@ def enrich_pick(pick: dict) -> dict:
     # Merge probability data (real or None)
     pick.update(prob_data)
 
+    # ── Copy raw odds to standard fields for frontend compatibility ──
+    if not pick.get('home_odds') and pick.get('home_odds_raw'):
+        pick['home_odds'] = float(pick['home_odds_raw'])
+    if not pick.get('draw_odds') and pick.get('draw_odds_raw'):
+        pick['draw_odds'] = float(pick['draw_odds_raw'])
+    if not pick.get('away_odds') and pick.get('away_odds_raw'):
+        pick['away_odds'] = float(pick['away_odds_raw'])
+
     # ── NEW: Implied probabilities from odds (vig-removed, always available) ──
     _ho = float(pick.get('home_odds') or pick.get('home_odds_raw') or 0)
     _do = float(pick.get('draw_odds') or pick.get('draw_odds_raw') or 0)
