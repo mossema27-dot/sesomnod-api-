@@ -100,11 +100,16 @@ async def _ensure_model():
         return
 
     logger.info("Dixon-Coles model cache expired or empty. Fitting new model...")
-    model, teams, _ = await asyncio.to_thread(_fit_model_sync)
-    _fitted_model = model
-    _available_teams = teams
-    _model_fitted_at = time.time()
-    logger.info("Dixon-Coles model cached successfully.")
+    try:
+        model, teams, _ = await asyncio.to_thread(_fit_model_sync)
+        _fitted_model = model
+        _available_teams = teams
+        _model_fitted_at = time.time()
+        logger.info("Dixon-Coles model cached. %d teams available.", len(teams))
+    except Exception as e:
+        logger.error("Dixon-Coles model fitting FAILED: %s", e)
+        _fitted_model = None
+        _available_teams = []
 
 
 async def get_dixon_coles_probs(
