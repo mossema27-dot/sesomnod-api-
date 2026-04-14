@@ -7371,6 +7371,56 @@ async def get_pick_scorers(pick_id: int):
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
+# ── SCORE-MATCH: Internal endpoint for market scanner ────────────────────────
+
+@app.get("/score-match")
+async def score_match(home: str = "", away: str = "", league: str = ""):
+    """
+    Returns real model probabilities for a match.
+    Called internally by MarketScanner. No auth required.
+    Uses existing Dixon-Coles engine — no code duplication.
+    """
+    if not home or not away:
+        return JSONResponse(status_code=400, content={"error": "home and away required"})
+
+    try:
+        from services.dixon_coles_engine import get_dixon_coles_probs
+
+        # Dixon-Coles needs a market_home_prob as prior.
+        # Estimate from odds or use 0.40 as neutral prior.
+        market_home_prob = 0.40
+
+        dc = await get_dixon_coles_probs(home, away, market_home_prob)
+
+        # Estimate xG from probabilities (no real xG model available)
+        # Use inverse Poisson approximation: if P(home_win)=0.45 → xG_home ≈ 1.3
+        import math
+        _hw = max(dc.home_win_prob, 0.05)
+        _aw = max(dc.away_win_prob, 0.05)
+        xg_home_est = round(-math.log(1 - min(_hw, 0.85)) * 1.2, 2)
+        xg_away_est = round(-math.log(1 - min(_aw, 0.85)) * 1.2, 2)
+
+        # BTTS from Dixon-Coles (already calculated)
+        btts_yes = round(dc.btts_prob, 4)
+
+        return {
+            "home_win": round(dc.home_win_prob, 4),
+            "draw": round(dc.draw_prob, 4),
+            "away_win": round(dc.away_win_prob, 4),
+            "xg_home": xg_home_est,
+            "xg_away": xg_away_est,
+            "btts_yes": btts_yes,
+            "fallback_used": dc.fallback_used,
+            "model": "dixon_coles_v1",
+            "home_found": dc.home_team_found_in_data,
+            "away_found": dc.away_team_found_in_data,
+        }
+
+    except Exception as e:
+        logger.error(f"/score-match error for {home} vs {away}: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 # ── MARKET SCANNER + MIROFISH ENDPOINTS ──────────────────────────────────────
 
 @app.get("/v2/run-full-scan")
