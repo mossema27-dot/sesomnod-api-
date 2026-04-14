@@ -7371,6 +7371,59 @@ async def get_pick_scorers(pick_id: int):
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
+# ── DEBUG: Dixon-Coles model status ──────────────────────────────────────────
+
+@app.get("/debug/dixon-coles")
+async def debug_dixon_coles():
+    """Debug endpoint: tests each step of Dixon-Coles model fitting."""
+    result = {"steps": {}}
+
+    # Step 1: Can we import?
+    try:
+        from services.football_data_fetcher import get_historical_data
+        result["steps"]["1_import"] = "OK"
+    except Exception as e:
+        result["steps"]["1_import"] = f"FAIL: {e}"
+        return result
+
+    # Step 2: Can we fetch data?
+    try:
+        df = get_historical_data()
+        result["steps"]["2_data_fetch"] = f"OK: {len(df)} rows"
+        if len(df) > 0:
+            result["steps"]["2_sample_teams"] = sorted(set(df["HomeTeam"].tolist()))[:10]
+        else:
+            result["steps"]["2_sample_teams"] = []
+    except Exception as e:
+        result["steps"]["2_data_fetch"] = f"FAIL: {e}"
+        return result
+
+    # Step 3: Can we import penaltyblog?
+    try:
+        from penaltyblog.models import DixonColesGoalModel
+        result["steps"]["3_penaltyblog_import"] = "OK"
+    except Exception as e:
+        result["steps"]["3_penaltyblog_import"] = f"FAIL: {e}"
+        return result
+
+    # Step 4: Can we fit the model?
+    try:
+        model = DixonColesGoalModel(
+            goals_home=df["FTHG"].tolist()[:100],
+            goals_away=df["FTAG"].tolist()[:100],
+            teams_home=df["HomeTeam"].tolist()[:100],
+            teams_away=df["AwayTeam"].tolist()[:100],
+            weights=0.0018,
+        )
+        model.fit()
+        teams = sorted(set(df["HomeTeam"].tolist()[:100] + df["AwayTeam"].tolist()[:100]))
+        result["steps"]["4_model_fit"] = f"OK: {len(teams)} teams"
+    except Exception as e:
+        result["steps"]["4_model_fit"] = f"FAIL: {e}"
+
+    return result
+
+
 # ── SCORE-MATCH: Internal endpoint for market scanner ────────────────────────
 
 @app.get("/score-match")
