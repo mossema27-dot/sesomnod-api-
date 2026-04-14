@@ -4815,6 +4815,20 @@ def enrich_pick(pick: dict) -> dict:
         else:
             pick[f'form_{_side}_streak'] = None
 
+    # ── VALUE GAP — top-level field for frontend ──
+    try:
+        _hp = pick.get('home_win_prob')
+        _ip = pick.get('implied_home_prob')
+        if _hp is not None and _ip is not None:
+            _hp_f = float(_hp)
+            _ip_f = float(_ip)
+            # Both are 0-100 scale from enrich_pick
+            pick['value_gap'] = round(_hp_f - _ip_f, 1)
+        else:
+            pick['value_gap'] = None
+    except Exception:
+        pick['value_gap'] = None
+
     return pick
 
 async def _fetch_xg_from_api_football(
@@ -5109,6 +5123,17 @@ async def get_picks():
             pick["live_score"] = live.get("score") if live else None
             pick["minute"] = live.get("minute") if live else None
             pick["is_live"] = bool(live)
+        # Add rejected_today count (one DB call, shared across all picks)
+        try:
+            async with db_state.pool.acquire() as _rconn:
+                _rej = await _rconn.fetchval(
+                    "SELECT COUNT(*) FROM no_bet_log WHERE scan_date = CURRENT_DATE"
+                )
+                _rej_int = int(_rej or 0)
+        except Exception:
+            _rej_int = 0
+        for _p in enriched:
+            _p['rejected_today'] = _rej_int
         return {"status": "ok", "data": enriched, "count": len(enriched)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
