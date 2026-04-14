@@ -7406,20 +7406,36 @@ async def debug_dixon_coles():
         result["steps"]["3_penaltyblog_import"] = f"FAIL: {e}"
         return result
 
-    # Step 4: Can we fit the model?
+    # Step 4: Can we fit the model? Try with and without weights
     try:
         model = DixonColesGoalModel(
             goals_home=df["FTHG"].tolist()[:100],
             goals_away=df["FTAG"].tolist()[:100],
             teams_home=df["HomeTeam"].tolist()[:100],
             teams_away=df["AwayTeam"].tolist()[:100],
-            weights=0.0018,
         )
         model.fit()
         teams = sorted(set(df["HomeTeam"].tolist()[:100] + df["AwayTeam"].tolist()[:100]))
-        result["steps"]["4_model_fit"] = f"OK: {len(teams)} teams"
+        result["steps"]["4_model_fit"] = f"OK (no weights): {len(teams)} teams"
     except Exception as e:
-        result["steps"]["4_model_fit"] = f"FAIL: {e}"
+        result["steps"]["4_model_fit_no_weights"] = f"FAIL: {e}"
+
+    # Step 5: Try with weights as array
+    try:
+        import numpy as np
+        n = min(100, len(df))
+        w = np.full(n, 0.0018)
+        model2 = DixonColesGoalModel(
+            goals_home=df["FTHG"].tolist()[:n],
+            goals_away=df["FTAG"].tolist()[:n],
+            teams_home=df["HomeTeam"].tolist()[:n],
+            teams_away=df["AwayTeam"].tolist()[:n],
+            weights=w,
+        )
+        model2.fit()
+        result["steps"]["5_model_fit_array_weights"] = "OK"
+    except Exception as e:
+        result["steps"]["5_model_fit_array_weights"] = f"FAIL: {e}"
 
     return result
 
