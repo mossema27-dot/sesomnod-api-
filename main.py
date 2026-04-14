@@ -7373,9 +7373,9 @@ async def get_pick_scorers(pick_id: int):
 
 # ── MARKET SCANNER + MIROFISH ENDPOINTS ──────────────────────────────────────
 
-@app.get("/run-full-scan")
-async def run_full_scan_endpoint(x_api_key: str = Header(None, alias="X-API-Key")):
-    """Scans 500+ matches across 12 leagues. Returns top 10 picks ranked by value gap."""
+@app.get("/v2/run-full-scan")
+async def run_full_scan_v2(x_api_key: str = Header(None, alias="X-API-Key")):
+    """V2: Scans 500+ matches across 12 leagues via Odds API. Returns top 10 by value gap."""
     expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
     if x_api_key != expected_key:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -7389,9 +7389,9 @@ async def run_full_scan_endpoint(x_api_key: str = Header(None, alias="X-API-Key"
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
-@app.post("/mirofish-analyze")
-async def mirofish_analyze_endpoint(body: dict, x_api_key: str = Header(None, alias="X-API-Key")):
-    """Run 11-agent MiroFish simulation on a single match."""
+@app.post("/v2/mirofish-analyze")
+async def mirofish_analyze_v2(body: dict, x_api_key: str = Header(None, alias="X-API-Key")):
+    """V2: Run 11-agent MiroFish simulation on a single match."""
     expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
     if x_api_key != expected_key:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -7415,9 +7415,9 @@ async def mirofish_analyze_endpoint(body: dict, x_api_key: str = Header(None, al
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
-@app.get("/deep-scan")
-async def deep_scan_endpoint(top_n: int = 3, x_api_key: str = Header(None, alias="X-API-Key")):
-    """Full market scan + parallel MiroFish simulation on top N picks."""
+@app.get("/v2/deep-scan")
+async def deep_scan_v2(top_n: int = 3, x_api_key: str = Header(None, alias="X-API-Key")):
+    """V2: Full market scan + parallel MiroFish simulation on top N picks."""
     expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
     if x_api_key != expected_key:
         raise HTTPException(status_code=403, detail="Unauthorized")
