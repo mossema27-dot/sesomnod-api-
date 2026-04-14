@@ -40,7 +40,7 @@ from datetime import datetime, timezone, timedelta
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from services.mirofish_client import (
@@ -50,6 +50,8 @@ from services.mirofish_client import (
     MIROFISH_BASE_URL,
 )
 from services.receipt_engine import create_or_update_receipt
+from services.market_scanner import MarketScanner
+from services.mirofish_agent import MiroFishAgent, apply_mirofish_to_omega
 from services.atlas_engine import atlas_run_clv_closer, atlas_calculate_dqs
 from services.no_bet_verdict import log_rejected_pick, fill_no_bet_verdicts
 from services.the_operator import (
@@ -292,6 +294,10 @@ class DBState:
 
 db_state = DBState()
 
+# Module-level scanner and agent — initialized after DB connects
+market_scanner: MarketScanner | None = None
+mirofish_agent_instance: MiroFishAgent | None = None
+
 
 # ─────────────────────────────────────────────────────────
 # DATABASE HELPERS
@@ -318,6 +324,20 @@ async def connect_db() -> bool:
         logger.info("[DB] Tilkoblet Railway PostgreSQL!")
 
         await ensure_tables(pool)
+
+        # Initialize MarketScanner + MiroFish agent
+        global market_scanner, mirofish_agent_instance
+        market_scanner = MarketScanner(
+            odds_api_key=os.environ.get("ODDS_API_KEY", ""),
+            db_pool=pool,
+            telegram_token=os.environ.get("TELEGRAM_TOKEN", ""),
+            telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+            notion_token=os.environ.get("NOTION_TOKEN", ""),
+        )
+        await market_scanner.ensure_db_tables()
+        mirofish_agent_instance = MiroFishAgent()
+        logger.info("[INIT] MarketScanner + MiroFishAgent initialized")
+
         return True
 
     except Exception as e:
@@ -7349,6 +7369,97 @@ async def get_pick_scorers(pick_id: int):
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+# ── MARKET SCANNER + MIROFISH ENDPOINTS ──────────────────────────────────────
+
+@app.get("/run-full-scan")
+async def run_full_scan_endpoint(x_api_key: str = Header(None, alias="X-API-Key")):
+    """Scans 500+ matches across 12 leagues. Returns top 10 picks ranked by value gap."""
+    expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
+    if x_api_key != expected_key:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    if not market_scanner:
+        raise HTTPException(status_code=503, detail="Scanner not initialized — DB offline?")
+    try:
+        result = await market_scanner.run_full_scan()
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.error(f"/run-full-scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+@app.post("/mirofish-analyze")
+async def mirofish_analyze_endpoint(body: dict, x_api_key: str = Header(None, alias="X-API-Key")):
+    """Run 11-agent MiroFish simulation on a single match."""
+    expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
+    if x_api_key != expected_key:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    if not mirofish_agent_instance:
+        raise HTTPException(status_code=503, detail="MiroFish not initialized")
+    match_data = body.get("match_data", body)
+    if not match_data.get("home_team"):
+        raise HTTPException(status_code=400, detail="home_team is required")
+    try:
+        simulation = await mirofish_agent_instance.analyze_match(match_data)
+        base_omega = int(match_data.get("omega", 0))
+        omega_result = apply_mirofish_to_omega(base_omega, simulation)
+        return JSONResponse(content={
+            "match": f"{match_data.get('home_team')} vs {match_data.get('away_team')}",
+            "selection": match_data.get("selection", "N/A"),
+            "simulation": simulation,
+            "omega_integration": omega_result,
+        })
+    except Exception as e:
+        logger.error(f"/mirofish-analyze error: {e}")
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+@app.get("/deep-scan")
+async def deep_scan_endpoint(top_n: int = 3, x_api_key: str = Header(None, alias="X-API-Key")):
+    """Full market scan + parallel MiroFish simulation on top N picks."""
+    expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
+    if x_api_key != expected_key:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    if not market_scanner or not mirofish_agent_instance:
+        raise HTTPException(status_code=503, detail="Scanner/MiroFish not initialized")
+    top_n = min(max(top_n, 1), 5)
+    try:
+        scan_result = await market_scanner.run_full_scan()
+        top_picks = scan_result.get("top_picks", [])[:top_n]
+        if not top_picks:
+            return JSONResponse(content={**scan_result, "deep_analysis": True, "mirofish_applied": 0})
+        simulations = await mirofish_agent_instance.analyze_batch(top_picks)
+        enriched = []
+        for pick, sim in zip(top_picks, simulations):
+            base_omega = pick.get("omega", 0)
+            omega_result = apply_mirofish_to_omega(base_omega, sim)
+            enriched.append({
+                **pick,
+                "omega_adjusted": omega_result["adjusted_omega"],
+                "mirofish_bonus": omega_result["mirofish_bonus"],
+                "mirofish_penalty": omega_result["mirofish_penalty"],
+                "narrative_pressure": omega_result["narrative_pressure"],
+                "public_bias": omega_result["public_bias"],
+                "sharp_disagreement": omega_result["sharp_disagreement"],
+                "market_distortion": omega_result["market_distortion"],
+                "false_consensus_risk": omega_result["false_consensus_risk"],
+                "actionability": omega_result["actionability"],
+                "what_to_watch": omega_result["what_to_watch"],
+                "what_to_ignore": omega_result["what_to_ignore"],
+                "invalidation_triggers": omega_result["invalidation_triggers"],
+                "mirofish_confidence": omega_result["mirofish_confidence"],
+            })
+        enriched.sort(key=lambda x: x["omega_adjusted"], reverse=True)
+        return JSONResponse(content={
+            **scan_result,
+            "deep_analysis": True,
+            "mirofish_applied": len(enriched),
+            "top_picks": enriched,
+        })
+    except Exception as e:
+        logger.error(f"/deep-scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
 if __name__ == "__main__":
