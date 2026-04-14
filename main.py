@@ -7403,6 +7403,8 @@ async def score_match(home: str = "", away: str = "", league: str = ""):
         # BTTS from Dixon-Coles (already calculated)
         btts_yes = round(dc.btts_prob, 4)
 
+        # Debug: include sample of available teams to diagnose matching issues
+        from services.dixon_coles_engine import _available_teams as _at
         return {
             "home_win": round(dc.home_win_prob, 4),
             "draw": round(dc.draw_prob, 4),
@@ -7414,6 +7416,9 @@ async def score_match(home: str = "", away: str = "", league: str = ""):
             "model": "dixon_coles_v1",
             "home_found": dc.home_team_found_in_data,
             "away_found": dc.away_team_found_in_data,
+            "data_sample_size": dc.data_sample_size,
+            "_debug_available_teams_count": len(_at),
+            "_debug_sample_teams": _at[:10] if _at else [],
         }
 
     except Exception as e:
