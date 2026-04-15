@@ -7476,8 +7476,15 @@ async def score_match(home: str = "", away: str = "", league: str = ""):
         ht_home = df[df["HomeTeam"] == home_n]
         home_found = len(ht_home) >= 5
         if home_found:
-            home_attack = ht_home["FTHG"].mean() / max(avg_home_goals, 0.5)  # attack strength
-            home_defense = ht_home["FTAG"].mean() / max(avg_away_goals, 0.5)  # defense weakness
+            raw_h_att = ht_home["FTHG"].mean() / max(avg_home_goals, 0.5)
+            raw_h_def = ht_home["FTAG"].mean() / max(avg_away_goals, 0.5)
+            # Shrinkage toward 1.0 — prevents extreme xG from small samples
+            # With 38 matches: 80% weight on data, 20% regression to mean
+            # With 10 matches: 50% weight on data
+            n_h = len(ht_home)
+            w_h = n_h / (n_h + 15.0)  # Bayesian shrinkage
+            home_attack = w_h * raw_h_att + (1 - w_h) * 1.0
+            home_defense = w_h * raw_h_def + (1 - w_h) * 1.0
         else:
             home_attack = 1.0
             home_defense = 1.0
@@ -7486,19 +7493,23 @@ async def score_match(home: str = "", away: str = "", league: str = ""):
         at_away = df[df["AwayTeam"] == away_n]
         away_found = len(at_away) >= 5
         if away_found:
-            away_attack = at_away["FTAG"].mean() / max(avg_away_goals, 0.5)
-            away_defense = at_away["FTHG"].mean() / max(avg_home_goals, 0.5)
+            raw_a_att = at_away["FTAG"].mean() / max(avg_away_goals, 0.5)
+            raw_a_def = at_away["FTHG"].mean() / max(avg_home_goals, 0.5)
+            n_a = len(at_away)
+            w_a = n_a / (n_a + 15.0)
+            away_attack = w_a * raw_a_att + (1 - w_a) * 1.0
+            away_defense = w_a * raw_a_def + (1 - w_a) * 1.0
         else:
             away_attack = 1.0
             away_defense = 1.0
 
-        # Expected goals (Poisson lambda parameters)
+        # Expected goals (Poisson lambda) — conservative estimates
         xg_home = round(avg_home_goals * home_attack * away_defense, 2)
         xg_away = round(avg_away_goals * away_attack * home_defense, 2)
 
         # Clamp to realistic range
-        xg_home = max(0.3, min(xg_home, 3.5))
-        xg_away = max(0.3, min(xg_away, 3.5))
+        xg_home = max(0.4, min(xg_home, 2.8))
+        xg_away = max(0.3, min(xg_away, 2.3))
 
         # Poisson probability matrix P(home=i, away=j) for i,j in 0..6
         def poisson_pmf(k, lam):
