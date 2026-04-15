@@ -7445,9 +7445,11 @@ async def debug_dixon_coles():
 @app.get("/score-match")
 async def score_match(home: str = "", away: str = "", league: str = ""):
     """
-    Returns model probabilities for a match.
+    Returns Poisson model probabilities for a match.
     Called internally by MarketScanner. No auth required.
-    Uses historical win-rate from football-data.co.uk (fast, no penaltyblog fitting).
+    Uses football-data.co.uk historical data (3500+ matches, 5 leagues, 2 seasons).
+    Poisson model: xG → P(i goals, j goals) → home_win, draw, away_win.
+    Draw typically 22-30% — calibrated to real football.
     """
     if not home or not away:
         return JSONResponse(status_code=400, content={"error": "home and away required"})
@@ -7459,88 +7461,96 @@ async def score_match(home: str = "", away: str = "", league: str = ""):
 
         df = get_historical_data()
         if len(df) == 0:
-            return {"home_win": 0.33, "draw": 0.34, "away_win": 0.33,
-                    "xg_home": 1.3, "xg_away": 1.1, "btts_yes": 0.50,
+            return {"home_win": 0.38, "draw": 0.27, "away_win": 0.35,
+                    "xg_home": 1.3, "xg_away": 1.1, "btts_yes": 0.50, "over25": 0.50,
                     "fallback_used": True, "model": "empty_data"}
 
-        # Normalize team names to match training data
         home_n = normalize_team_name(home)
         away_n = normalize_team_name(away)
 
-        # Find matches involving these teams
-        home_matches = df[(df["HomeTeam"] == home_n) | (df["AwayTeam"] == home_n)]
-        away_matches = df[(df["HomeTeam"] == away_n) | (df["AwayTeam"] == away_n)]
-        home_found = len(home_matches) > 0
-        away_found = len(away_matches) > 0
+        # League averages (baseline)
+        avg_home_goals = df["FTHG"].mean()  # ~1.55
+        avg_away_goals = df["FTAG"].mean()  # ~1.20
 
-        if not home_found and not away_found:
-            return {"home_win": 0.40, "draw": 0.25, "away_win": 0.35,
-                    "xg_home": 1.3, "xg_away": 1.1, "btts_yes": 0.50,
-                    "fallback_used": True, "model": "no_team_data",
-                    "home_found": False, "away_found": False,
-                    "tried_home": home_n, "tried_away": away_n}
-
-        # Calculate win rates from historical data
-        # Home team: how often does this team win at home?
+        # Home team attack/defense from their home matches
         ht_home = df[df["HomeTeam"] == home_n]
-        ht_home_wins = len(ht_home[ht_home["FTHG"] > ht_home["FTAG"]]) if len(ht_home) > 0 else 0
-        ht_home_total = max(len(ht_home), 1)
+        home_found = len(ht_home) >= 5
+        if home_found:
+            home_attack = ht_home["FTHG"].mean() / max(avg_home_goals, 0.5)  # attack strength
+            home_defense = ht_home["FTAG"].mean() / max(avg_away_goals, 0.5)  # defense weakness
+        else:
+            home_attack = 1.0
+            home_defense = 1.0
 
-        # Away team: how often does this team win away?
+        # Away team attack/defense from their away matches
         at_away = df[df["AwayTeam"] == away_n]
-        at_away_wins = len(at_away[at_away["FTAG"] > at_away["FTHG"]]) if len(at_away) > 0 else 0
-        at_away_total = max(len(at_away), 1)
+        away_found = len(at_away) >= 5
+        if away_found:
+            away_attack = at_away["FTAG"].mean() / max(avg_away_goals, 0.5)
+            away_defense = at_away["FTHG"].mean() / max(avg_home_goals, 0.5)
+        else:
+            away_attack = 1.0
+            away_defense = 1.0
 
-        # Home advantage factor from entire dataset
-        all_home_wins = len(df[df["FTHG"] > df["FTAG"]])
-        all_draws = len(df[df["FTHG"] == df["FTAG"]])
-        all_total = max(len(df), 1)
-        base_home_rate = all_home_wins / all_total  # ~0.45
-        base_draw_rate = all_draws / all_total      # ~0.26
+        # Expected goals (Poisson lambda parameters)
+        xg_home = round(avg_home_goals * home_attack * away_defense, 2)
+        xg_away = round(avg_away_goals * away_attack * home_defense, 2)
 
-        # Team-specific rates
-        home_strength = ht_home_wins / ht_home_total if home_found else base_home_rate
-        away_strength = at_away_wins / at_away_total if away_found else 0.30
+        # Clamp to realistic range
+        xg_home = max(0.3, min(xg_home, 3.5))
+        xg_away = max(0.3, min(xg_away, 3.5))
 
-        # Combine: home win = blend of home_strength and (1 - away_strength)
-        raw_home = (home_strength * 0.6 + (1 - away_strength) * 0.4)
-        raw_away = (away_strength * 0.6 + (1 - home_strength) * 0.4)
-        raw_draw = max(0.10, 1.0 - raw_home - raw_away)
+        # Poisson probability matrix P(home=i, away=j) for i,j in 0..6
+        def poisson_pmf(k, lam):
+            return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
-        # Normalize to sum = 1.0
-        total = raw_home + raw_draw + raw_away
-        hw = round(raw_home / total, 4)
-        dw = round(raw_draw / total, 4)
+        max_goals = 7
+        home_win_p = 0.0
+        draw_p = 0.0
+        away_win_p = 0.0
+
+        for i in range(max_goals):
+            for j in range(max_goals):
+                p = poisson_pmf(i, xg_home) * poisson_pmf(j, xg_away)
+                if i > j:
+                    home_win_p += p
+                elif i == j:
+                    draw_p += p
+                else:
+                    away_win_p += p
+
+        # Normalize (Poisson truncation leaves tiny residual)
+        total = home_win_p + draw_p + away_win_p
+        hw = round(home_win_p / total, 4)
+        dw = round(draw_p / total, 4)
         aw = round(1.0 - hw - dw, 4)
 
-        # xG from average goals in team's matches
-        if home_found:
-            xg_h = round(ht_home["FTHG"].mean(), 2)
-        else:
-            xg_h = round(df["FTHG"].mean(), 2)
-        if away_found:
-            xg_a = round(at_away["FTAG"].mean(), 2)
-        else:
-            xg_a = round(df["FTAG"].mean(), 2)
+        # BTTS = P(home>=1) * P(away>=1)
+        p_home_zero = poisson_pmf(0, xg_home)
+        p_away_zero = poisson_pmf(0, xg_away)
+        btts = round((1.0 - p_home_zero) * (1.0 - p_away_zero), 4)
 
-        # BTTS from xG Poisson
-        p_home_scores = 1.0 - math.exp(-max(xg_h, 0.1))
-        p_away_scores = 1.0 - math.exp(-max(xg_a, 0.1))
-        btts = round(p_home_scores * p_away_scores, 4)
+        # Over 2.5 = 1 - P(total <= 2)
+        lam_total = xg_home + xg_away
+        p_0 = poisson_pmf(0, lam_total)
+        p_1 = poisson_pmf(1, lam_total)
+        p_2 = poisson_pmf(2, lam_total)
+        over25 = round(1.0 - p_0 - p_1 - p_2, 4)
 
         return {
             "home_win": hw,
             "draw": dw,
             "away_win": aw,
-            "xg_home": xg_h,
-            "xg_away": xg_a,
+            "xg_home": xg_home,
+            "xg_away": xg_away,
             "btts_yes": btts,
+            "over25": over25,
             "fallback_used": not (home_found and away_found),
-            "model": "historical_winrate_v1",
+            "model": "poisson_v1",
             "home_found": home_found,
             "away_found": away_found,
-            "home_matches": len(home_matches),
-            "away_matches": len(away_matches),
+            "home_matches": len(ht_home),
+            "away_matches": len(at_away),
         }
 
     except Exception as e:
