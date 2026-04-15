@@ -531,27 +531,85 @@ class MarketScanner:
 
     # ── NOTIFICATIONS ─────────────────────────────────────────────────────────
 
+    def _build_why(self, p: dict) -> str:
+        """Build 'Hvorfor' from real data — never generic."""
+        parts = []
+        sel = (p.get("selection") or "").lower()
+        xg_h = p.get("xg_home", 0)
+        xg_a = p.get("xg_away", 0)
+        btts = p.get("model_btts", 0)
+        over25 = p.get("model_over25", 0)
+
+        if "over" in sel:
+            parts.append(f"xG-snitt {xg_h}+{xg_a}={round(xg_h+xg_a,2)} tilsier {over25:.0f}% sannsynlighet for over 2.5 mål.")
+            if btts > 50:
+                parts.append(f"BTTS-rate {btts:.0f}% — begge lag scorer regelmessig.")
+        elif "btts" in sel or "both" in sel:
+            parts.append(f"Begge lag angriper: xG hjemme {xg_h}, borte {xg_a}.")
+            parts.append(f"Poisson-modellen gir {btts:.0f}% BTTS-sannsynlighet.")
+        else:
+            # Home/away win
+            if "home" in p.get("market_type", "") or "win" in sel.split()[0:2]:
+                parts.append(f"Hjemmelaget har xG {xg_h} hjemme siste 10, motstander slipper inn xG {xg_a} borte.")
+            else:
+                parts.append(f"Bortelaget har xG {xg_a} borte siste 10, motstander slipper inn xG {xg_h} hjemme.")
+            gap = p.get("value_gap", 0)
+            parts.append(f"Modellen ser +{gap:.1f}% verdi-gap vs. markedet.")
+        return " ".join(parts[:2])
+
+    def _build_warn(self, p: dict) -> str:
+        """Build 'Advarsel' from real match context — never generic."""
+        odds = p.get("best_odds", 0)
+        xg_h = p.get("xg_home", 0)
+        xg_a = p.get("xg_away", 0)
+        btts = p.get("model_btts", 0)
+        draw_est = 100 - p.get("model_prob", 33) - (100 - p.get("model_prob", 33) - p.get("market_prob", 33))
+
+        if odds < 1.60:
+            return "Lave odds (<1.60) — begrenset oppside selv med edge."
+        if odds > 5.0:
+            return f"Høye odds ({odds}) — høy varians, krever sterk bankroll-disiplin."
+        if xg_h + xg_a < 2.0:
+            return f"Lav samlet xG ({xg_h+xg_a:.2f}) — defensiv kamp, uavgjort-risiko."
+        if btts < 40 and ("btts" in (p.get("selection") or "").lower()):
+            return f"BTTS-modell kun {btts:.0f}% — ett lag scorer sjelden."
+        if abs(xg_h - xg_a) < 0.2:
+            return "Jevne xG-tall — høy uavgjort-sannsynlighet."
+        return "Markedet kan ha priset inn informasjon modellen ikke fanger."
+
     async def _notify_telegram(self, result: dict):
         if not (self.telegram_token and self.telegram_chat_id):
             return
-        picks = result["top_picks"]
+        picks = [p for p in result["top_picks"] if not p.get("fallback_used", True)]
+        if not picks:
+            logger.info("[Telegram] No valid picks (all fallback) — skipping notification")
+            return
+
+        today = date.today().strftime("%d.%m.%Y")
         lines = [
-            f"📡 *SESOMNOD DAILY SCAN*",
-            f"_{date.today().isoformat()}_",
+            f"SESOMNOD DAGLIG SCAN — {today}",
             f"",
-            f"✅ *{result['total_scanned']}* kamper skannet",
-            f"🎯 *{len(picks)}* picks godkjent · avg gap *{result['avg_value_gap_top10']}%*",
-            f"❌ *{result['total_rejected']}* avvist",
+            f"{result['total_scanned']} kamper skannet | {len(picks)} picks godkjent",
             f"",
         ]
         for i, p in enumerate(picks[:5], 1):
+            conf = "Høy" if p.get("omega", 0) >= 70 else "Middels"
+            why = self._build_why(p)
+            warn = self._build_warn(p)
             lines.append(
-                f"*{i}. {p['match']}*\n"
-                f"  {p['selection']} · Gap: +{p['value_gap']}% · Omega: {p['omega']}/100 [{p['tier']}]\n"
-                f"  Odds: {p['best_odds']} · Kelly: {p['kelly_pct']}%"
+                f"{i}. {p['match']}\n"
+                f"   Utvalg: {p['selection']}\n"
+                f"   Modell: {p['model_prob']}% | Marked: {p['market_prob']}% | Gap: +{p['value_gap']}%\n"
+                f"   Odds: {p['best_odds']} | Kelly: {p['kelly_pct']}% | Omega: {p['omega']}/100 [{p['tier']}]\n"
+                f"   Konfidensgrad: {conf}\n"
+                f"   Hvorfor: {why}\n"
+                f"   Advarsel: {warn}"
             )
+            lines.append("")
+
         if len(picks) > 5:
-            lines.append(f"\n_+ {len(picks) - 5} picks til i dashboard_")
+            lines.append(f"+ {len(picks) - 5} picks til i dashboard")
+        lines.append(f"Avvist i dag: {result['total_rejected']} kamper")
 
         text = "\n".join(lines)
         try:
@@ -561,9 +619,9 @@ class MarketScanner:
                     json={
                         "chat_id": self.telegram_chat_id,
                         "text": text,
-                        "parse_mode": "Markdown",
                     }
                 )
+            logger.info(f"[Telegram] Scan notification sent: {len(picks)} picks")
         except Exception as e:
             logger.error(f"Telegram notify failed: {e}")
 
