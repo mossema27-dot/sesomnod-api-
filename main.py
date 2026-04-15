@@ -7445,49 +7445,102 @@ async def debug_dixon_coles():
 @app.get("/score-match")
 async def score_match(home: str = "", away: str = "", league: str = ""):
     """
-    Returns real model probabilities for a match.
+    Returns model probabilities for a match.
     Called internally by MarketScanner. No auth required.
-    Uses existing Dixon-Coles engine — no code duplication.
+    Uses historical win-rate from football-data.co.uk (fast, no penaltyblog fitting).
     """
     if not home or not away:
         return JSONResponse(status_code=400, content={"error": "home and away required"})
 
     try:
-        from services.dixon_coles_engine import get_dixon_coles_probs
-
-        # Dixon-Coles needs a market_home_prob as prior.
-        # Estimate from odds or use 0.40 as neutral prior.
-        market_home_prob = 0.40
-
-        dc = await get_dixon_coles_probs(home, away, market_home_prob)
-
-        # Estimate xG from probabilities (no real xG model available)
-        # Use inverse Poisson approximation: if P(home_win)=0.45 → xG_home ≈ 1.3
+        from services.football_data_fetcher import get_historical_data
+        from services.team_normalizer import normalize_team_name
         import math
-        _hw = max(dc.home_win_prob, 0.05)
-        _aw = max(dc.away_win_prob, 0.05)
-        xg_home_est = round(-math.log(1 - min(_hw, 0.85)) * 1.2, 2)
-        xg_away_est = round(-math.log(1 - min(_aw, 0.85)) * 1.2, 2)
 
-        # BTTS from Dixon-Coles (already calculated)
-        btts_yes = round(dc.btts_prob, 4)
+        df = get_historical_data()
+        if len(df) == 0:
+            return {"home_win": 0.33, "draw": 0.34, "away_win": 0.33,
+                    "xg_home": 1.3, "xg_away": 1.1, "btts_yes": 0.50,
+                    "fallback_used": True, "model": "empty_data"}
 
-        # Debug: include sample of available teams to diagnose matching issues
-        from services.dixon_coles_engine import _available_teams as _at
+        # Normalize team names to match training data
+        home_n = normalize_team_name(home)
+        away_n = normalize_team_name(away)
+
+        # Find matches involving these teams
+        home_matches = df[(df["HomeTeam"] == home_n) | (df["AwayTeam"] == home_n)]
+        away_matches = df[(df["HomeTeam"] == away_n) | (df["AwayTeam"] == away_n)]
+        home_found = len(home_matches) > 0
+        away_found = len(away_matches) > 0
+
+        if not home_found and not away_found:
+            return {"home_win": 0.40, "draw": 0.25, "away_win": 0.35,
+                    "xg_home": 1.3, "xg_away": 1.1, "btts_yes": 0.50,
+                    "fallback_used": True, "model": "no_team_data",
+                    "home_found": False, "away_found": False,
+                    "tried_home": home_n, "tried_away": away_n}
+
+        # Calculate win rates from historical data
+        # Home team: how often does this team win at home?
+        ht_home = df[df["HomeTeam"] == home_n]
+        ht_home_wins = len(ht_home[ht_home["FTHG"] > ht_home["FTAG"]]) if len(ht_home) > 0 else 0
+        ht_home_total = max(len(ht_home), 1)
+
+        # Away team: how often does this team win away?
+        at_away = df[df["AwayTeam"] == away_n]
+        at_away_wins = len(at_away[at_away["FTAG"] > at_away["FTHG"]]) if len(at_away) > 0 else 0
+        at_away_total = max(len(at_away), 1)
+
+        # Home advantage factor from entire dataset
+        all_home_wins = len(df[df["FTHG"] > df["FTAG"]])
+        all_draws = len(df[df["FTHG"] == df["FTAG"]])
+        all_total = max(len(df), 1)
+        base_home_rate = all_home_wins / all_total  # ~0.45
+        base_draw_rate = all_draws / all_total      # ~0.26
+
+        # Team-specific rates
+        home_strength = ht_home_wins / ht_home_total if home_found else base_home_rate
+        away_strength = at_away_wins / at_away_total if away_found else 0.30
+
+        # Combine: home win = blend of home_strength and (1 - away_strength)
+        raw_home = (home_strength * 0.6 + (1 - away_strength) * 0.4)
+        raw_away = (away_strength * 0.6 + (1 - home_strength) * 0.4)
+        raw_draw = max(0.10, 1.0 - raw_home - raw_away)
+
+        # Normalize to sum = 1.0
+        total = raw_home + raw_draw + raw_away
+        hw = round(raw_home / total, 4)
+        dw = round(raw_draw / total, 4)
+        aw = round(1.0 - hw - dw, 4)
+
+        # xG from average goals in team's matches
+        if home_found:
+            xg_h = round(ht_home["FTHG"].mean(), 2)
+        else:
+            xg_h = round(df["FTHG"].mean(), 2)
+        if away_found:
+            xg_a = round(at_away["FTAG"].mean(), 2)
+        else:
+            xg_a = round(df["FTAG"].mean(), 2)
+
+        # BTTS from xG Poisson
+        p_home_scores = 1.0 - math.exp(-max(xg_h, 0.1))
+        p_away_scores = 1.0 - math.exp(-max(xg_a, 0.1))
+        btts = round(p_home_scores * p_away_scores, 4)
+
         return {
-            "home_win": round(dc.home_win_prob, 4),
-            "draw": round(dc.draw_prob, 4),
-            "away_win": round(dc.away_win_prob, 4),
-            "xg_home": xg_home_est,
-            "xg_away": xg_away_est,
-            "btts_yes": btts_yes,
-            "fallback_used": dc.fallback_used,
-            "model": "dixon_coles_v1",
-            "home_found": dc.home_team_found_in_data,
-            "away_found": dc.away_team_found_in_data,
-            "data_sample_size": dc.data_sample_size,
-            "_debug_available_teams_count": len(_at),
-            "_debug_sample_teams": _at[:10] if _at else [],
+            "home_win": hw,
+            "draw": dw,
+            "away_win": aw,
+            "xg_home": xg_h,
+            "xg_away": xg_a,
+            "btts_yes": btts,
+            "fallback_used": not (home_found and away_found),
+            "model": "historical_winrate_v1",
+            "home_found": home_found,
+            "away_found": away_found,
+            "home_matches": len(home_matches),
+            "away_matches": len(away_matches),
         }
 
     except Exception as e:
