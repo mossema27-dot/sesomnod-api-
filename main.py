@@ -5325,6 +5325,34 @@ def _map_scanner_pick(pick: dict, index: int) -> dict:
     }
 
 
+@app.get("/debug/scan-results")
+async def debug_scan_results():
+    """Debug: check if scan_results table exists and has data."""
+    if not db_state.connected or not db_state.pool:
+        return {"error": "DB offline"}
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Check table exists
+            exists = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='scan_results')"
+            )
+            if not exists:
+                return {"table_exists": False, "message": "scan_results table does not exist"}
+            count = await conn.fetchval("SELECT COUNT(*) FROM scan_results")
+            latest = await conn.fetchrow(
+                "SELECT scan_date, total_scanned, total_approved, avg_gap, "
+                "jsonb_array_length(picks_json) as pick_count "
+                "FROM scan_results ORDER BY scan_date DESC LIMIT 1"
+            )
+            return {
+                "table_exists": True,
+                "total_rows": count,
+                "latest": dict(latest) if latest else None,
+            }
+    except Exception as e:
+        return {"error": str(e)[:300]}
+
+
 @app.get("/dagens-kamp")
 async def get_dagens_kamp():
     """
