@@ -5217,17 +5217,161 @@ async def get_pick_analysis(match_id: int):
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
+def _build_why_pick(pick: dict) -> str:
+    """Bygg konkret begrunnelse basert på ekte modelldata."""
+    selection   = pick.get("selection", "")
+    xg_home     = pick.get("xg_home", 0)
+    xg_away     = pick.get("xg_away", 0)
+    model_prob  = pick.get("model_prob", 0)
+    market_prob = pick.get("market_prob", 0)
+    value_gap   = pick.get("value_gap", 0)
+    over25      = pick.get("model_over25", 0)
+    btts        = pick.get("model_btts", 0)
+    home_team   = pick.get("home_team", "Hjemmelaget")
+    away_team   = pick.get("away_team", "Bortelaget")
+    sel_lower   = selection.lower()
+
+    if "over" in sel_lower and "2.5" in sel_lower:
+        total_xg = round(xg_home + xg_away, 1)
+        return (
+            f"Modellen estimerer xG {xg_home:.1f} + {xg_away:.1f} = {total_xg} forventede mål. "
+            f"Poisson-sannsynlighet for Over 2.5 er {over25:.0f}% mot markedets {market_prob:.0f}%."
+        )
+    elif "btts" in sel_lower or "begge" in sel_lower:
+        return (
+            f"{home_team} forventes å score med {xg_home:.1f} xG hjemme, "
+            f"{away_team} med {xg_away:.1f} xG borte. "
+            f"BTTS-sannsynlighet {btts:.0f}% vs markedets {market_prob:.0f}%."
+        )
+    elif away_team.lower() in sel_lower or "away" in sel_lower:
+        return (
+            f"{away_team} har {xg_away:.1f} xG snitt borte. "
+            f"Modellens {model_prob:.0f}% er {value_gap:.1f}% over markedets implisitte sannsynlighet."
+        )
+    else:
+        return (
+            f"{home_team} har {xg_home:.1f} xG snitt hjemme mot bortelagets {xg_away:.1f} xG. "
+            f"Modellen gir {model_prob:.0f}% sannsynlighet mot markedets {market_prob:.0f}%."
+        )
+
+
+def _build_warn_pick(pick: dict) -> str:
+    """Bygg kamp-spesifikk advarsel basert på ekte data."""
+    best_odds = pick.get("best_odds", 2.0)
+    xg_home   = pick.get("xg_home", 0)
+    xg_away   = pick.get("xg_away", 0)
+    kelly_pct = pick.get("kelly_pct", 0)
+    btts      = pick.get("model_btts", 50)
+
+    if best_odds < 1.60:
+        return f"Lave odds ({best_odds:.2f}) gir begrenset oppside — Kelly anbefaler {kelly_pct:.1f}% stake."
+    if abs(xg_home - xg_away) < 0.25:
+        return f"Jevne xG-tall ({xg_home:.1f} vs {xg_away:.1f}) — uavgjort er reell risiko."
+    if btts < 40:
+        return f"Begge lag scorer sannsynlighet er lav ({btts:.0f}%) — defensiv kamp forventet."
+    return "Modellen er basert på historisk form og Poisson — skader og lagoppstilling påvirker ikke analysen."
+
+
+def _confidence_label(omega: int) -> str:
+    if omega >= 70:
+        return "Høy"
+    elif omega >= 45:
+        return "Middels"
+    return "Lav"
+
+
+def _map_scanner_pick(pick: dict, index: int) -> dict:
+    """Map scanner pick → frontend pick format."""
+    omega = pick.get("omega", 0)
+    return {
+        "id":            pick.get("match_id", f"pick_{index}"),
+        "match_name":    pick.get("match", ""),
+        "home_team":     pick.get("home_team", ""),
+        "away_team":     pick.get("away_team", ""),
+        "league":        pick.get("league", ""),
+        "kickoff_cet":   pick.get("commence_time", ""),
+        "selection":     pick.get("selection", ""),
+        "market_type":   pick.get("market_type", "h2h"),
+        "our_pick":      pick.get("selection", ""),
+        "model_prob":    pick.get("model_prob", 0),
+        "market_prob":   pick.get("market_prob", 0),
+        "value_gap":     pick.get("value_gap", 0),
+        "edge":          pick.get("value_gap", 0),
+        "best_odds":     pick.get("best_odds", 0),
+        "odds":          pick.get("best_odds", 0),
+        "home_odds":     pick.get("best_odds", 0) if pick.get("market_type") == "home" else 0,
+        "draw_odds":     0,
+        "away_odds":     pick.get("best_odds", 0) if pick.get("market_type") == "away" else 0,
+        "kelly_pct":     pick.get("kelly_pct", 0),
+        "omega_score":   omega,
+        "atomic_score":  max(1, omega // 10),  # Map 0-100 to 0-9 scale
+        "omega_tier":    pick.get("tier", "MONITORED"),
+        "tier":          pick.get("tier", "MONITORED"),
+        "confidence":    _confidence_label(omega),
+        "xg_home":       pick.get("xg_home", 0),
+        "xg_away":       pick.get("xg_away", 0),
+        "model_btts":    pick.get("model_btts", 0),
+        "model_over25":  pick.get("model_over25", 0),
+        "ev":            pick.get("ev_pct", 0),
+        "sharp_book":    pick.get("sharp_book", False),
+        "line_moved":    pick.get("line_moved", False),
+        "home_win_prob": pick.get("model_prob", 0),
+        "implied_home_prob": pick.get("market_prob", 0),
+        "verdict":       "Gyldig signal",
+        "why":           _build_why_pick(pick),
+        "warn":          _build_warn_pick(pick),
+        "is_completed":  False,
+        "result":        None,
+    }
+
+
 @app.get("/dagens-kamp")
 async def get_dagens_kamp():
+    """
+    Returnerer dagens picks fra siste scanner-kjøring.
+    Leser fra scan_results-tabellen. Mapper scanner-format til frontend-format.
+    Falls back to gamle dagens_kamp-tabellen hvis scan_results er tom.
+    """
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"status": "offline", "data": [], "error": "Database ikke tilgjengelig"})
     try:
+        # Prøv scan_results først (scanner v2 data med ekte modellprobs)
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT picks_json, scan_date, total_scanned, total_approved, avg_gap
+                FROM scan_results
+                ORDER BY scan_date DESC
+                LIMIT 1
+            """)
+
+        if row and row["picks_json"]:
+            raw_picks = json.loads(row["picks_json"]) if isinstance(row["picks_json"], str) else row["picks_json"]
+            total_scanned = row["total_scanned"] or 0
+            total_approved = row["total_approved"] or 0
+
+            picks = [_map_scanner_pick(p, i) for i, p in enumerate(raw_picks)]
+
+            return {
+                "status": "ok",
+                "data": picks,
+                "count": len(picks),
+                "meta": {
+                    "scan_date": str(row["scan_date"]),
+                    "total_scanned": total_scanned,
+                    "total_rejected": total_scanned - total_approved,
+                    "total_approved": total_approved,
+                    "source": "scanner_v2",
+                }
+            }
+
+        # Fallback: gamle dagens_kamp-tabellen
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM dagens_kamp ORDER BY timestamp DESC LIMIT 50"
             )
-        return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows)}
+        return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows), "meta": {"source": "legacy_dagens_kamp"}}
     except Exception as e:
+        logger.error(f"/dagens-kamp error: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
 
 
