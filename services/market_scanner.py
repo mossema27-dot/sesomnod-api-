@@ -507,8 +507,11 @@ class MarketScanner:
 
     async def _save_scan_result(self, result: dict):
         if not self.db:
+            logger.warning("DB pool is None — skipping scan result save")
             return
         try:
+            scan_date_val = date.today()  # Use date object, not string
+            picks_json_str = json.dumps(result.get("top_picks", []))
             async with self.db.acquire() as conn:
                 await conn.execute("""
                     INSERT INTO scan_results
@@ -520,14 +523,15 @@ class MarketScanner:
                       avg_gap        = EXCLUDED.avg_gap,
                       picks_json     = EXCLUDED.picks_json
                 """,
-                result["scan_date"],
-                result["total_scanned"],
-                result["total_approved"],
-                result["avg_value_gap_top10"],
-                json.dumps(result["top_picks"]),
+                scan_date_val,
+                result.get("total_scanned", 0),
+                result.get("total_approved", 0),
+                result.get("avg_value_gap_top10", 0.0),
+                picks_json_str,
                 )
+            logger.info(f"Scan results saved: {scan_date_val} — {result.get('total_approved', 0)} picks")
         except Exception as e:
-            logger.error(f"DB save scan failed: {e}")
+            logger.error(f"DB save scan failed: {e}", exc_info=True)
 
     # ── NOTIFICATIONS ─────────────────────────────────────────────────────────
 
