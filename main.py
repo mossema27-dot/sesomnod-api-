@@ -5280,7 +5280,7 @@ def _confidence_label(omega: int) -> str:
     return "Lav"
 
 
-def _map_scanner_pick(pick: dict, index: int) -> dict:
+def _map_scanner_pick(pick: dict, index: int, total_rejected: int = 0) -> dict:
     """Map scanner pick → frontend pick format."""
     omega = pick.get("omega", 0)
     return {
@@ -5320,6 +5320,7 @@ def _map_scanner_pick(pick: dict, index: int) -> dict:
         "verdict":       "Gyldig signal",
         "why":           _build_why_pick(pick),
         "warn":          _build_warn_pick(pick),
+        "rejected_today": total_rejected,
         "is_completed":  False,
         "result":        None,
     }
@@ -5377,7 +5378,8 @@ async def get_dagens_kamp():
             total_scanned = row["total_scanned"] or 0
             total_approved = row["total_approved"] or 0
 
-            picks = [_map_scanner_pick(p, i) for i, p in enumerate(raw_picks)]
+            total_rejected = total_scanned - total_approved
+            picks = [_map_scanner_pick(p, i, total_rejected) for i, p in enumerate(raw_picks)]
 
             return {
                 "status": "ok",
@@ -5386,7 +5388,7 @@ async def get_dagens_kamp():
                 "meta": {
                     "scan_date": str(row["scan_date"]),
                     "total_scanned": total_scanned,
-                    "total_rejected": total_scanned - total_approved,
+                    "total_rejected": total_rejected,
                     "total_approved": total_approved,
                     "source": "scanner_v2",
                 }
