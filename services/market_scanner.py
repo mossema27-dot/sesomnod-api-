@@ -496,6 +496,7 @@ class MarketScanner:
         await self._save_scan_result(result)
         await self._notify_telegram(result)
         await self._log_to_notion(top_picks)
+        await self._sync_to_picks_v2(top_picks)
 
         logger.info(
             f"MarketScanner done: {len(all_games)} scanned → "
@@ -662,3 +663,97 @@ class MarketScanner:
                     await c.post("https://api.notion.com/v1/pages", headers=headers, json=payload)
                 except Exception as e:
                     logger.error(f"Notion log failed for {pick['match']}: {e}")
+
+    # ── PICKS_V2 SYNC ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _selection_to_predicted_outcome(selection: str) -> str:
+        """Map scanner selection text to predicted_outcome enum."""
+        sel = (selection or "").lower()
+        if "over" in sel and "2.5" in sel:
+            return "OVER_25"
+        if "btts" in sel or "both" in sel or "begge" in sel:
+            return "BTTS_YES"
+        if "draw" in sel or "uavgjort" in sel:
+            return "DRAW"
+        if "away" in sel or "borte" in sel:
+            return "AWAY_WIN"
+        # Check if selection contains away team name (e.g. "Toulouse win")
+        # Default to HOME_WIN for "X win" patterns
+        return "HOME_WIN"
+
+    async def _sync_to_picks_v2(self, picks: list[dict]):
+        """Post scanner top-picks to picks_v2 for Phase 0 tracking."""
+        if not self.db:
+            return
+        try:
+            async with self.db.acquire() as conn:
+                # Ensure columns exist
+                await conn.execute("""
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS predicted_outcome VARCHAR(20);
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS model_prob FLOAT;
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS market_prob FLOAT;
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS value_gap FLOAT;
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS kelly_pct FLOAT;
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS phase0 BOOLEAN DEFAULT TRUE;
+                """)
+
+                inserted = 0
+                for pick in picks:
+                    if pick.get("fallback_used"):
+                        continue
+                    home = pick.get("home_team", "")
+                    away = pick.get("away_team", "")
+                    match_name = pick.get("match", f"{home} vs {away}")
+                    selection = pick.get("selection", "")
+                    predicted = self._selection_to_predicted_outcome(selection)
+
+                    # Skip if already exists (same match + odds = same pick)
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM picks_v2 WHERE match_name = $1 AND odds = $2",
+                        match_name, float(pick.get("best_odds", 0))
+                    )
+                    if exists:
+                        continue
+
+                    kickoff_str = pick.get("commence_time", "")
+                    kickoff_dt = None
+                    if kickoff_str:
+                        try:
+                            from datetime import datetime, timezone
+                            kickoff_dt = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+
+                    await conn.execute("""
+                        INSERT INTO picks_v2 (
+                            match_name, home_team, away_team, league, kickoff_time,
+                            odds, soft_edge, soft_ev, atomic_score,
+                            tier, tier_label, result, status,
+                            predicted_outcome, model_prob, market_prob, value_gap, kelly_pct, phase0
+                        ) VALUES (
+                            $1, $2, $3, $4, $5,
+                            $6, $7, $8, $9,
+                            $10, $11, NULL, 'PENDING',
+                            $12, $13, $14, $15, $16, TRUE
+                        )
+                    """,
+                        match_name, home, away, pick.get("league", ""),
+                        kickoff_dt,
+                        float(pick.get("best_odds", 0)),
+                        float(pick.get("value_gap", 0)),
+                        float(pick.get("ev_pct", 0)),
+                        int(pick.get("omega", 0)),
+                        pick.get("tier", "EDGE"),
+                        pick.get("tier", "EDGE"),
+                        predicted,
+                        float(pick.get("model_prob", 0)),
+                        float(pick.get("market_prob", 0)),
+                        float(pick.get("value_gap", 0)),
+                        float(pick.get("kelly_pct", 0)),
+                    )
+                    inserted += 1
+
+                logger.info(f"Synced {inserted} picks to picks_v2 (Phase 0)")
+        except Exception as e:
+            logger.error(f"picks_v2 sync failed: {e}", exc_info=True)

@@ -515,6 +515,7 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_velocity VARCHAR(30);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_xg VARCHAR(30);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_weather VARCHAR(30);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS predicted_outcome VARCHAR(20);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_home FLOAT;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_away FLOAT;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
@@ -2517,6 +2518,23 @@ async def run_analysis():
 # ─────────────────────────────────────────────────────────
 # SYNC dagens_kamp → picks_v2 (called after every INSERT into dagens_kamp)
 # ─────────────────────────────────────────────────────────
+def _selection_to_predicted_outcome(selection: str) -> str:
+    """Map pick selection text to predicted_outcome enum for auto-settlement."""
+    sel = (selection or "").lower()
+    if "over" in sel and "2.5" in sel:
+        return "OVER_25"
+    if "btts" in sel or "both" in sel or "begge" in sel:
+        return "BTTS_YES"
+    if "under" in sel and "2.5" in sel:
+        return "UNDER_25"
+    if "draw" in sel or "uavgjort" in sel:
+        return "DRAW"
+    if "away" in sel or "borte" in sel:
+        return "AWAY_WIN"
+    # "X vinner" or "home win" or default
+    return "HOME_WIN"
+
+
 async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
     """Mirror a dagens_kamp row into picks_v2 so every pick is tracked."""
     if not db_state.connected or not db_state.pool:
@@ -2531,6 +2549,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                     kelly_stake, signals_triggered,
                     telegram_posted, result, status,
                     home_odds_raw, draw_odds_raw, away_odds_raw, prob_source,
+                    predicted_outcome,
                     created_at, updated_at, timestamp
                 ) VALUES (
                     $1, $2, $3, $4,
@@ -2539,6 +2558,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                     $12, $13,
                     $14, $15, 'PENDING',
                     $16, $17, $18, $19,
+                    $20,
                     NOW(), NOW(), NOW()
                 )
             """,
@@ -2561,6 +2581,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                 float(pick.get("draw_odds_raw")) if pick.get("draw_odds_raw") else None,
                 float(pick.get("away_odds_raw")) if pick.get("away_odds_raw") else None,
                 "implied" if pick.get("home_odds_raw") and pick.get("draw_odds_raw") and pick.get("away_odds_raw") else None,
+                _selection_to_predicted_outcome(pick.get("pick") or pick.get("selection") or ""),
             )
         logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id}: {pick.get('match') or pick.get('home_team','?')}")
     except Exception as e:
@@ -6758,12 +6779,14 @@ async def add_pick(payload: dict):
     try:
         kickoff_dt = datetime.fromisoformat(payload["kickoff"])
         async with db_state.pool.acquire() as conn:
+            predicted = _selection_to_predicted_outcome(payload.get("pick", ""))
             row_id = await conn.fetchval("""
                 INSERT INTO dagens_kamp
                     (match, league, home_team, away_team, pick, odds, stake,
                      edge, ev, confidence, kickoff, telegram_posted,
-                     market_type, score, bookmaker_count, pinnacle_opening)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15)
+                     market_type, score, bookmaker_count, pinnacle_opening,
+                     predicted_outcome)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15,$16)
                 RETURNING id
             """,
                 f"{payload['home_team']} vs {payload['away_team']}",
@@ -6781,6 +6804,7 @@ async def add_pick(payload: dict):
                 float(payload.get("score", 0)) if payload.get("score") else None,
                 int(payload.get("bookmaker_count", 0)) if payload.get("bookmaker_count") else None,
                 float(payload.get("pinnacle_opening", 0)) if payload.get("pinnacle_opening") else None,
+                predicted,
             )
         pick_data = {**payload, "id": row_id, "kickoff": kickoff_dt}
         await _sync_to_picks_v2(pick_data, row_id)
