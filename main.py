@@ -516,6 +516,9 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_xg VARCHAR(30);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS signal_weather VARCHAR(30);
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS predicted_outcome VARCHAR(20);
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS rejected_markets JSONB DEFAULT '[]';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS context_adjustments JSONB DEFAULT '[]';
+                ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS combined_xg FLOAT DEFAULT 0.0;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_home FLOAT;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS xg_divergence_away FLOAT;
                 ALTER TABLE dagens_kamp ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
@@ -3794,6 +3797,9 @@ async def _auto_settle_results():
                 ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS outcome VARCHAR(10);
                 ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'PENDING';
                 ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS brier_score NUMERIC(5,4);
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS rejected_markets JSONB DEFAULT '[]';
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS context_adjustments JSONB DEFAULT '[]';
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS combined_xg FLOAT DEFAULT 0.0;
             """)
 
             pending = await conn.fetch("""
@@ -7976,6 +7982,174 @@ async def clean_duplicate_receipts():
             }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+# ── V3 MARKET INTELLIGENCE ENDPOINTS ─────────────────────────────────────────
+
+@app.get("/v3/run-full-scan")
+async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
+    """Market Intelligence Scanner v3 — evaluates all markets per match using Poisson matrix."""
+    expected_key = os.environ.get("INTERNAL_API_KEY", "sesomnod-internal-2026")
+    if x_api_key != expected_key:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        from workers.market_scanner_v2 import MarketScannerV2, MatchData
+        from services.market_extractor import MarketExtractor
+        from services.market_selection_engine import MarketSelectionEngine
+        from services.context_engine import ContextEngine
+
+        # Reuse existing score-match data for lambda values
+        from services.football_data_fetcher import get_historical_data
+        from services.team_normalizer import normalize_team_name
+
+        df = get_historical_data()
+        avg_home = df["FTHG"].mean() if len(df) > 0 else 1.5
+        avg_away = df["FTAG"].mean() if len(df) > 0 else 1.2
+
+        extractor = MarketExtractor(max_goals=10)
+        selector = MarketSelectionEngine()
+        context_engine = ContextEngine()
+
+        # Fetch odds from The Odds API (reuse v2 scanner's method)
+        if not market_scanner:
+            raise HTTPException(status_code=503, detail="Scanner not initialized")
+
+        # Run v2 scan first to get matches with odds
+        v2_result = await market_scanner.run_full_scan()
+        v2_picks = v2_result.get("top_picks", [])
+
+        # Enhance each pick with market intelligence
+        v3_picks = []
+        for pick in v2_picks:
+            xg_h = float(pick.get("xg_home", avg_home))
+            xg_a = float(pick.get("xg_away", avg_away))
+
+            # Apply context (with safe defaults)
+            try:
+                context = {
+                    'weather': {'wind_ms': 0, 'rain_mm': 0, 'temp_c': 15},
+                    'travel': {'travel_km': 0, 'hours_since_arrival': 72},
+                    'european': {'home_played_europe': False, 'away_played_europe': False, 'days_since_european': 10},
+                    'referee': {'avg_cards': 3.5, 'avg_fouls': 20, 'penalty_rate': 0.12},
+                    'derby': {'is_derby': False},
+                    'motivation': {'home_position': 10, 'away_position': 10, 'games_remaining': 15,
+                                   'home_points_from_safety': 15, 'away_points_from_safety': 15}
+                }
+                adj_h, adj_a, ctx_logs = context_engine.apply_all(xg_h, xg_a, context)
+            except Exception:
+                adj_h, adj_a, ctx_logs = xg_h, xg_a, []
+
+            # Extract all markets from Poisson matrix
+            markets = extractor.extract_all_markets(adj_h, adj_a)
+
+            # Build market_odds from pick data
+            market_odds = {
+                'home_win': float(pick.get("best_odds", 2.0)) if pick.get("market_type") == "home" else 2.5,
+                'draw': 3.3,
+                'away_win': float(pick.get("best_odds", 3.0)) if pick.get("market_type") == "away" else 3.5,
+                'over_25': float(pick.get("best_odds", 2.0)) if "over" in (pick.get("selection", "")).lower() else 1.9,
+            }
+
+            # Evaluate which market is best
+            try:
+                best = selector.select_best_market(markets, market_odds, league=pick.get("league", "default"))
+            except Exception:
+                best = None
+
+            # Build rejected markets list
+            rejected = []
+            if best:
+                for m_name in ['home_win', 'draw', 'away_win', 'over_25', 'btts']:
+                    if m_name != (best.get("market_type") if best else ""):
+                        edge = getattr(markets, f"P_{m_name}", 0) - (1.0 / market_odds.get(m_name, 2.0)) if market_odds.get(m_name) else 0
+                        rejected.append({"market": m_name, "edge": f"{edge*100:.1f}%", "reason": "Lower composite score"})
+
+            v3_pick = {
+                **pick,
+                "combined_xg": round(adj_h + adj_a, 2),
+                "context_adjustments": [str(l) for l in ctx_logs] if ctx_logs else [],
+                "rejected_markets": rejected[:5],
+                "all_markets": {
+                    "P_home_win": round(markets.P_home_win, 4),
+                    "P_draw": round(markets.P_draw, 4),
+                    "P_away_win": round(markets.P_away_win, 4),
+                    "P_over_25": round(markets.P_over_25, 4),
+                    "P_btts": round(markets.P_btts, 4),
+                    "P_over_15": round(markets.P_over_15, 4),
+                    "P_over_35": round(markets.P_over_35, 4),
+                },
+                "version": "v3",
+            }
+            v3_picks.append(v3_pick)
+
+        return JSONResponse(content={
+            "version": "v3",
+            "total_scanned": v2_result.get("total_scanned", 0),
+            "total_approved": len(v3_picks),
+            "total_rejected": v2_result.get("total_rejected", 0),
+            "top_picks": v3_picks,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/v3/run-full-scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+@app.get("/v3/dagens-kamp")
+async def get_dagens_kamp_v3():
+    """Returns today's picks with full market intelligence — all markets, context, rejected."""
+    try:
+        # Run v3 scan inline (uses cached v2 data)
+        from workers.market_scanner_v2 import MarketScannerV2
+        # Reuse v2 data from scan_results + enhance
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT picks_json, scan_date, total_scanned, total_approved FROM scan_results ORDER BY scan_date DESC LIMIT 1"
+            )
+        if not row or not row["picks_json"]:
+            return JSONResponse(content={"picks": [], "meta": {"source": "no_scan"}})
+
+        raw = json.loads(row["picks_json"]) if isinstance(row["picks_json"], str) else row["picks_json"]
+        total_scanned = row["total_scanned"] or 0
+        total_approved = row["total_approved"] or 0
+
+        from services.market_extractor import MarketExtractor
+        extractor = MarketExtractor(max_goals=10)
+
+        picks = []
+        for i, p in enumerate(raw):
+            xg_h = float(p.get("xg_home", 1.3))
+            xg_a = float(p.get("xg_away", 1.1))
+            markets = extractor.extract_all_markets(xg_h, xg_a)
+
+            picks.append({
+                **_map_scanner_pick(p, i, total_scanned - total_approved),
+                "combined_xg": round(xg_h + xg_a, 2),
+                "all_markets": {
+                    "P_home_win": round(markets.P_home_win, 4),
+                    "P_draw": round(markets.P_draw, 4),
+                    "P_away_win": round(markets.P_away_win, 4),
+                    "P_over_25": round(markets.P_over_25, 4),
+                    "P_btts": round(markets.P_btts, 4),
+                },
+                "version": "v3",
+            })
+
+        return JSONResponse(content={
+            "picks": picks,
+            "meta": {
+                "scan_date": str(row["scan_date"]),
+                "total_scanned": total_scanned,
+                "total_approved": len(picks),
+                "total_rejected": total_scanned - total_approved,
+                "source": "scanner_v3_poisson",
+            }
+        })
+    except Exception as e:
+        logger.error(f"/v3/dagens-kamp error: {e}")
+        return JSONResponse(content={"picks": [], "meta": {"source": "error", "detail": str(e)[:200]}})
 
 
 if __name__ == "__main__":
