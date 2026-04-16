@@ -516,8 +516,12 @@ class MarketScanner:
             logger.warning("DB pool is None — skipping scan result save")
             return
         try:
-            scan_date_val = date.today()  # Use date object, not string
-            picks_json_str = json.dumps(result.get("top_picks", []))
+            top_picks = result.get("top_picks", [])
+            if not top_picks:
+                logger.warning("v2 scan returned 0 picks — scan_results NOT overwritten")
+                return
+            scan_date_val = date.today()
+            picks_json_str = json.dumps(top_picks)
             async with self.db.acquire() as conn:
                 await conn.execute("""
                     INSERT INTO scan_results

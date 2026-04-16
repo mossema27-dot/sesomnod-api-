@@ -8136,23 +8136,26 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
 
         # Save v3 results to scan_results
         try:
-            async with db_state.pool.acquire() as conn:
-                from datetime import date
-                await conn.execute("""
-                    INSERT INTO scan_results (scan_date, total_scanned, total_approved, avg_gap, picks_json)
-                    VALUES ($1, $2, $3, $4, $5::jsonb)
-                    ON CONFLICT (scan_date) DO UPDATE SET
-                        total_scanned = EXCLUDED.total_scanned,
-                        total_approved = EXCLUDED.total_approved,
-                        avg_gap = EXCLUDED.avg_gap,
-                        picks_json = EXCLUDED.picks_json
-                """,
-                    date.today(),
-                    v2_result.get("total_scanned", 0),
-                    len(v3_picks),
-                    round(sum(p["value_gap"] for p in v3_picks) / max(len(v3_picks), 1), 1),
-                    json.dumps(v3_picks),
-                )
+            if not v3_picks:
+                logger.warning("v3 scan returned 0 picks — scan_results NOT overwritten")
+            else:
+                async with db_state.pool.acquire() as conn:
+                    from datetime import date
+                    await conn.execute("""
+                        INSERT INTO scan_results (scan_date, total_scanned, total_approved, avg_gap, picks_json)
+                        VALUES ($1, $2, $3, $4, $5::jsonb)
+                        ON CONFLICT (scan_date) DO UPDATE SET
+                            total_scanned = EXCLUDED.total_scanned,
+                            total_approved = EXCLUDED.total_approved,
+                            avg_gap = EXCLUDED.avg_gap,
+                            picks_json = EXCLUDED.picks_json
+                    """,
+                        date.today(),
+                        v2_result.get("total_scanned", 0),
+                        len(v3_picks),
+                        round(sum(p.get("value_gap", 0) for p in v3_picks) / max(len(v3_picks), 1), 1),
+                        json.dumps(v3_picks),
+                    )
         except Exception as db_err:
             logger.warning(f"v3 scan_results save failed: {db_err}")
 
