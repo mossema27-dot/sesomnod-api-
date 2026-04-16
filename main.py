@@ -7834,6 +7834,51 @@ async def deep_scan_v2(top_n: int = 3, x_api_key: str = Header(None, alias="X-AP
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
+# ── ADMIN: Clean duplicate receipts ──────────────────────────────────────────
+
+@app.post("/admin/clean-duplicate-receipts")
+async def clean_duplicate_receipts():
+    """Remove duplicate pick_receipts, keeping the earliest (lowest id) for each match+kickoff."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            # Count before
+            before = await conn.fetchval("SELECT COUNT(*) FROM pick_receipts")
+
+            # Delete duplicates — keep MIN(id) per group
+            deleted = await conn.execute("""
+                DELETE FROM pick_receipts
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM pick_receipts
+                    GROUP BY match_name, kickoff
+                )
+            """)
+
+            # Add unique constraint if not exists
+            try:
+                await conn.execute("""
+                    ALTER TABLE pick_receipts
+                    ADD CONSTRAINT unique_receipt_match_kickoff
+                    UNIQUE (match_name, kickoff)
+                """)
+                constraint_added = True
+            except Exception:
+                constraint_added = False  # Already exists
+
+            after = await conn.fetchval("SELECT COUNT(*) FROM pick_receipts")
+
+            return {
+                "before": before,
+                "after": after,
+                "deleted": before - after,
+                "unique_constraint_added": constraint_added,
+            }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"Fyrer opp Uvicorn på port {cfg.PORT}...")
