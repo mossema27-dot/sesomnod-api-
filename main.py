@@ -7855,6 +7855,31 @@ async def fix_result(body: dict):
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
+# ── ADMIN: Delete specific dagens_kamp row by match + odds ───────────────────
+
+@app.post("/admin/delete-pick")
+async def admin_delete_pick(body: dict):
+    """Delete a single dagens_kamp row by match name + odds. For dedup only."""
+    match_name = body.get("match")
+    odds = body.get("odds")
+    if not match_name or not odds:
+        return JSONResponse(status_code=400, content={"error": "match and odds required"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, match, odds, result FROM dagens_kamp WHERE match ILIKE $1 AND odds = $2 LIMIT 1",
+                f"%{match_name}%", float(odds)
+            )
+            if not row:
+                return {"deleted": False, "reason": "no matching row"}
+            await conn.execute("DELETE FROM dagens_kamp WHERE id = $1", row["id"])
+            return {"deleted": True, "id": row["id"], "match": row["match"], "odds": float(row["odds"]), "result": row["result"]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 # ── ADMIN: Clean duplicate receipts ──────────────────────────────────────────
 
 @app.post("/admin/clean-duplicate-receipts")
