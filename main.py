@@ -7834,6 +7834,27 @@ async def deep_scan_v2(top_n: int = 3, x_api_key: str = Header(None, alias="X-AP
         raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
+# ── ADMIN: Fix result on dagens_kamp by ID ──────────────────────────────────
+
+@app.post("/admin/fix-result")
+async def fix_result(body: dict):
+    """Set result field on dagens_kamp row. Used to fix VOID → WIN/LOSS."""
+    dk_id = body.get("id")
+    result = body.get("result")
+    if not dk_id or result not in ("WIN", "LOSS", "VOID"):
+        return JSONResponse(status_code=400, content={"error": "id and result (WIN/LOSS/VOID) required"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            updated = await conn.execute(
+                "UPDATE dagens_kamp SET result = $1 WHERE id = $2", result, dk_id
+            )
+        return {"id": dk_id, "result": result, "updated": str(updated)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
 # ── ADMIN: Clean duplicate receipts ──────────────────────────────────────────
 
 @app.post("/admin/clean-duplicate-receipts")
