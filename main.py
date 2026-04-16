@@ -7869,7 +7869,10 @@ async def admin_delete_pick(body: dict):
     try:
         async with db_state.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, match, odds, result FROM dagens_kamp WHERE match ILIKE $1 AND odds = $2 LIMIT 1",
+                """SELECT id, match, home_team, away_team, odds, result FROM dagens_kamp
+                   WHERE (match ILIKE $1 OR home_team ILIKE $1 OR away_team ILIKE $1)
+                     AND odds = $2
+                   LIMIT 1""",
                 f"%{match_name}%", float(odds)
             )
             if not row:
