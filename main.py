@@ -8028,43 +8028,28 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
         v2_result = await market_scanner.run_full_scan()
         v2_picks = v2_result.get("top_picks", [])
 
-        # Step 2: For each v2 pick, run MarketSelectionEngine to find the TRUE best market
+        # Step 2: HYBRID — MarketSelectionEngine picks WHICH market, v2 keeps calibrated edge
         v3_picks = []
         for pick in v2_picks:
             xg_h = float(pick.get("xg_home") or 1.3)
             xg_a = float(pick.get("xg_away") or 1.1)
 
-            # Context adjustment (safe defaults)
-            try:
-                ctx = {
-                    'weather': {'wind_ms': 0, 'rain_mm': 0, 'temp_c': 15},
-                    'travel': {'travel_km': 0, 'hours_since_arrival': 72},
-                    'european': {'home_played_europe': False, 'away_played_europe': False, 'days_since_european': 10},
-                    'referee': {'avg_cards': 3.5, 'avg_fouls': 20, 'penalty_rate': 0.12},
-                    'derby': {'is_derby': False},
-                    'motivation': {'home_position': 10, 'away_position': 10, 'games_remaining': 15,
-                                   'home_points_from_safety': 15, 'away_points_from_safety': 15},
-                }
-                adj_h, adj_a, ctx_logs = ctx_engine.apply_all(xg_h, xg_a, ctx)
-            except Exception:
-                adj_h, adj_a, ctx_logs = xg_h, xg_a, []
+            # Poisson market probabilities
+            markets = extractor.extract_all_markets(xg_h, xg_a)
+            market_probs = {
+                'home_win': markets.P_home_win, 'draw': markets.P_draw,
+                'away_win': markets.P_away_win, 'over_25': markets.P_over_25,
+                'under_25': markets.P_under_25, 'btts': markets.P_btts,
+                'over_15': markets.P_over_15, 'over_35': markets.P_over_35,
+            }
 
-            # Extract Poisson probabilities
-            markets = extractor.extract_all_markets(adj_h, adj_a)
-
-            # Build odds dict — use v2's best_odds + reconstruct missing markets
-            # Build market_odds from ALL odds in pick (added by v2 scanner)
+            # All available odds from v2 scanner
             market_odds = {}
-            if pick.get('home_odds'):
-                market_odds['home_win'] = float(pick['home_odds'])
-            if pick.get('draw_odds'):
-                market_odds['draw'] = float(pick['draw_odds'])
-            if pick.get('away_odds'):
-                market_odds['away_win'] = float(pick['away_odds'])
-            if pick.get('over25_odds'):
-                market_odds['over_25'] = float(pick['over25_odds'])
-            if pick.get('under25_odds'):
-                market_odds['under_25'] = float(pick['under25_odds'])
+            if pick.get('home_odds'): market_odds['home_win'] = float(pick['home_odds'])
+            if pick.get('draw_odds'): market_odds['draw'] = float(pick['draw_odds'])
+            if pick.get('away_odds'): market_odds['away_win'] = float(pick['away_odds'])
+            if pick.get('over25_odds'): market_odds['over_25'] = float(pick['over25_odds'])
+            if pick.get('under25_odds'): market_odds['under_25'] = float(pick['under25_odds'])
 
             # Hours to kickoff
             try:
@@ -8074,58 +8059,73 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
             except Exception:
                 hours = 24.0
 
-            # Run MarketSelectionEngine
             league_key = _odds_api_league_to_engine(pick.get("league", ""))
+
+            # Run engine to pick best market
             try:
                 sel = selector.select_best_market(
-                    market_probs={
-                        'home_win': markets.P_home_win, 'draw': markets.P_draw,
-                        'away_win': markets.P_away_win, 'over_25': markets.P_over_25,
-                        'under_25': markets.P_under_25, 'btts': markets.P_btts,
-                        'over_15': markets.P_over_15, 'over_35': markets.P_over_35,
-                    },
-                    market_odds=market_odds,
-                    league=league_key,
-                    hours_to_kickoff=hours,
+                    market_probs=market_probs, market_odds=market_odds,
+                    league=league_key, hours_to_kickoff=hours,
                 )
-                # sel is a MarketSelectionResult with .market, .selection, .edge, .model_prob, .market_prob, .rejected_markets etc.
-                v3_market_type = sel.market
-                v3_selection = sel.selection
-                v3_model_prob = round(sel.model_prob * 100, 1)
-                v3_market_prob = round(sel.market_prob * 100, 1)
-                v3_edge = round(sel.edge * 100, 2)
-                v3_rejected = sel.rejected_markets or []  # Already list of dicts with market/edge/reason
+
+                # Filter: if engine edge > 50%, Poisson is miscalibrated — skip to next best
+                if sel.edge > 0.50 and len(market_odds) > 1:
+                    rejected_uncal = {
+                        'market': sel.market, 'edge': f"{sel.edge*100:.1f}%",
+                        'reason': 'model_not_calibrated',
+                    }
+                    filtered_odds = {k: v for k, v in market_odds.items() if k != sel.market}
+                    if filtered_odds:
+                        try:
+                            sel2 = selector.select_best_market(
+                                market_probs=market_probs, market_odds=filtered_odds,
+                                league=league_key, hours_to_kickoff=hours,
+                            )
+                            # If second choice also > 50%, keep original
+                            if sel2.edge <= 0.50:
+                                rej_list = list(sel2.rejected_markets or [])
+                                rej_list.insert(0, rejected_uncal)
+                                sel = sel2
+                                sel.rejected_markets = rej_list
+                            else:
+                                sel.rejected_markets = list(sel.rejected_markets or [])
+                                sel.rejected_markets.insert(0, {
+                                    'market': sel2.market, 'edge': f"{sel2.edge*100:.1f}%",
+                                    'reason': 'model_not_calibrated',
+                                })
+                        except Exception:
+                            pass
+
+                # HYBRID: Use engine's market choice but KEEP v2's calibrated edge
+                v3_pick = {
+                    **pick,
+                    # Engine decides WHICH market
+                    "market_type": sel.market,
+                    "selection": sel.selection,
+                    "model_prob": round(sel.model_prob * 100, 1),
+                    "market_prob": round(sel.market_prob * 100, 1),
+                    "predicted_outcome": _market_to_predicted_outcome(sel.market),
+                    "rejected_markets": sel.rejected_markets or [],
+                    # V2 keeps calibrated value — NEVER overwrite these
+                    # "value_gap": KEPT from v2 pick via **pick
+                    # "omega": KEPT from v2
+                    # "tier": KEPT from v2
+                    # "kelly_pct": KEPT from v2
+                    "combined_xg": round(xg_h + xg_a, 2),
+                    "all_markets": {
+                        "P_home_win": round(markets.P_home_win, 4),
+                        "P_draw": round(markets.P_draw, 4),
+                        "P_away_win": round(markets.P_away_win, 4),
+                        "P_over_25": round(markets.P_over_25, 4),
+                        "P_btts": round(markets.P_btts, 4),
+                    },
+                    "version": "v3",
+                }
+
             except Exception as eng_err:
                 logger.warning(f"MarketSelectionEngine failed for {pick.get('match')}: {eng_err}")
-                # Fallback to v2 values
-                v3_market_type = pick.get("market_type", "home")
-                v3_selection = pick.get("selection", "")
-                v3_model_prob = float(pick.get("model_prob") or 0)
-                v3_market_prob = float(pick.get("market_prob") or 0)
-                v3_edge = float(pick.get("value_gap") or 0)
-                v3_rejected = []
+                v3_pick = {**pick, "version": "v3", "rejected_markets": [], "combined_xg": round(xg_h + xg_a, 2)}
 
-            v3_pick = {
-                **pick,
-                "market_type": v3_market_type,
-                "selection": v3_selection,
-                "model_prob": v3_model_prob,
-                "market_prob": v3_market_prob,
-                "value_gap": v3_edge,
-                "edge": v3_edge,
-                "predicted_outcome": _market_to_predicted_outcome(v3_market_type),
-                "combined_xg": round(adj_h + adj_a, 2),
-                "context_adjustments": [str(l) for l in ctx_logs] if ctx_logs else [],
-                "rejected_markets": v3_rejected,
-                "all_markets": {
-                    "P_home_win": round(markets.P_home_win, 4),
-                    "P_draw": round(markets.P_draw, 4),
-                    "P_away_win": round(markets.P_away_win, 4),
-                    "P_over_25": round(markets.P_over_25, 4),
-                    "P_btts": round(markets.P_btts, 4),
-                },
-                "version": "v3",
-            }
             v3_picks.append(v3_pick)
 
         # Save v3 results to scan_results
