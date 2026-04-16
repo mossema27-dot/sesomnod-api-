@@ -447,6 +447,11 @@ class MarketScanner:
             "away_team": away,
             "league": sport,
             "commence_time": commence,
+            "home_odds": round(best_home, 2) if best_home > 1.0 else None,
+            "draw_odds": round(best_draw, 2) if best_draw > 1.0 else None,
+            "away_odds": round(best_away, 2) if best_away > 1.0 else None,
+            "over25_odds": round(best_over25, 2) if best_over25 > 1.0 else None,
+            "under25_odds": round(best_under25, 2) if best_under25 > 1.0 else None,
             **best,
         }
 

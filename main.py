@@ -8053,15 +8053,18 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
             markets = extractor.extract_all_markets(adj_h, adj_a)
 
             # Build odds dict — use v2's best_odds + reconstruct missing markets
-            best_odds_val = float(pick.get("best_odds") or 2.0)
-            mt = pick.get("market_type", "home")
+            # Build market_odds from ALL odds in pick (added by v2 scanner)
             market_odds = {}
-            if mt == "home":
-                market_odds['home_win'] = best_odds_val
-            elif mt == "away":
-                market_odds['away_win'] = best_odds_val
-            elif "over" in (pick.get("selection") or "").lower():
-                market_odds['over_25'] = best_odds_val
+            if pick.get('home_odds'):
+                market_odds['home_win'] = float(pick['home_odds'])
+            if pick.get('draw_odds'):
+                market_odds['draw'] = float(pick['draw_odds'])
+            if pick.get('away_odds'):
+                market_odds['away_win'] = float(pick['away_odds'])
+            if pick.get('over25_odds'):
+                market_odds['over_25'] = float(pick['over25_odds'])
+            if pick.get('under25_odds'):
+                market_odds['under_25'] = float(pick['under25_odds'])
 
             # Hours to kickoff
             try:
