@@ -7894,6 +7894,9 @@ async def admin_delete_pick(body: dict):
                         "reason": f"found {len(rows)} rows but none with odds={target}",
                         "found": [{"id": r["id"], "match": r["match"], "odds": float(r["odds"] or 0), "result": r["result"]} for r in rows]
                     }
+                # Clean up FK references first
+                await conn.execute("DELETE FROM clv_records WHERE pick_id = $1", match_row["id"])
+                await conn.execute("DELETE FROM pick_receipts WHERE pick_id = $1", match_row["id"])
                 await conn.execute("DELETE FROM dagens_kamp WHERE id = $1", match_row["id"])
                 return {"deleted": True, "id": match_row["id"], "match": match_row["match"], "odds": float(match_row["odds"]), "result": match_row["result"]}
             else:
