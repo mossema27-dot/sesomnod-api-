@@ -8097,6 +8097,11 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
                             pass
 
                 # HYBRID: Use engine's market choice but KEEP v2's calibrated edge
+                v2_value_gap = pick.get("value_gap")  # Save BEFORE spread
+                v2_omega = pick.get("omega")
+                v2_tier = pick.get("tier")
+                v2_kelly = pick.get("kelly_pct")
+
                 v3_pick = {
                     **pick,
                     # Engine decides WHICH market
@@ -8106,11 +8111,12 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
                     "market_prob": round(sel.market_prob * 100, 1),
                     "predicted_outcome": _market_to_predicted_outcome(sel.market),
                     "rejected_markets": sel.rejected_markets or [],
-                    # V2 keeps calibrated value — NEVER overwrite these
-                    # "value_gap": KEPT from v2 pick via **pick
-                    # "omega": KEPT from v2
-                    # "tier": KEPT from v2
-                    # "kelly_pct": KEPT from v2
+                    # FORCE v2 calibrated values — override anything engine set
+                    "value_gap": v2_value_gap,
+                    "edge": v2_value_gap,
+                    "omega": v2_omega,
+                    "tier": v2_tier,
+                    "kelly_pct": v2_kelly,
                     "combined_xg": round(xg_h + xg_a, 2),
                     "all_markets": {
                         "P_home_win": round(markets.P_home_win, 4),
