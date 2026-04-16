@@ -7862,23 +7862,46 @@ async def admin_delete_pick(body: dict):
     """Delete a single dagens_kamp row by match name + odds. For dedup only."""
     match_name = body.get("match")
     odds = body.get("odds")
-    if not match_name or not odds:
-        return JSONResponse(status_code=400, content={"error": "match and odds required"})
+    if not match_name:
+        return JSONResponse(status_code=400, content={"error": "match required"})
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
     try:
         async with db_state.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """SELECT id, match, home_team, away_team, odds, result FROM dagens_kamp
-                   WHERE (match ILIKE $1 OR home_team ILIKE $1 OR away_team ILIKE $1)
-                     AND odds = $2
-                   LIMIT 1""",
-                f"%{match_name}%", float(odds)
+            # Debug: find ALL rows matching the name
+            search = f"%{match_name}%"
+            rows = await conn.fetch(
+                """SELECT id, match, home_team, away_team, odds, result
+                   FROM dagens_kamp
+                   WHERE match ILIKE $1 OR home_team ILIKE $1 OR away_team ILIKE $1
+                   ORDER BY id""",
+                search
             )
-            if not row:
-                return {"deleted": False, "reason": "no matching row"}
-            await conn.execute("DELETE FROM dagens_kamp WHERE id = $1", row["id"])
-            return {"deleted": True, "id": row["id"], "match": row["match"], "odds": float(row["odds"]), "result": row["result"]}
+            if not rows:
+                return {"deleted": False, "reason": "no matching rows", "search": search}
+
+            if odds is not None:
+                # Find exact odds match (with tolerance)
+                target = float(odds)
+                match_row = None
+                for r in rows:
+                    if abs(float(r["odds"] or 0) - target) < 0.02:
+                        match_row = r
+                        break
+                if not match_row:
+                    return {
+                        "deleted": False,
+                        "reason": f"found {len(rows)} rows but none with odds={target}",
+                        "found": [{"id": r["id"], "match": r["match"], "odds": float(r["odds"] or 0), "result": r["result"]} for r in rows]
+                    }
+                await conn.execute("DELETE FROM dagens_kamp WHERE id = $1", match_row["id"])
+                return {"deleted": True, "id": match_row["id"], "match": match_row["match"], "odds": float(match_row["odds"]), "result": match_row["result"]}
+            else:
+                return {
+                    "deleted": False,
+                    "reason": "listing matches only (no odds specified)",
+                    "found": [{"id": r["id"], "match": r["match"], "odds": float(r["odds"] or 0), "result": r["result"]} for r in rows]
+                }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
