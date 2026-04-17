@@ -712,51 +712,16 @@ async def ensure_tables(pool: asyncpg.Pool):
                 ON CONFLICT (id) DO NOTHING;
             """)
 
-            # FASE A-3: Sync trigger (ny picks → picks_v2 automatisk)
-            # Bruker kun kolonner som eksisterer i picks
+            # FASE A-3: Legacy sync trigger DEPRECATED
+            # Tidligere speilet picks → picks_v2 automatisk, men triggeren
+            # kunne ikke sette predicted_outcome (kolonnen finnes ikke i
+            # legacy picks-tabellen). Resulterte i 163 pending rader med
+            # NULL predicted_outcome. Se commit c6e054c.
+            # Nye picks skrives nå direkte via _sync_to_picks_v2() i main.py
+            # og services/market_scanner.py, som setter predicted_outcome korrekt.
             await conn.execute("""
-                CREATE OR REPLACE FUNCTION sync_picks_to_v2()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    INSERT INTO picks_v2 (
-                        id, match_name,
-                        odds, soft_edge, soft_ev, soft_book, pinnacle_clv,
-                        atomic_score, signals_triggered,
-                        result, telegram_posted, posted_at, created_at, timestamp,
-                        tier, tier_label, kelly_multiplier, kelly_stake
-                    ) VALUES (
-                        NEW.id,
-                        COALESCE(NEW.match, ''),
-                        NEW.odds,
-                        NEW.soft_edge,
-                        NEW.soft_ev,
-                        NEW.soft_book,
-                        NEW.pinnacle_clv,
-                        COALESCE(NEW.atomic_score, 0),
-                        COALESCE(NEW.signals_triggered, '[]'::jsonb),
-                        NEW.result,
-                        COALESCE(NEW.telegram_posted, FALSE),
-                        NEW.posted_at,
-                        COALESCE(NEW.timestamp, NOW()),
-                        COALESCE(NEW.timestamp, NOW()),
-                        COALESCE(NEW.tier, 'MONITORED'),
-                        COALESCE(NEW.tier_label, '📊 MONITORED'),
-                        COALESCE(NEW.kelly_multiplier, 0.00),
-                        COALESCE(NEW.kelly_stake, 0.00)
-                    )
-                    ON CONFLICT (id) DO UPDATE SET
-                        result = EXCLUDED.result,
-                        telegram_posted = EXCLUDED.telegram_posted,
-                        updated_at = NOW();
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
-
                 DROP TRIGGER IF EXISTS picks_sync_trigger ON picks;
-                CREATE TRIGGER picks_sync_trigger
-                AFTER INSERT OR UPDATE ON picks
-                FOR EACH ROW
-                EXECUTE FUNCTION sync_picks_to_v2();
+                DROP FUNCTION IF EXISTS sync_picks_to_v2();
             """)
 
             # FASE A-2b: Legg til timestamp hvis mangler (idempotent)
