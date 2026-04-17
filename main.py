@@ -4578,10 +4578,18 @@ async def get_dashboard_stats():
                      WHERE tier = 'ATOMIC' AND result IS NULL)         AS brutal_picks,
                     (SELECT COUNT(*) FROM dagens_kamp
                      WHERE tier IN ('EDGE','ATOMIC') AND result IS NULL) AS strong_picks,
-                    (SELECT COUNT(*) FROM dagens_kamp
-                     WHERE result IS NOT NULL)                         AS phase0_picks,
-                    (SELECT COUNT(*) FROM dagens_kamp
-                     WHERE result = 'WIN')                             AS won_picks
+                    (SELECT COUNT(*) FROM dagens_kamp dk
+                     WHERE dk.result IS NOT NULL)                      AS phase0_picks,
+                    (SELECT COUNT(*) FROM dagens_kamp dk
+                     LEFT JOIN picks_v2 pv
+                       ON pv.home_team = dk.home_team
+                       AND pv.away_team = dk.away_team
+                       AND pv.odds = dk.odds
+                       AND pv.kickoff_time = dk.kickoff
+                     WHERE dk.result IS NOT NULL
+                       AND COALESCE(pv.outcome,
+                           CASE WHEN dk.result IN ('WIN','LOSS')
+                                THEN dk.result END) = 'WIN')           AS won_picks
             """)
 
         # Fetch real CLV from MiroFish (source of truth)
