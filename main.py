@@ -156,7 +156,10 @@ async def enrich_with_consensus(pick: dict) -> dict:
         pick["consensus_ratio"]  = round(float(signal.consensus_ratio), 3)
         pick["kelly_fraction"]   = round(float(signal.kelly_fraction), 4)
         pick["agent_conflicts"]  = len(signal.conflicts or [])
-        pick["swarm_edge"]       = round(float(signal.edge_percent), 3)
+        # ConsensusEngine returnerer edge_percent allerede multiplisert med 100
+        # (se _calculate_edge: (prob * odds - 1) * 100). Deler på 100 her for at
+        # swarm_edge skal være i samme skala som value_gap (prosent, typisk -10..40).
+        pick["swarm_edge"]       = round(float(signal.edge_percent) / 100.0, 2)
         pick["swarm_confidence"] = round(float(signal.confidence), 3)
 
         if _moat_engine is not None and model_prob > 0:
