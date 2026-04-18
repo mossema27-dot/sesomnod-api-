@@ -1,5 +1,5 @@
 #!/bin/bash
-API_KEY="a9a1f6239e6431ec9183ed2582250927"
+API_KEY="${ODDS_API_KEY}"
 
 # 1. Torino vs Parma (Serie A)
 echo "=== TORINO VS PARMA ==="
