@@ -10018,3 +10018,9 @@ async def get_swarm_intelligence():
             "clv": phase0_clv,
         },
     }
+
+
+@app.get("/v3/prism")
+async def get_prism_intelligence():
+    """PRISM Intelligence — alias for /v3/swarm-intelligence."""
+    return await get_swarm_intelligence()
