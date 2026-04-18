@@ -10024,3 +10024,181 @@ async def get_swarm_intelligence():
 async def get_prism_intelligence():
     """PRISM Intelligence — alias for /v3/swarm-intelligence."""
     return await get_swarm_intelligence()
+
+
+@app.get("/v3/prism/gold-cards")
+async def get_prism_gold_cards():
+    """
+    PRISM produserer alltid topp 5 gullkort.
+    Henter dagens picks fra scan_results JSONB,
+    scorer dem med PRISM-formel, returnerer topp 5.
+    """
+    if not db_state.connected or not db_state.pool:
+        return {
+            "status": "db_offline",
+            "gold_cards": [],
+            "cards_count": 0,
+            "total_analyzed": 0,
+            "total_rejected": 0,
+        }
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT picks_json, total_scanned, total_approved
+                FROM scan_results
+                ORDER BY scan_date DESC
+                LIMIT 1
+            """)
+    except Exception as e:
+        logger.warning(f"[gold-cards] DB feil: {e}")
+        return {
+            "status": "db_error",
+            "gold_cards": [],
+            "cards_count": 0,
+            "total_analyzed": 0,
+            "total_rejected": 0,
+        }
+
+    if not row or not row["picks_json"]:
+        return {
+            "status": "no_picks_today",
+            "gold_cards": [],
+            "cards_count": 0,
+            "total_analyzed": 0,
+            "total_rejected": 0,
+            "oraklion_top1": None,
+        }
+
+    raw_picks = (
+        json.loads(row["picks_json"])
+        if isinstance(row["picks_json"], str)
+        else row["picks_json"]
+    )
+    total_scanned = int(row["total_scanned"] or 0)
+    total_approved = int(row["total_approved"] or 0)
+    total_analyzed = len(raw_picks)
+    total_rejected_today = max(0, total_scanned - total_approved)
+
+    # Map til frontend-format (gjenbruker eksisterende mapper)
+    mapped = [
+        _map_scanner_pick(p, i, total_rejected_today)
+        for i, p in enumerate(raw_picks)
+    ]
+
+    scored = []
+    for pick in mapped:
+        try:
+            omega = float(pick.get("omega_score", 0) or 0)
+            value = float(pick.get("value_gap", 0) or pick.get("edge", 0) or 0)
+            consensus = float(pick.get("consensus_ratio", 0) or 0)
+            model_p = float(pick.get("model_prob", 0) or 0)
+            market_p = float(pick.get("market_prob", 0) or 0)
+            signal = pick.get("consensus_signal", "NO_BET") or "NO_BET"
+
+            signal_mult = {
+                "VALID": 1.3,
+                "WATCH": 1.0,
+                "NO_BET": 0.0,
+                "UNAVAILABLE": 0.8,
+            }.get(signal, 0.8)
+
+            prism_score = (
+                omega * 0.35
+                + value * 0.30
+                + consensus * 100 * 0.20
+                + model_p * 100 * 0.15
+            ) * signal_mult
+
+            conflicts = int(pick.get("agent_conflicts", 0) or 0)
+            if conflicts <= 5:
+                disagreement = "LOW"
+            elif conflicts <= 15:
+                disagreement = "MEDIUM"
+            else:
+                disagreement = "HIGH"
+
+            if omega >= 70 and consensus >= 0.65:
+                robustness = "HIGH"
+            elif omega >= 55 and consensus >= 0.50:
+                robustness = "MEDIUM"
+            else:
+                robustness = "LOW"
+
+            if signal == "VALID" and omega >= 70:
+                confidence = "HIGH"
+            elif signal == "WATCH" or omega >= 55:
+                confidence = "MEDIUM"
+            else:
+                confidence = "LOW"
+
+            if signal == "VALID" and omega >= 65:
+                verdict = "VALID SIGNAL"
+            elif signal == "WATCH":
+                verdict = "WATCH ONLY"
+            else:
+                verdict = "NO BET"
+
+            home = pick.get("home_team", "") or ""
+            away = pick.get("away_team", "") or ""
+            match_name = (
+                f"{home} vs {away}"
+                if home and away
+                else pick.get("match_name", "Ukjent")
+            )
+
+            scored.append({
+                "prism_score": round(prism_score, 2),
+                "match": match_name,
+                "league": pick.get("league", "") or "",
+                "kickoff": str(pick.get("kickoff_cet", "") or ""),
+                "market": pick.get("market_type", "") or "",
+                "selection": pick.get("our_pick", pick.get("selection", "")) or "",
+                "odds": float(pick.get("odds", 0) or 0),
+                "model_probability": round(model_p * 100, 1),
+                "market_implied": round(market_p * 100, 1),
+                "value_gap": round(value, 1),
+                "confidence": confidence,
+                "robustness": robustness,
+                "disagreement": disagreement,
+                "verdict": verdict,
+                "consensus_signal": signal,
+                "consensus_ratio": round(consensus, 3),
+                "omega_score": int(omega),
+                "tier": pick.get("tier", "EDGE") or "EDGE",
+                "kelly_pct": float(pick.get("kelly_pct", 0) or 0),
+                "xg_home": float(pick.get("xg_home", 0) or 0),
+                "xg_away": float(pick.get("xg_away", 0) or 0),
+                "btts_pct": float(pick.get("model_btts", 0) or 0),
+                "over25_pct": float(pick.get("model_over25", 0) or 0),
+                "why": pick.get("why", "") or "",
+                "warn": pick.get("warn", "") or "",
+                "rejected_alternatives": int(pick.get("rejected_today", 0) or 0),
+                "proof": (
+                    f"Signal overlevde kryssvalidering mot "
+                    f"{int(consensus * 100)}% agent-konsensus. "
+                    f"Omega {int(omega)}/100. "
+                    f"Forkastet alternativer: "
+                    f"{int(pick.get('rejected_today', 0) or 0)}."
+                ),
+                "agent_conflicts": conflicts,
+                "kelly_fraction": float(pick.get("kelly_fraction", 0) or 0),
+            })
+        except Exception as e:
+            logger.warning(f"[gold-cards] mapping feil: {e}")
+            continue
+
+    scored.sort(key=lambda x: x["prism_score"], reverse=True)
+    gold_cards = scored[:5]
+    rejected_count = total_analyzed - len(scored)
+
+    return {
+        "status": "ok",
+        "prism_version": "2.0.0",
+        "total_analyzed": total_analyzed,
+        "total_rejected": rejected_count,
+        "cards_count": len(gold_cards),
+        "gold_cards": gold_cards,
+        "oraklion_top1": gold_cards[0] if gold_cards else None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
