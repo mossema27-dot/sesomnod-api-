@@ -8,7 +8,7 @@
 - HTTP: httpx.AsyncClient med timeout=10
 
 ## KRITISKE FILER
-- main.py: over 4500 linjer — alltid grep før edit
+- main.py: ~14 000 linjer (450 KB) — les seksjonsvis, aldri helhetlig
 - services/dixon_coles_engine.py: ML-modell, ikke endre schema
 - services/kelly_calculator.py: Kelly Criterion logikk
 - database.py: connection pool — aldri modifiser uten backup
