@@ -1,0 +1,88 @@
+{
+  "dossier_id": "manchester-city-arsenal-20260419-over-2.5",
+  "generated_at": "2026-04-19T10:30:00Z",
+  "dossier_completeness_pct": 88.0,
+  "match": {
+    "home_team": "Manchester City",
+    "away_team": "Arsenal",
+    "league": "Premier League",
+    "kickoff_utc": "2026-04-19T15:00:00Z",
+    "venue": "Etihad Stadium",
+    "is_neutral": false
+  },
+  "market": {
+    "opening_odds": 1.78,
+    "current_odds": 1.72,
+    "closing_odds": null,
+    "line_movement_pct": -3.4,
+    "sharp_money_indicator": "home",
+    "market_pick": "Over 2.5",
+    "market_pick_odds": 1.72
+  },
+  "sesomnod_core": {
+    "model_prob_home": 0.54,
+    "model_prob_draw": 0.24,
+    "model_prob_away": 0.22,
+    "model_prob_over25": 0.729,
+    "model_prob_btts": 0.61,
+    "edge_pct": 19.01,
+    "omega_score": 70,
+    "tier": "STRONG",
+    "kelly_pct": 3.2,
+    "selection": "Over 2.5",
+    "confidence": "HIGH"
+  },
+  "team_priors": {
+    "home": {
+      "xg_avg_home_last10": 2.31,
+      "xga_avg_home_last10": 0.98,
+      "form_last8": "WWWDWWLW",
+      "btts_rate_home": 0.60,
+      "over25_rate_home": 0.70,
+      "clean_sheet_rate_home": 0.40
+    },
+    "away": {
+      "xg_avg_away_last10": 1.74,
+      "xga_avg_away_last10": 1.12,
+      "form_last8": "WWLWWDWW",
+      "btts_rate_away": 0.55,
+      "over25_rate_away": 0.65,
+      "clean_sheet_rate_away": 0.30
+    }
+  },
+  "squad": {
+    "home_confirmed_lineup": [
+      "Ederson", "Walker", "Dias", "Akanji", "Gvardiol",
+      "Rodri", "De Bruyne", "Bernardo Silva",
+      "Foden", "Haaland", "Doku"
+    ],
+    "away_confirmed_lineup": [
+      "Raya", "White", "Saliba", "Gabriel", "Zinchenko",
+      "Partey", "Odegaard", "Rice",
+      "Saka", "Havertz", "Martinelli"
+    ],
+    "home_injuries": [],
+    "away_injuries": ["Timber (kne)"],
+    "home_suspensions": [],
+    "away_suspensions": [],
+    "lineup_confirmed": true,
+    "lineup_confirmed_at": "2026-04-19T10:00:00Z"
+  },
+  "intelligence_state": {
+    "false_confidence_triggers": [],
+    "contradiction_density": 10.0,
+    "narrative_distortion_index": 15.0,
+    "dossier_completeness_flags": ["OPTIONAL:referee_data", "OPTIONAL:weather"],
+    "hours_to_kickoff": 4.5,
+    "xg_form_divergence_pct": 8.0,
+    "sharp_alignment_score_input": 82.0,
+    "mirofish_ssr": 74.0
+  },
+  "simulation_question": "Vil Manchester City vs Arsenal produsere over 2.5 mal gitt begge lags offensive form og svake borteforsvar siste 10?",
+  "simulation_constraints": [
+    "Ignorer H2H eldre enn 2 sesonger",
+    "Vekt siste 5 kamper dobbelt av sesongsnitt",
+    "Haaland 100% fit — ingen restriksjoner"
+  ],
+  "operator_question": "Er Over 2.5 robust nok til publish, eller er lav line movement et varseltegn?"
+}

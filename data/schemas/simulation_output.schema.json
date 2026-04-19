@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "SesomNod Simulation Output v2",
+  "type": "object",
+  "required": ["pick_id","verdict","scores","operator_output"],
+  "properties": {
+    "pick_id": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "dossier_completeness_pct": {"type": "number"},
+    "scores": {
+      "type": "object",
+      "properties": {
+        "edge_integrity_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "confidence_fragility_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "narrative_distortion_index": {"type": "number", "minimum": 0, "maximum": 100},
+        "sharp_alignment_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "scenario_survival_rate": {"type": "number", "minimum": 0, "maximum": 100},
+        "no_bet_pressure_index": {"type": "number", "minimum": 0, "maximum": 100},
+        "contradiction_density": {"type": "number", "minimum": 0, "maximum": 100}
+      }
+    },
+    "false_confidence_triggers": {"type": "array", "items": {"type": "string"}},
+    "contradictions": {
+      "type": "object",
+      "properties": {
+        "weak": {"type": "array"},
+        "medium": {"type": "array"},
+        "critical": {"type": "array"}
+      }
+    },
+    "verdict": {"type": "string", "enum": ["PUBLISH","REVIEW","NO-BET","HOLD"]},
+    "verdict_reason": {"type": "string"},
+    "operator_output": {
+      "type": "object",
+      "required": ["why","warn","stress","verdict","receipt"],
+      "properties": {
+        "why": {"type": "string"},
+        "warn": {"type": "array", "items": {"type": "string"}},
+        "stress": {"type": "string"},
+        "verdict": {"type": "string"},
+        "receipt": {
+          "type": "object",
+          "properties": {
+            "sha256": {"type": "string"},
+            "logged_at": {"type": "string"},
+            "pick_number": {"type": "integer"},
+            "phase": {"type": "string"}
+          }
+        }
+      }
+    },
+    "telegram_output": {"type": "string"},
+    "post_match": {
+      "type": "object",
+      "description": "Fylles ut etter kamp",
+      "properties": {
+        "actual_outcome": {"type": "string"},
+        "closing_clv": {"type": "number"},
+        "flags_correct": {"type": "array"},
+        "flags_noise": {"type": "array"},
+        "mirofish_improved_decision": {"type": "boolean"}
+      }
+    }
+  }
+}

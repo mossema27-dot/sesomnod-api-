@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "SesomNod Match Dossier v2",
+  "type": "object",
+  "required": ["dossier_id","match","market","sesomnod_core","team_priors","squad","simulation_question"],
+  "properties": {
+    "dossier_id": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "dossier_completeness_pct": {"type": "number", "minimum": 0, "maximum": 100},
+    "match": {
+      "type": "object",
+      "required": ["home_team","away_team","league","kickoff_utc"],
+      "properties": {
+        "home_team": {"type": "string"},
+        "away_team": {"type": "string"},
+        "league": {"type": "string"},
+        "kickoff_utc": {"type": "string", "format": "date-time"},
+        "venue": {"type": "string"},
+        "is_neutral": {"type": "boolean"}
+      }
+    },
+    "market": {
+      "type": "object",
+      "properties": {
+        "opening_odds": {"type": "number"},
+        "current_odds": {"type": "number"},
+        "closing_odds": {"type": "number"},
+        "line_movement_pct": {"type": "number"},
+        "sharp_money_indicator": {"type": "string", "enum": ["home","draw","away","neutral"]},
+        "market_pick": {"type": "string"},
+        "market_pick_odds": {"type": "number"}
+      }
+    },
+    "sesomnod_core": {
+      "type": "object",
+      "required": ["edge_pct","confidence","tier","selection"],
+      "properties": {
+        "model_prob_home": {"type": "number"},
+        "model_prob_draw": {"type": "number"},
+        "model_prob_away": {"type": "number"},
+        "model_prob_over25": {"type": "number"},
+        "model_prob_btts": {"type": "number"},
+        "edge_pct": {"type": "number"},
+        "omega_score": {"type": "integer"},
+        "tier": {"type": "string", "enum": ["ATOMIC","STRONG","MONITOR"]},
+        "kelly_pct": {"type": "number"},
+        "selection": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["HIGH","MEDIUM","LOW"]}
+      }
+    },
+    "team_priors": {
+      "type": "object",
+      "properties": {
+        "home": {
+          "type": "object",
+          "properties": {
+            "xg_avg_home_last10": {"type": "number"},
+            "xga_avg_home_last10": {"type": "number"},
+            "form_last8": {"type": "string"},
+            "btts_rate_home": {"type": "number"},
+            "over25_rate_home": {"type": "number"},
+            "clean_sheet_rate_home": {"type": "number"}
+          }
+        },
+        "away": {
+          "type": "object",
+          "properties": {
+            "xg_avg_away_last10": {"type": "number"},
+            "xga_avg_away_last10": {"type": "number"},
+            "form_last8": {"type": "string"},
+            "btts_rate_away": {"type": "number"},
+            "over25_rate_away": {"type": "number"},
+            "clean_sheet_rate_away": {"type": "number"}
+          }
+        }
+      }
+    },
+    "squad": {
+      "type": "object",
+      "properties": {
+        "home_confirmed_lineup": {"type": "array", "items": {"type": "string"}},
+        "away_confirmed_lineup": {"type": "array", "items": {"type": "string"}},
+        "home_injuries": {"type": "array"},
+        "away_injuries": {"type": "array"},
+        "home_suspensions": {"type": "array"},
+        "away_suspensions": {"type": "array"},
+        "lineup_confirmed": {"type": "boolean"},
+        "lineup_confirmed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "intelligence_state": {
+      "type": "object",
+      "properties": {
+        "false_confidence_triggers": {"type": "array"},
+        "contradiction_density": {"type": "number"},
+        "narrative_distortion_index": {"type": "number"},
+        "dossier_completeness_flags": {"type": "array"}
+      }
+    },
+    "simulation_question": {"type": "string"},
+    "simulation_constraints": {"type": "array", "items": {"type": "string"}},
+    "operator_question": {"type": "string"}
+  }
+}

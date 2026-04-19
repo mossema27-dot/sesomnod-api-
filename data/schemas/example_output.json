@@ -1,0 +1,42 @@
+{
+  "pick_id": "manchester-city-arsenal-20260419-over-2.5",
+  "generated_at": "2026-04-19T10:30:05Z",
+  "dossier_completeness_pct": 88.0,
+  "scores": {
+    "edge_integrity_score": 72.4,
+    "confidence_fragility_score": 0.0,
+    "narrative_distortion_index": 15.0,
+    "sharp_alignment_score": 82.0,
+    "scenario_survival_rate": 68.0,
+    "no_bet_pressure_index": 18.3,
+    "contradiction_density": 10.0
+  },
+  "false_confidence_triggers": [],
+  "contradictions": {
+    "weak": [],
+    "medium": [],
+    "critical": []
+  },
+  "verdict": "PUBLISH",
+  "verdict_reason": "Alle gates bestatt",
+  "operator_output": {
+    "why": "Manchester City vs Arsenal | Valg: Over 2.5 @ 1.72 | Edge: 19.0% | Omega: 70 | EIS: 72/100 | Completeness: 88%",
+    "warn": [],
+    "stress": "NBPI=18 | CFS=0 | CD=10 | SSR=68%",
+    "verdict": "PUBLISH",
+    "receipt": {
+      "sha256": "a3f1c9d2e8b047f6",
+      "logged_at": "2026-04-19T10:30:05Z",
+      "pick_number": 19,
+      "phase": "Phase-1"
+    }
+  },
+  "telegram_output": "[PUBLISH] Manchester City vs Arsenal\nPick: Over 2.5 @ 1.72\nEdge: 19.0% | Omega: 70 | NBPI: 18",
+  "post_match": {
+    "actual_outcome": null,
+    "closing_clv": null,
+    "flags_correct": [],
+    "flags_noise": [],
+    "mirofish_improved_decision": null
+  }
+}
