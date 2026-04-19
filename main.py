@@ -3667,6 +3667,10 @@ async def _check_live_results():
 
         logger.info(f"[Results] {len(pending)} pending picks to check")
         mirofish_needed = False
+        # Queue MiroFish result-submissions until after /close-clv has
+        # populated closing_odds. Avoids the race where _submit bails with
+        # "no_closing_odds_yet" and never retries.
+        mirofish_result_queue: list[tuple[dict, str]] = []
 
         for pick in pending:
             pick_home = str(pick["home_team"] or "").lower().strip()
@@ -3746,9 +3750,9 @@ async def _check_live_results():
                 pick_dict = dict(pick)
                 pick_dict["match_name"] = pick_dict.get("match", "")
                 asyncio.create_task(_log_result_to_notion(pick_dict, outcome_str, None))
-                # Submit result to MiroFish /clv (fire-and-forget, never blocks).
-                # Same pick_id format as _log_pick_to_mirofish so the row matches.
-                asyncio.create_task(_submit_result_to_mirofish(pick_dict, outcome_str))
+                # Queue for MiroFish result-submission — fired AFTER /close-clv
+                # so closing_odds is guaranteed populated before _submit runs.
+                mirofish_result_queue.append((pick_dict, outcome_str))
 
         # Trigger MiroFish close-clv once per run if any results were written
         if mirofish_needed:
@@ -3758,6 +3762,16 @@ async def _check_live_results():
                 logger.info("[Results] MiroFish /close-clv triggered")
             except Exception as mf_err:
                 logger.warning(f"[Results] MiroFish error (non-fatal): {mf_err}")
+
+            # Drain queue — submit each (pick, outcome) now that closing_odds
+            # is seeded. Fire-and-forget: failures logged, never block loop.
+            for pick_dict, outcome_str in mirofish_result_queue:
+                asyncio.create_task(_submit_result_to_mirofish(pick_dict, outcome_str))
+            if mirofish_result_queue:
+                logger.info(
+                    f"[Results] {len(mirofish_result_queue)} MiroFish result "
+                    f"submissions queued after /close-clv"
+                )
 
     except Exception as e:
         logger.warning(f"[Results] Top-level exception: {e}")
@@ -4592,12 +4606,37 @@ async def get_backtest_picks(limit: int = 50, offset: int = 0):
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
+def compute_phase1_gate(
+    avg_clv: float | None,
+    hit_rate_pct: float,
+    settled: int,
+) -> dict:
+    """Canonical Phase 1 gate (live).
+
+    Three conditions per CLAUDE.md:
+      - clv_ok:      Pinnacle no-vig avg CLV >= 2.0%
+      - hit_rate_ok: headline HR > 55.0% (dagens_kamp-derived)
+      - picks_ok:    settled count >= 30
+    Brier + drawdown belong to the backtest gate (/backtest/latest),
+    not the live Phase 1 gate.
+    """
+    clv_ok = avg_clv is not None and avg_clv >= 2.0
+    hr_ok = hit_rate_pct > 55.0
+    pk_ok = settled >= 30
+    return {
+        "clv_ok": clv_ok,
+        "hit_rate_ok": hr_ok,
+        "picks_ok": pk_ok,
+        "gate_passed": clv_ok and hr_ok and pk_ok,
+    }
+
+
 @app.get("/dashboard/stats")
 async def get_dashboard_stats():
     """Public dashboard: live Phase 0 + backtest + Phase 1 gate status."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
-    live_data = {"phase0_picks": 0, "hit_rate": 0.0, "avg_clv": 0.0, "profit_units": 0.0}
+    live_data = {"phase0_picks": 0, "_debug_picks_v2_hit_rate": 0.0, "avg_clv": 0.0, "profit_units": 0.0}
     backtest_data = {"hit_rate": 0.0, "roi_pct": 0.0, "avg_clv": 0.0, "qualified_picks": 0}
     try:
         async with db_state.pool.acquire() as conn:
@@ -4618,7 +4657,9 @@ async def get_dashboard_stats():
                 s, w = live_row["settled"], live_row["wins"] or 0
                 live_data = {
                     "phase0_picks": int(s),
-                    "hit_rate": round(w / s, 4) if s > 0 else 0.0,
+                    # Renamed from "hit_rate" — kept for debugging only.
+                    # Canonical HR = dagens_kamp-derived hit_rate_pct (see gate).
+                    "_debug_picks_v2_hit_rate": round(w / s, 4) if s > 0 else 0.0,
                     "avg_clv": round(float(live_row["avg_clv"] or 0), 2),
                     "profit_units": 0.0,
                 }
@@ -4675,8 +4716,6 @@ async def get_dashboard_stats():
         except Exception as _e:
             logger.warning(f"MiroFish CLV fetch failed: {_e}")
 
-        hit_ok = live_data["hit_rate"] > 0.55
-        clv_ok = _mirofish_clv is not None and _mirofish_clv >= 2.0
         ops = dict(ops_row) if ops_row else {}
 
         total_settled = int(ops.get("phase0_picks") or 0)
@@ -4688,7 +4727,7 @@ async def get_dashboard_stats():
 
         return {
             "live": live_data, "backtest": backtest_data,
-            "phase1_gate": {"hit_rate_ok": hit_ok, "clv_ok": clv_ok, "gate_passed": all([hit_ok, clv_ok])},
+            "phase1_gate": compute_phase1_gate(_mirofish_clv, hit_rate_pct, total_settled),
             # Settled stats for frontend
             "phase0_picks":        total_settled,
             "phase0_target":       30,
