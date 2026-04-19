@@ -283,7 +283,7 @@ class MOATEngine:
     def load_historical_clv(self, records: list) -> int:
         """
         Seed MOATEngine from historical mirofish_clv rows.
-        Each record must have: pick_id, outcome, clv_pct, closing_odds.
+        Each record must have: pick_id, result, clv_pct, closing_odds.
         Returns count of records loaded.
         SELECT-only — never writes to mirofish_clv.
         """
@@ -291,7 +291,7 @@ class MOATEngine:
         for row in records:
             try:
                 pick_id     = str(row.get("pick_id") or row["pick_id"])
-                outcome     = row.get("outcome")       # WIN / LOSS / VOID / None
+                outcome     = row.get("result")        # WIN / LOSS / PUSH / None
                 clv_pct     = row.get("clv_pct")
                 closing_odds = row.get("closing_odds")
 

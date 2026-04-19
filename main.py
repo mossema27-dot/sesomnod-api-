@@ -464,9 +464,9 @@ async def connect_db() -> bool:
             try:
                 async with pool.acquire() as _conn:
                     _clv_rows = await _conn.fetch("""
-                        SELECT pick_id, outcome, clv_pct, closing_odds
+                        SELECT pick_id, result, clv_pct, closing_odds
                         FROM mirofish_clv
-                        WHERE outcome IS NOT NULL
+                        WHERE result IS NOT NULL
                         LIMIT 200
                     """)
                 if _clv_rows:
