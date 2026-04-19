@@ -464,7 +464,7 @@ async def connect_db() -> bool:
             try:
                 async with pool.acquire() as _conn:
                     _clv_rows = await _conn.fetch("""
-                        SELECT pick_id, result, clv_pct, closing_odds
+                        SELECT pick_id, result, clv AS clv_pct, closing_odds
                         FROM mirofish_clv
                         WHERE result IS NOT NULL
                         LIMIT 200
@@ -10077,9 +10077,9 @@ async def get_swarm_intelligence():
                     if p0["hit_rate"] is not None:
                         phase0_hit_rate = float(p0["hit_rate"])
                 clv_row = await conn.fetchrow("""
-                    SELECT ROUND(AVG(clv_pct)::numeric, 2) AS avg_clv
+                    SELECT ROUND(AVG(clv)::numeric, 2) AS avg_clv
                     FROM mirofish_clv
-                    WHERE clv_pct IS NOT NULL
+                    WHERE clv IS NOT NULL
                 """)
                 if clv_row and clv_row["avg_clv"] is not None:
                     phase0_clv = float(clv_row["avg_clv"])
