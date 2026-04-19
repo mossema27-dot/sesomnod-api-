@@ -32,8 +32,8 @@ class IntelligenceScores:
     edge_integrity_score: float = 0.0          # EIS
     confidence_fragility_score: float = 0.0    # CFS
     narrative_distortion_index: float = 0.0    # NDI
-    sharp_alignment_score: float = 100.0       # SAS  (starter hoy — trekkes ned)
-    scenario_survival_rate: float = 100.0      # SSR  (starter hoy — trekkes ned)
+    sharp_alignment_score: float = 50.0        # SAS  (M2: default 50, ikke 100)
+    scenario_survival_rate: float = 65.0       # SSR  (M3: default 65, ikke 100)
     no_bet_pressure_index: float = 0.0         # NBPI
     contradiction_density: float = 0.0         # CD
     false_confidence_triggers: list[str] = field(default_factory=list)
@@ -145,25 +145,32 @@ def calculate_contradiction_density(
 
 
 def calculate_nbpi(
-    eis: float,
     cfs: float,
     contradiction_density: float,
-    completeness_pct: float,
-    sharp_alignment_score: float,
+    ndi: float,
+    lineup_uncertainty: float,
+    sas: float,
 ) -> float:
     """
     No-Bet Pressure Index — aggregert press mot a legge bet.
 
+    P7: ny signatur iht. doctrine-vekter.
     NBPI >80 = automatisk NO-BET (iht. CONTRADICTION_DOCTRINE).
-    """
-    # Vektet gjennomsnitt: lav EIS + hoy CFS + hoy CD = hoy NBPI
-    eis_contribution = (100.0 - eis) * 0.30
-    cfs_contribution = cfs * 0.25
-    cd_contribution = contradiction_density * 0.25
-    comp_contribution = (100.0 - completeness_pct) * 0.10
-    sas_contribution = (100.0 - sharp_alignment_score) * 0.10
 
-    nbpi = eis_contribution + cfs_contribution + cd_contribution + comp_contribution + sas_contribution
+    Vekter:
+      CFS                 * 0.30
+      contradiction_density * 0.25
+      NDI                 * 0.20
+      lineup_uncertainty  * 0.15
+      (100 - SAS)         * 0.10
+    """
+    nbpi = (
+        cfs * 0.30
+        + contradiction_density * 0.25
+        + ndi * 0.20
+        + lineup_uncertainty * 0.15
+        + (100.0 - sas) * 0.10
+    )
     return round(min(100.0, max(0.0, nbpi)), 1)
 
 
@@ -219,7 +226,7 @@ def score_pick(dossier: dict) -> IntelligenceScores:
         fc_triggers.append("COMPLETENESS_BELOW_65")
 
     # HIGH confidence med 3+ motsigende signaler
-    n_contradictions = len(intel.get("false_confidence_triggers", []))
+    n_contradictions = len(intel.get("false_confidence_triggers") or [])
     if confidence == "HIGH" and n_contradictions >= 3:
         fc_triggers.append("HIGH_CONFIDENCE_MULTIPLE_CONTRADICTIONS")
 
@@ -263,19 +270,21 @@ def score_pick(dossier: dict) -> IntelligenceScores:
     # ---------------------------------------------------------------------------
     cd = calculate_contradiction_density(weak, medium, critical)
 
-    # Sharp Alignment Score
-    sas: float = sas_input if sas_input is not None else 100.0
+    # Sharp Alignment Score (M2: default 50 ikke 100)
+    sas: float = sas_input if sas_input is not None else 50.0
     if sharp_money != "neutral" and sharp_money != _selection_side:
         sas = max(0.0, sas - 30.0)
 
-    # Scenario Survival Rate — reduseres av CD og FC-triggers
-    ssr: float = ssr_input if ssr_input is not None else 100.0
+    # Scenario Survival Rate — reduseres av CD og FC-triggers (M3: default 65 ikke 100)
+    ssr: float = ssr_input if ssr_input is not None else 65.0
     ssr = max(0.0, ssr - cd * 0.3 - len(fc_triggers) * 5.0)
 
     eis = calculate_eis(edge_pct, line_movement_pct, completeness_pct, omega_score)
     cfs = calculate_cfs(confidence, fc_triggers, lineup_confirmed, completeness_pct, hours_to_kickoff, edge_pct)
     ndi: float = intel.get("narrative_distortion_index", 0.0)
-    nbpi = calculate_nbpi(eis, cfs, cd, completeness_pct, sas)
+    # P7: lineup_uncertainty = 0 hvis bekreftet, 100 hvis ukonfirmert/ukjent
+    lineup_uncertainty: float = 0.0 if lineup_confirmed else 100.0
+    nbpi = calculate_nbpi(cfs, cd, ndi, lineup_uncertainty, sas)
 
     scores = IntelligenceScores(
         edge_integrity_score=eis,
