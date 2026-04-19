@@ -280,6 +280,47 @@ class MOATEngine:
         kelly = max(0.0, min(MAX_KELLY_BET, raw))
         return kelly if kelly >= MIN_KELLY_BET else 0.0
 
+    def load_historical_clv(self, records: list) -> int:
+        """
+        Seed MOATEngine from historical mirofish_clv rows.
+        Each record must have: pick_id, outcome, clv_pct, closing_odds.
+        Returns count of records loaded.
+        SELECT-only — never writes to mirofish_clv.
+        """
+        loaded = 0
+        for row in records:
+            try:
+                pick_id     = str(row.get("pick_id") or row["pick_id"])
+                outcome     = row.get("outcome")       # WIN / LOSS / VOID / None
+                clv_pct     = row.get("clv_pct")
+                closing_odds = row.get("closing_odds")
+
+                if outcome is None or clv_pct is None:
+                    continue
+
+                agent_id = f"historical_{pick_id}"
+                hist     = self._agent_history[agent_id]
+                hist["predictions"] += 1
+
+                was_correct = str(outcome).upper() == "WIN"
+                if was_correct:
+                    hist["correct"] += 1
+
+                # Synthetic Brier: CLV >0 = good prediction → lower brier
+                clv_float = float(clv_pct) if clv_pct else 0.0
+                brier = max(0.0, min(1.0, 0.25 - clv_float / 100.0))
+                hist["brier_scores"].append(brier)
+
+                # CLV record
+                if clv_pct is not None:
+                    hist["clv_values"].append(clv_float)
+
+                hist["last_updated"] = datetime.utcnow()
+                loaded += 1
+            except Exception:
+                continue
+        return loaded
+
     def calibrate_confidence(self, agent_id: str, raw_conf: float = 0.7) -> float:
         """Brier-score basert kalibrering."""
         hist = self._agent_history.get(agent_id)

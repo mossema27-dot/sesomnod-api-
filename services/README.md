@@ -39,7 +39,7 @@ Oversikt over alle service-moduler. Alle services er async, har type hints og br
 |-----|--------|----------|
 | [mirofish_agent.py](mirofish_agent.py) | 11-agent simulering via Claude API, ~$0.002/kamp, max 15% Omega-vekt | JA |
 | [mirofish_client.py](mirofish_client.py) | HTTP-klient mot mirofish-service Railway-app | JA |
-| [mirofish_v3.py](mirofish_v3.py) | 6-agent hierarkisk validering | JA |
+| ~~mirofish_v3.py~~ | DEPRECATED 2026-04-19 — flyttet til scripts/legacy/. Erstattet av mirofish_agent.py + swarm/ | NEI |
 
 ## MiroFish Swarm V2 — [swarm/](swarm/)
 | Fil | Ansvar |

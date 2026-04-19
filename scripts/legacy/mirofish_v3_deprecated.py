@@ -1,4 +1,11 @@
 """
+DEPRECATED: 2026-04-19
+This file is no longer imported by main.py or any services/.
+Superseded by services/mirofish_agent.py (11-agent Haiku simulation)
+and services/swarm/ (ConsensusEngine + MOATEngine).
+Moved to scripts/legacy/ for archival purposes only.
+DO NOT import this module.
+---
 SesomNod MiroFish V3
 6-agent hierarchical validation system for betting picks.
 """

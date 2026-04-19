@@ -92,11 +92,27 @@ except Exception as _swarm_err:
     _moat_engine = None
 
 
-async def enrich_with_consensus(pick: dict) -> dict:
+async def enrich_with_consensus(pick: dict, mirofish_results: dict | None = None) -> dict:
     """Berik pick med MiroFish Swarm V2 konsensus-analyse.
+    mirofish_results: dict keyed by match_name from analyze_batch().
     Fail-safe: returnerer original pick ved enhver feil."""
     if not _swarm_available or _consensus_engine is None:
         return pick
+
+    # Avoid in-place mutation — work on a copy
+    enriched_pick = dict(pick)
+    pick = enriched_pick
+
+    # Merge MiroFish sim data for this match if available
+    sim_data = (mirofish_results or {}).get(pick.get("match_name") or pick.get("match", ""), {})
+    if sim_data:
+        mf_meta = sim_data.get("meta", {})
+        pick["mirofish_actionability"]      = mf_meta.get("actionability", "skip")
+        pick["mirofish_confidence"]         = mf_meta.get("mirofish_confidence", 0)
+        pick["mirofish_narrative_pressure"] = mf_meta.get("narrative_pressure", 0)
+        pick["mirofish_what_to_watch"]      = mf_meta.get("what_to_watch", "")
+        pick["mirofish_what_to_ignore"]     = mf_meta.get("what_to_ignore", "")
+        pick["mirofish_false_consensus"]    = mf_meta.get("false_consensus_risk", 0)
 
     try:
         model_prob = float(pick.get("model_prob", 0.5) or 0.5)
@@ -442,6 +458,26 @@ async def connect_db() -> bool:
         await market_scanner.ensure_db_tables()
         mirofish_agent_instance = MiroFishAgent()
         logger.info("[INIT] MarketScanner + MiroFishAgent initialized")
+
+        # ── STEG D: MOATEngine historisk kalibrering fra mirofish_clv ────────
+        if _swarm_available and _moat_engine is not None:
+            try:
+                async with pool.acquire() as _conn:
+                    _clv_rows = await _conn.fetch("""
+                        SELECT pick_id, outcome, clv_pct, closing_odds
+                        FROM mirofish_clv
+                        WHERE outcome IS NOT NULL
+                        LIMIT 200
+                    """)
+                if _clv_rows:
+                    _loaded = _moat_engine.load_historical_clv(
+                        [dict(r) for r in _clv_rows]
+                    )
+                    logger.info(f"[MOATEngine] Kalibrert: {_loaded} historiske picks lastet")
+                else:
+                    logger.info("[MOATEngine] Ingen historiske CLV-picks funnet — starter fresh")
+            except Exception as _moat_err:
+                logger.warning(f"[MOATEngine] Historisk kalibrering feilet (ikke kritisk): {_moat_err}")
 
         return True
 
@@ -8249,6 +8285,57 @@ async def run_full_scan_v3(x_api_key: str = Header(None, alias="X-API-Key")):
                 v3_pick = {**pick, "version": "v3", "rejected_markets": [], "combined_xg": round(xg_h + xg_a, 2)}
 
             v3_picks.append(v3_pick)
+
+        # ── STEG A: MiroFish analyze_batch on v3_picks ───────────────────────
+        mirofish_results: dict = {}
+        if mirofish_agent_instance and v3_picks:
+            try:
+                batch_sims = await asyncio.wait_for(
+                    mirofish_agent_instance.analyze_batch(v3_picks),
+                    timeout=30.0,
+                )
+                # Key by match_name for O(1) lookup in enrich_with_consensus
+                for _p, _sim in zip(v3_picks, batch_sims):
+                    _key = _p.get("match_name") or _p.get("match", "")
+                    if _key:
+                        mirofish_results[_key] = _sim
+                logger.info(f"[v3/MiroFish] analyze_batch: {len(mirofish_results)} simulations OK")
+            except (asyncio.TimeoutError, Exception) as _mf_err:
+                logger.warning(f"[v3/MiroFish] analyze_batch fallback: {_mf_err}")
+
+        # ── STEG C: apply_mirofish_to_omega before DB insert ─────────────────
+        if mirofish_results:
+            omega_adjusted_picks = []
+            for _p in v3_picks:
+                _p = dict(_p)  # copy — never mutate in-place
+                _key = _p.get("match_name") or _p.get("match", "")
+                _sim = mirofish_results.get(_key)
+                if _sim:
+                    _base_omega = int(_p.get("omega") or _p.get("omega_score") or 0)
+                    _omega_result = apply_mirofish_to_omega(_base_omega, _sim)
+                    actionability = _omega_result.get("actionability", "skip")
+                    mf_confidence = _omega_result.get("mirofish_confidence", 0)
+                    # HIGH confidence + BET-signal → +8; LOW/NO_BET → −8; else 0
+                    if actionability in ("high", "medium") and mf_confidence >= 60:
+                        delta = 8
+                    elif actionability == "skip" or mf_confidence < 40:
+                        delta = -8
+                    else:
+                        delta = 0
+                    new_omega = int(min(100, max(0, _base_omega + delta)))
+                    _p["omega"]                  = new_omega
+                    _p["omega_score"]            = new_omega
+                    _p["mirofish_omega_delta"]   = delta
+                    _p["mirofish_bonus"]         = _omega_result.get("mirofish_bonus", 0)
+                    _p["mirofish_penalty"]       = _omega_result.get("mirofish_penalty", 0)
+                    _p["mirofish_actionability"] = actionability
+                    _p["mirofish_confidence"]    = mf_confidence
+                    _p["what_to_watch"]          = _omega_result.get("what_to_watch", "")
+                    _p["what_to_ignore"]         = _omega_result.get("what_to_ignore", "")
+                    _p["invalidation_triggers"]  = _omega_result.get("invalidation_triggers", [])
+                omega_adjusted_picks.append(_p)
+            v3_picks = omega_adjusted_picks
+            logger.info(f"[v3/MiroFish] omega-justering ferdig: {len(v3_picks)} picks")
 
         # Save v3 results to scan_results
         try:
