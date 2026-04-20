@@ -6604,6 +6604,14 @@ async def log_results_manual(results: list[dict]):
                 pick_won = total_goals < 4
             outcome = "WIN" if pick_won else "LOSS" if pick_won is False else "VOID"
 
+            kickoff_str = p.get("kickoff")
+            if not kickoff_str:
+                raise HTTPException(422, f"Missing 'kickoff' for {p['home']} vs {p['away']}")
+            try:
+                kickoff_dt = datetime.fromisoformat(str(kickoff_str).replace("Z", "+00:00"))
+            except ValueError:
+                raise HTTPException(422, f"Invalid 'kickoff' format for {p['home']} vs {p['away']}: {kickoff_str}")
+
             row = await conn.fetchrow("""
                 SELECT id FROM dagens_kamp
                 WHERE home_team ILIKE $1 AND away_team ILIKE $2
@@ -6627,7 +6635,7 @@ async def log_results_manual(results: list[dict]):
                     p.get("pick",""),
                     float(p.get("odds", 3.5)),
                     15.0, "EDGE",
-                    datetime(2026, 3, 31, 20, 0, 0, tzinfo=timezone.utc),
+                    kickoff_dt,
                     outcome, hs, aws
                 )
                 logged.append(f"INSERTED: {p['home']} vs {p['away']} → {outcome}")
@@ -6637,7 +6645,7 @@ async def log_results_manual(results: list[dict]):
                     "match": f"{p['home']} vs {p['away']}",
                     "odds": float(p.get("odds", 3.5)),
                     "edge": 15.0, "tier": "EDGE",
-                    "kickoff": datetime(2026, 3, 31, 20, 0, 0, tzinfo=timezone.utc),
+                    "kickoff": kickoff_dt,
                     "result": outcome,
                 }, 0)
         total = await conn.fetchval("SELECT COUNT(*) FROM dagens_kamp WHERE result IS NOT NULL")
