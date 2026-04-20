@@ -3934,7 +3934,7 @@ async def _auto_settle_results():
                 LEFT JOIN dagens_kamp dk
                     ON pv.home_team = dk.home_team
                     AND pv.away_team = dk.away_team
-                    AND pv.kickoff_time = dk.kickoff
+                    AND pv.kickoff_time::date = dk.kickoff::date
                 WHERE (pv.status IS NULL OR pv.status != 'RESULT_LOGGED')
                   AND pv.outcome IS NULL
                   AND pv.kickoff_time > NOW() - INTERVAL '48 hours'
@@ -6623,6 +6623,14 @@ async def log_results_manual(results: list[dict]):
                     WHERE id=$4
                 """, outcome, hs, aws, row["id"])
                 logged.append(f"UPDATED: {p['home']} vs {p['away']} → {outcome}")
+                await _sync_to_picks_v2({
+                    "home_team": p["home"], "away_team": p["away"],
+                    "match": f"{p['home']} vs {p['away']}",
+                    "odds": float(p.get("odds", 3.5)),
+                    "edge": 15.0, "tier": "EDGE",
+                    "kickoff": kickoff_dt,
+                    "result": outcome,
+                }, row["id"])
             else:
                 await conn.execute("""
                     INSERT INTO dagens_kamp

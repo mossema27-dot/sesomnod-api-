@@ -69,7 +69,13 @@ class MarketSelectionEngine:
     """
     Evaluates all available markets and selects the best one based on composite scoring.
     """
-    
+
+    # Draw markets er policy-blokkert: kan evalueres og returneres i rejected_markets
+    # for analyse, men skal aldri velges som anbefalt pick.
+    DRAW_BLOCKED_MARKETS = frozenset({
+        'draw', '1x2_draw', 'home_draw_away', 'x', 'uavgjort',
+    })
+
     # Liga-spesifikke edge-terskler
     LEAGUE_THRESHOLDS = {
         'premier_league':  {'1x2': 0.045, 'over_under': 0.035, 'btts': 0.040, 'ah': 0.030},
@@ -276,15 +282,20 @@ class MarketSelectionEngine:
         """
         market_prob = 1.0 / odds if odds > 0 else 0.0
         edge = self.calculate_edge(model_prob, market_prob)
-        
+
         # Get threshold for this market
         threshold = self.get_threshold_for_market(market, league, hours_to_kickoff)
-        
+
         # Check if edge meets threshold
         is_valid = edge >= threshold
         rejection_reason = None
         if not is_valid:
             rejection_reason = f"edge_too_low ({edge:.1%} < {threshold:.1%})"
+
+        # Policy: draw markets er aldri gyldige som anbefalt pick
+        if str(market).lower().strip() in self.DRAW_BLOCKED_MARKETS:
+            is_valid = False
+            rejection_reason = "draw_blocked_by_policy"
         
         # Calculate Kelly
         kelly = self.calculate_kelly(edge, odds, confidence=data_quality)
