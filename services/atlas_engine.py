@@ -60,7 +60,8 @@ async def _fetch_mirofish_clv(pick_id: str) -> tuple[float | None, str]:
         closing_odds = pick_data.get("closing_odds")
         if closing_odds is None:
             return (None, "no_closing_odds_yet")
-        clv_raw = pick_data.get("clv_pct")
+        # MiroFish response field is "clv" (not "clv_pct") — verified via live GET.
+        clv_raw = pick_data.get("clv")
         if clv_raw is None:
             return (None, "no_clv_yet")
         try:
