@@ -6348,6 +6348,61 @@ async def _submit_result_to_mirofish(pick_row: dict, outcome_str: str) -> dict:
                     f"[MiroFish] Result submitted: {pick_id} → {outcome_str} "
                     f"(clv={resp_clv}%)"
                 )
+
+                # RC #1: persist closing_odds to pick_receipts.
+                # Source: MiroFish /clv/{pick_id} (Pinnacle no-vig closing).
+                # Race guard: WHERE closing_odds IS NULL (atomic at row-lock).
+                # Key resolution: pick_id (via picks_v2 lookup) first, then
+                # match_name+kickoff fallback — mirrors _auto_settle_results
+                # so any team-name/kickoff skew between dagens_kamp and
+                # picks_v2 does not silently drop the write.
+                try:
+                    closing_odds_f = float(closing_odds)
+                    if (
+                        closing_odds_f > 0
+                        and db_state.connected
+                        and db_state.pool
+                    ):
+                        kickoff_dt = pick_row.get("kickoff")
+                        async with db_state.pool.acquire() as conn:
+                            pv_id = await conn.fetchval(
+                                """SELECT id FROM picks_v2
+                                   WHERE home_team = $1
+                                     AND away_team = $2
+                                     AND kickoff_time::date = $3::date
+                                   ORDER BY id DESC
+                                   LIMIT 1""",
+                                home_raw, away_raw, kickoff_dt,
+                            )
+                            up_res = "UPDATE 0"
+                            if pv_id:
+                                up_res = await conn.execute(
+                                    """UPDATE pick_receipts
+                                       SET closing_odds = $1
+                                       WHERE pick_id = $2
+                                         AND closing_odds IS NULL""",
+                                    closing_odds_f, pv_id,
+                                )
+                            if up_res == "UPDATE 0":
+                                match_name_rec = f"{home_raw} vs {away_raw}"
+                                up_res = await conn.execute(
+                                    """UPDATE pick_receipts
+                                       SET closing_odds = $1
+                                       WHERE match_name = $2
+                                         AND kickoff = $3
+                                         AND closing_odds IS NULL""",
+                                    closing_odds_f, match_name_rec, kickoff_dt,
+                                )
+                        logger.info(
+                            f"[MiroFish] pick_receipts.closing_odds {up_res} "
+                            f"(pv_id={pv_id}) for {home_raw} vs {away_raw} @ {kickoff_dt}"
+                        )
+                except Exception as db_err:
+                    logger.warning(
+                        f"[MiroFish] pick_receipts.closing_odds write failed "
+                        f"(non-fatal): {db_err}"
+                    )
+
                 return {"submitted": True, "pick_id": pick_id, "result": outcome_str, "clv_pct": resp_clv}
             logger.warning(f"[MiroFish] POST /clv HTTP {pr.status_code}: {pr.text[:200]}")
             return {"submitted": False, "reason": f"post_http_{pr.status_code}"}
