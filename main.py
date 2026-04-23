@@ -4868,11 +4868,27 @@ async def get_smartpick(pick_id: int):
 
 
 async def _load_or_build_smartpick(pick_id: int) -> dict:
-    """Helper: load cached SmartPick or build inline from picks_v2 row."""
+    """Helper: load cached SmartPick or build inline from picks_v2 row.
+    JOINs dagens_kamp to recover market_type + pick (not persisted in picks_v2)."""
     if not db_state.connected or not db_state.pool:
         raise HTTPException(503, "Database unavailable")
     async with db_state.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM picks_v2 WHERE id = $1", pick_id)
+        row = await conn.fetchrow("""
+            SELECT p.*,
+                   dk.market_type AS dk_market_type,
+                   dk.pick AS dk_pick
+            FROM picks_v2 p
+            LEFT JOIN LATERAL (
+                SELECT market_type, pick
+                FROM dagens_kamp
+                WHERE home_team = p.home_team
+                  AND away_team = p.away_team
+                  AND kickoff::date = p.kickoff_time::date
+                ORDER BY id DESC
+                LIMIT 1
+            ) dk ON TRUE
+            WHERE p.id = $1
+        """, pick_id)
         if not row:
             raise HTTPException(404, f"Pick {pick_id} not found")
         payload = row["smartpick_payload"]
@@ -4882,11 +4898,13 @@ async def _load_or_build_smartpick(pick_id: int) -> dict:
             return payload
         # Build inline from picks_v2 row (may have sparse fields)
         candidate = dict(row)
-        # Normalize legacy field aliases used by candidate-dict
         candidate.setdefault("edge", candidate.get("soft_edge"))
         candidate.setdefault("ev", candidate.get("soft_ev"))
-        candidate.setdefault("pick", "")
-        candidate.setdefault("market_type", "")
+        # Recover market_type / pick from dagens_kamp LATERAL
+        if candidate.get("dk_market_type"):
+            candidate["market_type"] = candidate["dk_market_type"]
+        if candidate.get("dk_pick"):
+            candidate["pick"] = candidate["dk_pick"]
         payload = await build_smartpick_payload(candidate, conn)
         payload["pick_id"] = pick_id
         return payload
@@ -4894,12 +4912,24 @@ async def _load_or_build_smartpick(pick_id: int) -> dict:
 
 @app.post("/admin/test-smartpick/{pick_id}")
 async def admin_test_smartpick(pick_id: int):
-    """Admin: send SmartPick to Telegram for an existing pick."""
+    """Admin: send SmartPick to Telegram for an existing pick.
+    MONITORED tier is blocked from posting per policy — use preview instead."""
     payload = await _load_or_build_smartpick(pick_id)
+    tier = (payload.get("math") or {}).get("tier") or "MONITORED"
+    if tier not in ("ATOMIC", "EDGE"):
+        return {
+            "pick_id": pick_id,
+            "status": "skipped",
+            "reason": f"Tier {tier} is not posted to Telegram — only ATOMIC and EDGE",
+            "tier": tier,
+            "message_len": 0,
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+        }
     msg = format_smartpick_telegram(payload, escape_fn=_mdv2_escape)
     result = await _send_telegram_markdownv2(msg)
     return {
         "pick_id": pick_id,
+        "tier": tier,
         "status": result["status"],
         "http_status": result.get("http_status"),
         "message_len": result["len"],

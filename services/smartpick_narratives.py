@@ -18,6 +18,44 @@ logger = logging.getLogger("sesomnod.smartpick")
 _OSLO = ZoneInfo("Europe/Oslo")
 _INACTIVE = {None, "", "NEUTRAL", "UNKNOWN", "UNAVAILABLE", "NO_DATA"}
 
+MARKET_DISPLAY_MAP = {
+    "over_25": "Over 2.5 mål",
+    "under_25": "Under 2.5 mål",
+    "over_15": "Over 1.5 mål",
+    "under_15": "Under 1.5 mål",
+    "over_35": "Over 3.5 mål",
+    "under_35": "Under 3.5 mål",
+    "btts_yes": "BTTS Ja",
+    "btts_no": "BTTS Nei",
+    "home_win": "Hjemmeseier",
+    "away_win": "Borteseier",
+    "draw": "Uavgjort",
+    "h2h": "Kampvinner",
+    # predicted_outcome enum fallbacks (uppercase):
+    "OVER_25": "Over 2.5 mål",
+    "UNDER_25": "Under 2.5 mål",
+    "BTTS_YES": "BTTS Ja",
+    "BTTS_NO": "BTTS Nei",
+    "HOME_WIN": "Hjemmeseier",
+    "AWAY_WIN": "Borteseier",
+    "DRAW": "Uavgjort",
+}
+
+
+def _resolve_market_display(candidate: dict) -> str:
+    """Pick the first non-empty source and map to readable Norwegian."""
+    raw = (
+        candidate.get("market_type")
+        or candidate.get("pick")
+        or candidate.get("selection")
+        or candidate.get("predicted_outcome")
+        or ""
+    )
+    raw_s = str(raw).strip()
+    if not raw_s:
+        return "Ukjent marked"
+    return MARKET_DISPLAY_MAP.get(raw_s, MARKET_DISPLAY_MAP.get(raw_s.lower(), raw_s))
+
 
 def _is_active(sig: Any) -> bool:
     if sig is None:
@@ -122,9 +160,9 @@ def generate_attack_angle(c: dict) -> str:
         return f"{wind_str} favoriserer Under — modellen og været konvergerer."
 
     edge_pct = _f(c.get("soft_edge")) or 0.0
-    sel = c.get("pick") or c.get("selection") or "selection"
+    market_display = _resolve_market_display(c)
     odds = _f(c.get("odds")) or 0.0
-    return f"Modellen ser +{edge_pct:.1f}% edge mot markedet på {sel} @ {odds:.2f}."
+    return f"Modellen ser +{edge_pct:.1f}% edge mot markedet på {market_display} @ {odds:.2f}."
 
 
 def generate_risks(c: dict) -> list[dict]:
@@ -189,13 +227,18 @@ def generate_risks(c: dict) -> list[dict]:
     return risks
 
 
-def calculate_confidence(c: dict, risks: list[dict]) -> str:
+def calculate_confidence(c: dict, risks: list[dict], active_signals: int | None = None) -> str:
     high = sum(1 for r in risks if r.get("severity") == "high")
     medium = sum(1 for r in risks if r.get("severity") == "medium")
     atomic = int(c.get("atomic_score") or 0)
-    if atomic >= 6 and high == 0:
+    if active_signals is None:
+        active_signals = count_active_signals(c)
+    # Hard gate: need ≥3 active signals to qualify for HIGH/MEDIUM
+    if active_signals < 3:
+        return "LOW"
+    if atomic >= 6 and active_signals >= 4 and high == 0:
         return "HIGH"
-    if atomic >= 4 and high == 0 and medium <= 2:
+    if atomic >= 4 and active_signals >= 3 and high == 0 and medium <= 2:
         return "MEDIUM"
     return "LOW"
 
@@ -274,10 +317,12 @@ async def build_smartpick_payload(candidate: dict, db) -> dict:
     pick_id is filled in by caller after INSERT.
     """
     risks = generate_risks(candidate)
-    confidence = calculate_confidence(candidate, risks)
+    active_signals = count_active_signals(candidate)
+    confidence = calculate_confidence(candidate, risks, active_signals)
     bankroll = calculate_bankroll(candidate.get("kelly_stake"))
     tier = candidate.get("tier") or "MONITORED"
     track_record = await get_tier_track_record(tier, db)
+    market_display = _resolve_market_display(candidate)
 
     kickoff = candidate.get("kickoff_time") or candidate.get("kickoff") or candidate.get("commence_time")
 
@@ -290,8 +335,8 @@ async def build_smartpick_payload(candidate: dict, db) -> dict:
             "kickoff_oslo": _format_oslo(kickoff),
         },
         "selection": {
-            "market": candidate.get("market_type", ""),
-            "side": candidate.get("pick") or candidate.get("selection", ""),
+            "market": market_display,
+            "side": "",
             "odds": _f(candidate.get("odds")),
         },
         "math": {
@@ -333,7 +378,7 @@ async def build_smartpick_payload(candidate: dict, db) -> dict:
         "attack_angle": generate_attack_angle(candidate),
         "risks": risks,
         "confidence": confidence,
-        "atomic_signals_used": count_active_signals(candidate),
+        "atomic_signals_used": active_signals,
         "bankroll": bankroll,
         "tier_track_record": track_record,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -391,7 +436,8 @@ def format_smartpick_telegram(payload: dict, escape_fn=None) -> str:
     league = e(match_["league"])
     kickoff = e(match_["kickoff_oslo"])
     market = e(sel.get("market") or "")
-    side = e(sel.get("side") or "")
+    side_raw = sel.get("side") or ""
+    side = (" " + e(side_raw)) if side_raw else ""
     odds_e = e(odds_s)
     edge_e = e(edge_s)
     ev_e = e(ev_s)
@@ -416,7 +462,7 @@ def format_smartpick_telegram(payload: dict, escape_fn=None) -> str:
         f"{home} vs {away}\n"
         f"{league} · {kickoff}\n"
         f"\n"
-        f"📊 *PICK:* {market} {side} @ {odds_e}\n"
+        f"📊 *PICK:* {market}{side} @ {odds_e}\n"
         f"💰 *Edge:* \\+{edge_e}% · *EV:* \\+{ev_e}% · *Kelly:* {kelly_e}%\n"
         f"⚛️ *Atomic Score:* {atomic_score}/9\n"
         f"\n"
