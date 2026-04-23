@@ -7853,6 +7853,14 @@ async def admin_fix_picks_v2_schema():
                 ALTER TABLE picks_v2
                 ADD COLUMN IF NOT EXISTS timestamp TIMESTAMPTZ DEFAULT NOW();
             """)
+            await conn.execute("""
+                ALTER TABLE picks_v2
+                ADD COLUMN IF NOT EXISTS smartpick_payload JSONB;
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_picks_v2_smartpick "
+                "ON picks_v2 USING GIN (smartpick_payload)"
+            )
             cols = await conn.fetch(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_name = 'picks_v2' ORDER BY column_name"
