@@ -19,3 +19,4 @@ prometheus-fastapi-instrumentator>=6.1.0
 slowapi>=0.1.9
 sentry-sdk[fastapi]>=2.0.0
 stripe>=7.0.0
+Pillow>=10.0.0
