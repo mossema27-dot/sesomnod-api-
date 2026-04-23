@@ -71,19 +71,27 @@ def _fit_model_sync() -> tuple:
     Synchronous model fitting — runs in thread via asyncio.to_thread.
     Returns (model, available_teams, data_size).
     """
-    from penaltyblog.models import DixonColesGoalModel
+    from penaltyblog.models import DixonColesGoalModel, dixon_coles_weights
     from services.football_data_fetcher import get_historical_data
 
     df = get_historical_data()
     data_size = len(df)
     logger.info("Fitting Dixon-Coles model on %d matches...", data_size)
 
+    # penaltyblog>=1.0 expects weights as a per-match array, not a scalar xi.
+    # Passing a scalar raises "len() of unsized object" in BaseGoalsModel.__init__.
+    try:
+        weights = dixon_coles_weights(df["Date"].tolist(), xi=0.0018)
+    except Exception as e:
+        logger.warning("dixon_coles_weights failed (%s); fitting with uniform weights", e)
+        weights = None
+
     model = DixonColesGoalModel(
         goals_home=df["FTHG"].tolist(),
         goals_away=df["FTAG"].tolist(),
         teams_home=df["HomeTeam"].tolist(),
         teams_away=df["AwayTeam"].tolist(),
-        weights=0.0018,  # time decay — recent matches weighted more
+        weights=weights,
     )
     model.fit()
 
@@ -188,15 +196,7 @@ async def get_dixon_coles_probs(
         draw = float(prob_grid.draw)
         away_win = float(prob_grid.away_win)
 
-        # BTTS probability: P(home scores >= 1) * P(away scores >= 1)
-        # Calculate P(home=0) and P(away=0) from grid
-        p_home_zero = sum(
-            float(prob_grid.probability(0, j)) for j in range(8)
-        )
-        p_away_zero = sum(
-            float(prob_grid.probability(i, 0)) for i in range(8)
-        )
-        btts_prob = (1.0 - p_home_zero) * (1.0 - p_away_zero)
+        btts_prob = float(prob_grid.btts_yes)
         btts_prob = max(0.0, min(1.0, btts_prob))
 
         # Edge vs market
