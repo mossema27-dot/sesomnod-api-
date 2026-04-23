@@ -3643,6 +3643,214 @@ async def post_dagens_kamp_telegram():
         logger.exception(f"[Scheduler] Uventet feil: {e}")
 
 
+# ─────────────────────────────────────────────────────────
+# MORNING BRIEF — 06:45 UTC (08:45 Oslo) daglig
+# ─────────────────────────────────────────────────────────
+def _mdv2_escape(text: str) -> str:
+    """Escape MarkdownV2 reserved chars (backslash first, then reserved set)."""
+    if text is None:
+        return ""
+    out = str(text).replace("\\", "\\\\")
+    for ch in "_*[]()~`>#+-=|{}.!":
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+async def _build_morning_brief() -> str:
+    """Bygger MarkdownV2-formattert morgen-brief. Leser data direkte fra DB."""
+    now_utc = datetime.now(timezone.utc)
+    date_str = now_utc.strftime("%Y-%m-%d")
+
+    phase0_picks = 0
+    hit_rate_pct = 0.0
+    avg_clv: float | None = None
+    last_snap_str = "ukjent"
+    api_calls_month = 0
+    top3_rows: list[dict] = []
+
+    if db_state.connected and db_state.pool:
+        try:
+            async with db_state.pool.acquire() as conn:
+                ops_row = await conn.fetchrow("""
+                    SELECT
+                        (SELECT COUNT(*) FROM dagens_kamp WHERE result IS NOT NULL) AS settled,
+                        (SELECT COUNT(*) FROM dagens_kamp dk
+                         LEFT JOIN picks_v2 pv
+                           ON pv.home_team = dk.home_team
+                           AND pv.away_team = dk.away_team
+                           AND pv.odds = dk.odds
+                           AND pv.kickoff_time = dk.kickoff
+                         WHERE dk.result IS NOT NULL
+                           AND COALESCE(pv.outcome,
+                               CASE WHEN dk.result IN ('WIN','LOSS') THEN dk.result END) = 'WIN') AS wins
+                """)
+                if ops_row and ops_row["settled"]:
+                    s = int(ops_row["settled"] or 0)
+                    w = int(ops_row["wins"] or 0)
+                    phase0_picks = s
+                    hit_rate_pct = round(w * 100.0 / s, 1) if s > 0 else 0.0
+
+                snap_row = await conn.fetchrow(
+                    "SELECT MAX(snapshot_time) AS last_snap FROM odds_snapshots"
+                )
+                if snap_row and snap_row["last_snap"]:
+                    last_snap_str = snap_row["last_snap"].strftime("%H:%M")
+
+                api_row = await conn.fetchrow(
+                    "SELECT COUNT(*) AS cnt FROM api_calls "
+                    "WHERE call_date >= DATE_TRUNC('month', CURRENT_DATE)"
+                )
+                api_calls_month = int(api_row["cnt"]) if api_row else 0
+
+                top3 = await conn.fetch("""
+                    SELECT match, pick, odds, edge, tier
+                    FROM dagens_kamp
+                    WHERE result IS NULL
+                      AND kickoff BETWEEN NOW() - INTERVAL '3 hours'
+                                      AND NOW() + INTERVAL '36 hours'
+                    ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST
+                    LIMIT 3
+                """)
+                top3_rows = [dict(r) for r in top3]
+        except Exception as e:
+            logger.warning(f"[MorningBrief] DB-feil: {e}")
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as hx:
+            r = await hx.get("https://mirofish-service-production.up.railway.app/summary")
+            if r.status_code == 200:
+                _raw = r.json().get("avg_clv")
+                if _raw is not None:
+                    avg_clv = round(float(_raw), 2)
+    except Exception as e:
+        logger.warning(f"[MorningBrief] MiroFish-feil: {e}")
+
+    health_emoji = "🟢" if db_state.connected else "🔴"
+    api_remaining = max(0, API_MONTHLY_BUDGET - api_calls_month)
+
+    gate_hr = "✅" if hit_rate_pct > 55.0 else "❌"
+    gate_clv = "✅" if (avg_clv is not None and avg_clv > 2.0) else "❌"
+    gate_picks = "✅" if phase0_picks >= 30 else "❌"
+    picks_left = max(0, 30 - phase0_picks)
+
+    clv_disp = f"{avg_clv:+.2f}" if avg_clv is not None else "n/a"
+
+    lines = []
+    lines.append(f"🌅 *SesomNod morgen {_mdv2_escape(date_str)}*")
+    lines.append("")
+    lines.append(
+        f"*Phase 0:* {phase0_picks}/30 picks · Hit {_mdv2_escape(f'{hit_rate_pct}%')} "
+        f"· CLV {_mdv2_escape(clv_disp + '%')}"
+    )
+    lines.append(
+        f"*Health:* Railway {health_emoji} · Last fetch {_mdv2_escape(last_snap_str)} UTC"
+    )
+    lines.append(
+        f"*Budget:* {api_calls_month} kall brukt · {api_remaining} igjen denne måneden"
+    )
+    lines.append("")
+    lines.append("*Dagens topp\\-3 picks:*")
+    if top3_rows:
+        for i, p in enumerate(top3_rows, 1):
+            m = _mdv2_escape(p.get("match") or "—")
+            sel = _mdv2_escape(p.get("pick") or "—")
+            odds_v = p.get("odds")
+            odds_s = _mdv2_escape(f"{float(odds_v):.2f}") if odds_v is not None else "—"
+            edge_v = p.get("edge")
+            edge_s = _mdv2_escape(f"{float(edge_v):.1f}%") if edge_v is not None else "—"
+            tier = _mdv2_escape(p.get("tier") or "—")
+            lines.append(f"{i}\\. {m} — {sel} @ {odds_s} — Edge {edge_s} — {tier}")
+    else:
+        lines.append("_ingen kvalifiserte picks_")
+    lines.append("")
+    lines.append("*Gate\\-status:*")
+    lines.append(f"{gate_hr} Hit rate \\>55%")
+    lines.append(f"{gate_clv} CLV \\>2%")
+    lines.append(f"{gate_picks} Picks ≥30")
+    lines.append(f"\\({picks_left} picks igjen til evaluering\\)")
+    lines.append("")
+
+    blockers: list[str] = []
+    if not db_state.connected:
+        blockers.append("DB offline")
+    if avg_clv is None:
+        blockers.append("MiroFish CLV utilgjengelig")
+    if api_remaining < 10:
+        blockers.append(f"API-budsjett lavt ({api_remaining} igjen)")
+    if last_snap_str == "ukjent":
+        blockers.append("ingen odds-snapshot registrert")
+
+    if blockers:
+        lines.append(f"*Blockere:* {_mdv2_escape(', '.join(blockers))}")
+    else:
+        lines.append("*Blockere:* ingen")
+
+    return "\n".join(lines)
+
+
+async def morning_brief_06_45_utc() -> dict:
+    """Daglig morgen-brief til Telegram kl 06:45 UTC (08:45 Oslo)."""
+    started = datetime.now(timezone.utc)
+    logger.info(f"[MorningBrief] Start {started.isoformat()}")
+
+    status_code = 0
+    error_msg = None
+    message = ""
+
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        logger.error("[MorningBrief] Telegram-config mangler")
+        error_msg = "telegram_config_missing"
+    else:
+        try:
+            message = await _build_morning_brief()
+        except Exception as e:
+            logger.exception(f"[MorningBrief] Bygg-feil: {e}")
+            error_msg = f"build_error: {e}"
+
+        if message:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": cfg.TELEGRAM_CHAT_ID,
+                            "text": message,
+                            "parse_mode": "MarkdownV2",
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                    status_code = resp.status_code
+                    if resp.status_code != 200:
+                        error_msg = f"telegram_{resp.status_code}: {resp.text[:200]}"
+                        logger.error(f"[MorningBrief] {error_msg}")
+                    else:
+                        logger.info("[MorningBrief] Sendt til Telegram OK")
+            except Exception as e:
+                logger.exception(f"[MorningBrief] Send-feil: {e}")
+                error_msg = f"send_error: {e}"
+
+    if db_state.connected and db_state.pool:
+        try:
+            async with db_state.pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO api_calls (window_name, league_key, status_code) "
+                    "VALUES ($1, $2, $3)",
+                    "morning_brief",
+                    "system",
+                    status_code,
+                )
+        except Exception as e:
+            logger.warning(f"[MorningBrief] api_calls-logg feilet: {e}")
+
+    return {
+        "status": "ok" if status_code == 200 else "error",
+        "http_status": status_code,
+        "error": error_msg,
+        "ts_utc": started.isoformat(),
+        "message_len": len(message),
+    }
+
+
 async def _check_live_results():
     """
     Runs every 15 minutes 24/7.
@@ -4295,11 +4503,24 @@ async def lifespan(app: FastAPI):
             coalesce=True,
         )
 
+    # Daglig morgen-brief 06:45 UTC (08:45 Oslo)
+    if not scheduler.get_job("morning_brief"):
+        scheduler.add_job(
+            morning_brief_06_45_utc,
+            trigger=CronTrigger(hour=6, minute=45, timezone="UTC"),
+            id="morning_brief",
+            misfire_grace_time=900,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            name="Morning Brief 06:45 UTC",
+        )
+
     scheduler.start()
     logger.info(
         "[Scheduler] Startet — "
         "3-vindu: Early 07:00 (8L) | Evening 18:00 (4L) | Pre-KO 20:00 (cache) | "
-        "Post: 09:00 | CLV: 30min | CLV-rapport: man 08:00 | NoBet-verdict: 23:30 UTC"
+        "Post: 09:00 | Morning brief: 06:45 | CLV: 30min | CLV-rapport: man 08:00 | NoBet-verdict: 23:30 UTC"
     )
 
     if db_state.connected:
@@ -7125,6 +7346,27 @@ async def operator_status():
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+
+@app.post("/admin/trigger-morning-brief")
+async def admin_trigger_morning_brief():
+    """Manuell trigger av morgen-brief for test/verifikasjon."""
+    try:
+        result = await morning_brief_06_45_utc()
+        return result
+    except Exception as e:
+        logger.exception(f"[AdminTrigger] Morning brief feilet: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/morning-brief-preview")
+async def admin_morning_brief_preview():
+    """Returnerer brief-tekst uten å sende til Telegram."""
+    try:
+        text = await _build_morning_brief()
+        return {"message": text, "length": len(text)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
 @app.post("/admin/create-operator-table")
