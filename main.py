@@ -4869,26 +4869,11 @@ async def get_smartpick(pick_id: int):
 
 async def _load_or_build_smartpick(pick_id: int) -> dict:
     """Helper: load cached SmartPick or build inline from picks_v2 row.
-    JOINs dagens_kamp to recover market_type + pick (not persisted in picks_v2)."""
+    Defensively recovers market_type + pick from dagens_kamp via separate query."""
     if not db_state.connected or not db_state.pool:
         raise HTTPException(503, "Database unavailable")
     async with db_state.pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT p.*,
-                   dk.market_type AS dk_market_type,
-                   dk.pick AS dk_pick
-            FROM picks_v2 p
-            LEFT JOIN LATERAL (
-                SELECT market_type, pick
-                FROM dagens_kamp
-                WHERE home_team = p.home_team
-                  AND away_team = p.away_team
-                  AND kickoff::date = p.kickoff_time::date
-                ORDER BY id DESC
-                LIMIT 1
-            ) dk ON TRUE
-            WHERE p.id = $1
-        """, pick_id)
+        row = await conn.fetchrow("SELECT * FROM picks_v2 WHERE id = $1", pick_id)
         if not row:
             raise HTTPException(404, f"Pick {pick_id} not found")
         payload = row["smartpick_payload"]
@@ -4896,15 +4881,30 @@ async def _load_or_build_smartpick(pick_id: int) -> dict:
             if isinstance(payload, str):
                 payload = json.loads(payload)
             return payload
-        # Build inline from picks_v2 row (may have sparse fields)
         candidate = dict(row)
         candidate.setdefault("edge", candidate.get("soft_edge"))
         candidate.setdefault("ev", candidate.get("soft_ev"))
-        # Recover market_type / pick from dagens_kamp LATERAL
-        if candidate.get("dk_market_type"):
-            candidate["market_type"] = candidate["dk_market_type"]
-        if candidate.get("dk_pick"):
-            candidate["pick"] = candidate["dk_pick"]
+        # Defensive dagens_kamp lookup with statement_timeout to recover market_type + pick
+        try:
+            await conn.execute("SET LOCAL statement_timeout = '2000ms'")
+            dk_row = await conn.fetchrow(
+                """
+                SELECT market_type, pick FROM dagens_kamp
+                WHERE home_team = $1 AND away_team = $2
+                  AND kickoff::date = $3::date
+                ORDER BY id DESC LIMIT 1
+                """,
+                candidate.get("home_team"),
+                candidate.get("away_team"),
+                candidate.get("kickoff_time"),
+            )
+            if dk_row:
+                if dk_row["market_type"]:
+                    candidate["market_type"] = dk_row["market_type"]
+                if dk_row["pick"]:
+                    candidate["pick"] = dk_row["pick"]
+        except Exception as e:
+            logger.warning(f"[SmartPick] dagens_kamp lookup skipped for pick {pick_id}: {e}")
         payload = await build_smartpick_payload(candidate, conn)
         payload["pick_id"] = pick_id
         return payload
