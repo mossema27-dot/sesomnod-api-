@@ -53,6 +53,10 @@ from services.receipt_engine import create_or_update_receipt
 from services.market_scanner import MarketScanner
 from services.mirofish_agent import MiroFishAgent, apply_mirofish_to_omega
 from services.atlas_engine import atlas_run_clv_closer, atlas_calculate_dqs
+from services.smartpick_narratives import (
+    build_smartpick_payload,
+    format_smartpick_telegram,
+)
 from services.no_bet_verdict import log_rejected_pick, fill_no_bet_verdicts
 from services.the_operator import (
     get_today_state as operator_get_today_state,
@@ -972,7 +976,12 @@ async def ensure_tables(pool: asyncpg.Pool):
                     ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS home_odds_raw NUMERIC(5,2);
                     ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS draw_odds_raw NUMERIC(5,2);
                     ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS away_odds_raw NUMERIC(5,2);
+                    ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS smartpick_payload JSONB;
                 """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_picks_v2_smartpick "
+                    "ON picks_v2 USING GIN (smartpick_payload)"
+                )
             logger.info("[DB] picks_v2 prob_source + raw odds columns OK")
 
             # ── Backfill: copy raw odds from dagens_kamp → picks_v2 ──
@@ -2569,8 +2578,9 @@ async def run_analysis():
             )
             newly_inserted.append({"id": row_id, **pick, "total_scanned": total_scanned})
             logger.info(f"[Analyse] Ny pick (id={row_id}): {pick['pick']} @ {pick['odds']} SCORE={pick['score']}")
-            # Sync to picks_v2
-            await _sync_to_picks_v2({**pick, "match": f"{pick['home_team']} vs {pick['away_team']}", "kickoff": kickoff_dt}, row_id)
+            # Sync to picks_v2 — capture v2_id for SmartPick payload persistence
+            v2_id = await _sync_to_picks_v2({**pick, "match": f"{pick['home_team']} vs {pick['away_team']}", "kickoff": kickoff_dt}, row_id)
+            newly_inserted[-1]["v2_id"] = v2_id
 
     if not newly_inserted:
         logger.info("[Analyse] Ingen nye picks (alle allerede i DB)")
@@ -2594,29 +2604,70 @@ async def run_analysis():
 
     rank = 1
     for pick in postable[:posts_left]:
-        try:
-            message = _format_pick_message(pick, rank=rank, total_scanned=total_scanned)
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
-                    json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
-                )
-            if resp.status_code == 200:
+        dk_id = pick["id"]
+        v2_id = pick.get("v2_id")
+        posted_ok = False
+
+        # ── SmartPick v1: 3-layer MarkdownV2 format + JSONB cache ──
+        if v2_id:
+            try:
+                async with db_state.pool.acquire() as conn:
+                    payload = await build_smartpick_payload(pick, conn)
+                    payload["pick_id"] = v2_id
+                    await conn.execute(
+                        "UPDATE picks_v2 SET smartpick_payload = $1::jsonb WHERE id = $2",
+                        json.dumps(payload, default=str), v2_id,
+                    )
+                msg = format_smartpick_telegram(payload, escape_fn=_mdv2_escape)
+                result = await _send_telegram_markdownv2(msg)
+                if result["status"] == "ok":
+                    posted_ok = True
+                    logger.info(
+                        f"[SmartPick] Postet v2_id={v2_id} dk_id={dk_id} "
+                        f"{pick['home_team']} vs {pick['away_team']} "
+                        f"[{pick.get('tier','?')}] len={result['len']}"
+                    )
+                else:
+                    logger.warning(
+                        f"[SmartPick] Send failed for v2_id={v2_id}: {result} — falling back"
+                    )
+            except Exception as e:
+                logger.error(f"[SmartPick] Build/send exception for v2_id={v2_id}: {e}")
+
+        # ── Fallback: legacy plain-text format ──
+        if not posted_ok:
+            try:
+                message = _format_pick_message(pick, rank=rank, total_scanned=total_scanned)
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+                    )
+                if resp.status_code == 200:
+                    posted_ok = True
+                    logger.info(
+                        f"[Analyse] Fallback-posted: {pick['pick']} — "
+                        f"{pick['home_team']} vs {pick['away_team']} [{pick.get('tier','?')}]"
+                    )
+                else:
+                    logger.error(f"[Analyse] Telegram fallback feil {resp.status_code}: {resp.text[:200]}")
+            except Exception as e:
+                logger.exception(f"[Analyse] Fallback feil ved posting id={dk_id}: {e}")
+
+        # ── Post-send bookkeeping: dagens_kamp flag + MiroFish tracking ──
+        if posted_ok:
+            try:
                 async with db_state.pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE dagens_kamp SET telegram_posted = TRUE WHERE id = $1",
-                        pick["id"]
+                        dk_id,
                     )
-                logger.info(f"[Analyse] Postet til Telegram: {pick['pick']} — {pick['home_team']} vs {pick['away_team']} [{pick.get('tier','?')}]")
-                # MiroFish CLV tracking — fire-and-forget, fails silently
-                try:
-                    asyncio.create_task(_log_pick_to_mirofish(pick))
-                except Exception as _e:
-                    logger.warning(f"[Analyse] MiroFish tracking ikke kritisk: {_e}")
-            else:
-                logger.error(f"[Analyse] Telegram feil {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            logger.exception(f"[Analyse] Feil ved posting id={pick['id']}: {e}")
+            except Exception as _e:
+                logger.warning(f"[Analyse] telegram_posted flag update failed: {_e}")
+            try:
+                asyncio.create_task(_log_pick_to_mirofish(pick))
+            except Exception as _e:
+                logger.warning(f"[Analyse] MiroFish tracking ikke kritisk: {_e}")
         rank += 1
 
     skipped = len(postable) - posts_left
@@ -2644,13 +2695,14 @@ def _selection_to_predicted_outcome(selection: str) -> str:
     return "HOME_WIN"
 
 
-async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
-    """Mirror a dagens_kamp row into picks_v2 so every pick is tracked."""
+async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
+    """Mirror a dagens_kamp row into picks_v2 so every pick is tracked.
+    Returns the picks_v2.id on success, None on failure. Never raises."""
     if not db_state.connected or not db_state.pool:
-        return
+        return None
     try:
         async with db_state.pool.acquire() as conn:
-            await conn.execute("""
+            v2_id = await conn.fetchval("""
                 INSERT INTO picks_v2 (
                     match_name, home_team, away_team, league,
                     kickoff_time, odds, soft_edge, soft_ev,
@@ -2670,6 +2722,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                     $20,
                     NOW(), NOW(), NOW()
                 )
+                RETURNING id
             """,
                 pick.get("match") or f"{pick.get('home_team','')} vs {pick.get('away_team','')}",
                 pick.get("home_team", ""),
@@ -2692,9 +2745,11 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int):
                 "implied" if pick.get("home_odds_raw") and pick.get("draw_odds_raw") and pick.get("away_odds_raw") else None,
                 _selection_to_predicted_outcome(pick.get("pick") or pick.get("selection") or ""),
             )
-        logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id}: {pick.get('match') or pick.get('home_team','?')}")
+        logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id} → picks_v2 id={v2_id}: {pick.get('match') or pick.get('home_team','?')}")
+        return v2_id
     except Exception as e:
         logger.warning(f"[picks_v2] Sync feil for dagens_kamp id={dagens_kamp_id}: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────
@@ -3656,6 +3711,33 @@ def _mdv2_escape(text: str) -> str:
     return out
 
 
+async def _send_telegram_markdownv2(msg: str) -> dict:
+    """SmartPick MarkdownV2 sender. Returns {status, http_status, len}.
+    status: ok | fail | too_long | no_config | exception"""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return {"status": "no_config", "http_status": 0, "len": len(msg)}
+    if len(msg) > 4096:
+        return {"status": "too_long", "http_status": 0, "len": len(msg)}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": cfg.TELEGRAM_CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "MarkdownV2",
+                },
+            )
+        return {
+            "status": "ok" if resp.status_code == 200 else "fail",
+            "http_status": resp.status_code,
+            "len": len(msg),
+            "response_body": resp.text[:300] if resp.status_code != 200 else None,
+        }
+    except Exception as e:
+        return {"status": "exception", "http_status": 0, "len": len(msg), "error": str(e)[:200]}
+
+
 async def _build_morning_brief() -> str:
     """Bygger MarkdownV2-formattert morgen-brief. Leser data direkte fra DB."""
     now_utc = datetime.now(timezone.utc)
@@ -4392,14 +4474,16 @@ async def lifespan(app: FastAPI):
     )
     # ──────────────────────────────────────────────────────────────
 
-    # Post 09:00 UTC
-    scheduler.add_job(
-        post_dagens_kamp_telegram,
-        trigger=CronTrigger(hour=9, minute=0, timezone="UTC"),
-        id="post_dagens_kamp",
-        misfire_grace_time=300,
-        replace_existing=True,
-    )
+    # DEAKTIVERT 2026-04-23 — erstattet av real-time SmartPick-posting
+    # i run_analysis (posting-loop ved linje ~2605). Behold for rollback.
+    # Funksjon post_dagens_kamp_telegram() ved linje ~3579 er uendret.
+    # scheduler.add_job(
+    #     post_dagens_kamp_telegram,
+    #     trigger=CronTrigger(hour=9, minute=0, timezone="UTC"),
+    #     id="post_dagens_kamp",
+    #     misfire_grace_time=300,
+    #     replace_existing=True,
+    # )
 
     # CLV tracking hvert 30. minutt
     scheduler.add_job(
@@ -4758,6 +4842,83 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/smartpick/{pick_id}")
+async def get_smartpick(pick_id: int):
+    """Return cached SmartPick payload for a picks_v2 row."""
+    if not db_state.connected or not db_state.pool:
+        raise HTTPException(503, "Database unavailable")
+    async with db_state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT smartpick_payload FROM picks_v2 WHERE id = $1", pick_id
+        )
+    if not row:
+        raise HTTPException(404, f"Pick {pick_id} not found")
+    payload = row["smartpick_payload"]
+    if not payload:
+        raise HTTPException(404, f"SmartPick payload not cached for pick {pick_id}")
+    # asyncpg returns JSONB as dict OR str depending on codec — normalize
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            raise HTTPException(500, "Corrupt smartpick_payload")
+    return payload
+
+
+async def _load_or_build_smartpick(pick_id: int) -> dict:
+    """Helper: load cached SmartPick or build inline from picks_v2 row."""
+    if not db_state.connected or not db_state.pool:
+        raise HTTPException(503, "Database unavailable")
+    async with db_state.pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM picks_v2 WHERE id = $1", pick_id)
+        if not row:
+            raise HTTPException(404, f"Pick {pick_id} not found")
+        payload = row["smartpick_payload"]
+        if payload:
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return payload
+        # Build inline from picks_v2 row (may have sparse fields)
+        candidate = dict(row)
+        # Normalize legacy field aliases used by candidate-dict
+        candidate.setdefault("edge", candidate.get("soft_edge"))
+        candidate.setdefault("ev", candidate.get("soft_ev"))
+        candidate.setdefault("pick", "")
+        candidate.setdefault("market_type", "")
+        payload = await build_smartpick_payload(candidate, conn)
+        payload["pick_id"] = pick_id
+        return payload
+
+
+@app.post("/admin/test-smartpick/{pick_id}")
+async def admin_test_smartpick(pick_id: int):
+    """Admin: send SmartPick to Telegram for an existing pick."""
+    payload = await _load_or_build_smartpick(pick_id)
+    msg = format_smartpick_telegram(payload, escape_fn=_mdv2_escape)
+    result = await _send_telegram_markdownv2(msg)
+    return {
+        "pick_id": pick_id,
+        "status": result["status"],
+        "http_status": result.get("http_status"),
+        "message_len": result["len"],
+        "response_body": result.get("response_body"),
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/admin/smartpick-preview/{pick_id}")
+async def admin_smartpick_preview(pick_id: int):
+    """Admin: render SmartPick text without sending to Telegram."""
+    payload = await _load_or_build_smartpick(pick_id)
+    msg = format_smartpick_telegram(payload, escape_fn=_mdv2_escape)
+    return {
+        "pick_id": pick_id,
+        "message": msg,
+        "length": len(msg),
+        "payload": payload,
+    }
 
 
 @app.get("/health")
