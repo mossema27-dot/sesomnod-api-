@@ -40,6 +40,7 @@ from datetime import datetime, timezone, timedelta
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -3738,6 +3739,108 @@ async def _send_telegram_markdownv2(msg: str) -> dict:
         return {"status": "exception", "http_status": 0, "len": len(msg), "error": str(e)[:200]}
 
 
+def _build_short_photo_caption(payload: dict) -> str:
+    """Plain-text short caption (≤1024) for sendPhoto when full SmartPick > 1024 chars."""
+    sel = payload.get("selection") or {}
+    math = payload.get("math") or {}
+    match = payload.get("match") or {}
+    tier = str(math.get("tier", "") or "").upper() or "PICK"
+    home = str(match.get("home_team", "") or "—")
+    away = str(match.get("away_team", "") or "—")
+    market = str(sel.get("market", "") or "")
+    try:
+        odds_str = f"{float(sel.get('odds') or 0):.2f}"
+    except (TypeError, ValueError):
+        odds_str = "0.00"
+    caption = f"{tier} · {home} vs {away}\n{market} @ {odds_str}"
+    return caption[:1024]
+
+
+async def _send_smartpick_with_image(payload: dict, caption: str) -> dict:
+    """SmartPick sender with PNG header — sendPhoto + optional MarkdownV2 follow-up.
+
+    Flow:
+      1. Generate 1200x628 PNG from payload (via services.smartpick_image_generator).
+      2. If caption ≤ 1024 chars: sendPhoto with full caption (MarkdownV2).
+      3. If caption > 1024 chars: sendPhoto with short plain-text caption,
+         then sendMessage follow-up with full MarkdownV2 body.
+      4. On any image/sendPhoto failure: fall back to plain _send_telegram_markdownv2.
+
+    Returns: {status, http_status, len, mode: photo|text, followup?: dict}
+    """
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        return {"status": "no_config", "http_status": 0, "len": len(caption), "mode": "photo"}
+
+    # 1. Generate image
+    try:
+        from services.smartpick_image_generator import (
+            generate_smartpick_image,
+            TELEGRAM_PHOTO_CAPTION_MAX,
+        )
+        image_bytes = generate_smartpick_image(payload)
+    except Exception as e:
+        logger.error(f"[SmartPick] Image generation failed — falling back to text: {e}")
+        fallback = await _send_telegram_markdownv2(caption)
+        fallback["mode"] = "text_fallback"
+        return fallback
+
+    # 2. Prepare caption + optional follow-up
+    if len(caption) <= TELEGRAM_PHOTO_CAPTION_MAX:
+        photo_caption = caption
+        photo_parse_mode = "MarkdownV2"
+        followup_text: str | None = None
+    else:
+        photo_caption = _build_short_photo_caption(payload)
+        photo_parse_mode = None  # plain text — no MarkdownV2 escaping needed
+        followup_text = caption
+
+    # 3. sendPhoto
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            files = {"photo": ("smartpick.png", image_bytes, "image/png")}
+            data: dict[str, str] = {
+                "chat_id": str(cfg.TELEGRAM_CHAT_ID),
+                "caption": photo_caption,
+            }
+            if photo_parse_mode:
+                data["parse_mode"] = photo_parse_mode
+            resp = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendPhoto",
+                data=data,
+                files=files,
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                f"[SmartPick] sendPhoto failed {resp.status_code}: "
+                f"{resp.text[:200]} — falling back to text"
+            )
+            fallback = await _send_telegram_markdownv2(caption)
+            fallback["mode"] = "text_fallback"
+            fallback["photo_error"] = f"{resp.status_code}: {resp.text[:200]}"
+            return fallback
+    except Exception as e:
+        logger.error(f"[SmartPick] sendPhoto exception: {e} — falling back to text")
+        fallback = await _send_telegram_markdownv2(caption)
+        fallback["mode"] = "text_fallback"
+        fallback["photo_error"] = str(e)[:200]
+        return fallback
+
+    result = {
+        "status": "ok",
+        "http_status": 200,
+        "len": len(photo_caption),
+        "mode": "photo",
+        "image_bytes": len(image_bytes),
+    }
+
+    # 4. Optional follow-up text message for long captions
+    if followup_text:
+        followup = await _send_telegram_markdownv2(followup_text)
+        result["followup"] = followup
+
+    return result
+
+
 async def _build_morning_brief() -> str:
     """Bygger MarkdownV2-formattert morgen-brief. Leser data direkte fra DB."""
     now_utc = datetime.now(timezone.utc)
@@ -4395,6 +4498,26 @@ async def _auto_settle_results():
 
 
 # ─────────────────────────────────────────────────────────
+# OBSERVABILITY STATE (admin endpoints — read-only)
+# ─────────────────────────────────────────────────────────
+# Captures last execution metadata for each scheduler job.
+# Populated via APScheduler event listener; read by /admin/scheduler-health.
+_scheduler_run_history: dict[str, dict] = {}
+
+# 60s TTL cache for /admin/phase0-stats keyed by window_days.
+_phase0_stats_cache: dict[int, tuple[float, dict]] = {}
+_PHASE0_CACHE_TTL_SEC = 60
+
+
+def _scheduler_job_event(event):
+    _scheduler_run_history[event.job_id] = {
+        "last_run_utc": datetime.now(timezone.utc).isoformat(),
+        "last_success": event.exception is None,
+        "last_error": (str(event.exception)[:200] if event.exception else None),
+    }
+
+
+# ─────────────────────────────────────────────────────────
 # NO-BET VERDICT JOB (defined before scheduler setup)
 # ─────────────────────────────────────────────────────────
 async def _no_bet_verdict_job():
@@ -4601,6 +4724,9 @@ async def lifespan(app: FastAPI):
         )
 
     scheduler.start()
+    # Expose scheduler to request handlers (read-only) and capture per-job execution history.
+    app.state.scheduler = scheduler
+    scheduler.add_listener(_scheduler_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     logger.info(
         "[Scheduler] Startet — "
         "3-vindu: Early 07:00 (8L) | Evening 18:00 (4L) | Pre-KO 20:00 (cache) | "
@@ -4949,6 +5075,55 @@ async def admin_smartpick_preview(pick_id: int):
         "length": len(msg),
         "payload": payload,
     }
+
+
+@app.post("/admin/test-smartpick-image/{pick_id}")
+async def admin_test_smartpick_image(pick_id: int):
+    """Admin: send SmartPick WITH branded image header to Telegram.
+
+    Uses sendPhoto (1200x628 PNG) with MarkdownV2 caption. Falls back to
+    plain sendMessage if image generation or sendPhoto fails.
+    MONITORED tier is blocked from posting per policy — use preview instead.
+    """
+    payload = await _load_or_build_smartpick(pick_id)
+    tier = (payload.get("math") or {}).get("tier") or "MONITORED"
+    if tier not in ("ATOMIC", "EDGE"):
+        return {
+            "pick_id": pick_id,
+            "status": "skipped",
+            "reason": f"Tier {tier} is not posted to Telegram — only ATOMIC and EDGE",
+            "tier": tier,
+            "message_len": 0,
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    msg = format_smartpick_telegram(payload, escape_fn=_mdv2_escape)
+    result = await _send_smartpick_with_image(payload, msg)
+    return {
+        "pick_id": pick_id,
+        "tier": tier,
+        "status": result["status"],
+        "http_status": result.get("http_status"),
+        "mode": result.get("mode"),
+        "message_len": result.get("len", 0),
+        "image_bytes": result.get("image_bytes"),
+        "photo_error": result.get("photo_error"),
+        "followup": result.get("followup"),
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/admin/smartpick-image-preview/{pick_id}")
+async def admin_smartpick_image_preview(pick_id: int):
+    """Admin: generate and return the SmartPick PNG as image bytes.
+
+    Useful for inspecting the image without touching Telegram.
+    Returns image/png binary response.
+    """
+    from fastapi.responses import Response
+    from services.smartpick_image_generator import generate_smartpick_image
+    payload = await _load_or_build_smartpick(pick_id)
+    png_bytes = generate_smartpick_image(payload)
+    return Response(content=png_bytes, media_type="image/png")
 
 
 @app.get("/health")
@@ -9619,6 +9794,137 @@ async def _ladder_history_compat():
             "milestones": [],
             "next_pick": None,
         }
+
+
+# ─────────────────────────────────────────────────────────
+# ADMIN OBSERVABILITY ENDPOINTS — read-only, no schema mutation
+# ─────────────────────────────────────────────────────────
+
+@app.get("/admin/phase0-stats")
+async def admin_phase0_stats(window: int = 30):
+    """Phase-0/Phase-1 gate telemetry over a settled-pick window.
+
+    Window-aggregated counts and gate booleans derived from picks_v2.
+    Field naming uses 'phase0' for path consistency, but threshold logic
+    follows compute_phase1_gate (per CLAUDE.md). 60s in-memory cache.
+    """
+    if window not in (7, 30, 60):
+        window = 30
+
+    cached = _phase0_stats_cache.get(window)
+    if cached and (time.time() - cached[0]) < _PHASE0_CACHE_TTL_SEC:
+        return cached[1]
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status='RESULT_LOGGED')                                    AS settled_count,
+                    COUNT(*) FILTER (WHERE tier='ATOMIC')                                             AS atomic_count,
+                    COUNT(*) FILTER (WHERE tier='EDGE')                                               AS edge_count,
+                    COUNT(*) FILTER (WHERE tier='MONITORED')                                          AS monitored_count,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED')      AS settled_atomic_edge,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_atomic_edge,
+                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE) AS avg_clv_pct,
+                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED')    AS avg_brier_score
+                FROM picks_v2
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                """,
+                str(window),
+            )
+
+        settled_ae = int(row["settled_atomic_edge"] or 0)
+        wins_ae = int(row["wins_atomic_edge"] or 0)
+        hit_rate_pct = round(wins_ae * 100.0 / settled_ae, 1) if settled_ae > 0 else None
+        clv_avg_pct = round(float(row["avg_clv_pct"]), 2) if row["avg_clv_pct"] is not None else None
+        brier_score = round(float(row["avg_brier_score"]), 4) if row["avg_brier_score"] is not None else None
+
+        gate_1_pass = settled_ae >= 30
+        gate_2_pass = hit_rate_pct is not None and hit_rate_pct > 55.0
+        gate_3_pass = clv_avg_pct is not None and clv_avg_pct >= 2.0
+        gate_4_pass = brier_score is not None and brier_score < 0.25
+
+        def _verdict(pass_flag: bool, value_str: str) -> str:
+            return f"PASS ({value_str})" if pass_flag else f"FAIL ({value_str})"
+
+        payload = {
+            "window_days": window,
+            "settled_count": int(row["settled_count"] or 0),
+            "atomic_count": int(row["atomic_count"] or 0),
+            "edge_count": int(row["edge_count"] or 0),
+            "monitored_count": int(row["monitored_count"] or 0),
+            "settled_atomic_edge": settled_ae,
+            "wins_atomic_edge": wins_ae,
+            "hit_rate_pct": hit_rate_pct,
+            "clv_avg_pct": clv_avg_pct,
+            "brier_score": brier_score,
+            "max_drawdown_pct": None,
+            "phase0_gate_status": {
+                "gate_1_30_picks": _verdict(gate_1_pass, f"{settled_ae}/30"),
+                "hit_rate_55pct": _verdict(gate_2_pass, f"{hit_rate_pct}%" if hit_rate_pct is not None else "n/a"),
+                "clv_2pct": _verdict(gate_3_pass, f"{clv_avg_pct}%" if clv_avg_pct is not None else "n/a"),
+                "brier_under_025": _verdict(gate_4_pass, f"{brier_score}" if brier_score is not None else "n/a"),
+                "drawdown_under_20pct": "DEFERRED (sequential P&L not in single-aggregate SQL)",
+            },
+            "_notes": {
+                "naming": "Path uses 'phase0' for caller compatibility; threshold logic = compute_phase1_gate per CLAUDE.md.",
+                "tier_filter": "hit_rate_pct restricted to tier IN ('ATOMIC','EDGE'); MONITORED/SKIP excluded.",
+                "drawdown": "max_drawdown_pct deferred — requires per-pick chronological stake+result traversal.",
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        _phase0_stats_cache[window] = (time.time(), payload)
+        return payload
+    except Exception as e:
+        logger.error(f"/admin/phase0-stats error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/scheduler-health")
+async def admin_scheduler_health(request: Request):
+    """APScheduler job inventory + last-run telemetry from in-memory listener."""
+    sch = getattr(request.app.state, "scheduler", None)
+    if sch is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "scheduler_running": False,
+                "error": "scheduler not attached to app.state",
+                "jobs": [],
+                "computed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    jobs = []
+    for j in sch.get_jobs():
+        history = _scheduler_run_history.get(j.id, {})
+        jobs.append({
+            "id": j.id,
+            "name": j.name or j.id,
+            "next_run_utc": j.next_run_time.isoformat() if j.next_run_time else None,
+            "last_run_utc": history.get("last_run_utc"),
+            "last_success": history.get("last_success"),
+            "last_error": history.get("last_error"),
+            "trigger": str(j.trigger) if j.trigger else None,
+        })
+
+    return {
+        "scheduler_running": bool(getattr(sch, "running", False)),
+        "job_count": len(jobs),
+        "jobs": jobs,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/admin/scheduler/jobs")
+async def admin_scheduler_jobs_alias(request: Request):
+    """Backward-compatible alias for /admin/scheduler-health (fixes prior 404)."""
+    return await admin_scheduler_health(request)
 
 
 # ─────────────────────────────────────────────────────────
