@@ -9878,7 +9878,7 @@ async def admin_phase0_stats(window: int = 30):
                     COUNT(*) FILTER (WHERE tier='MONITORED')                                          AS monitored_count,
                     COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED')      AS settled_atomic_edge,
                     COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_atomic_edge,
-                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE) AS avg_clv_pct,
+                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE) AS avg_model_edge_pct,
                     AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED')    AS avg_brier_score
                 FROM picks_v2
                 WHERE created_at >= NOW() - ($1 || ' days')::interval
@@ -9889,8 +9889,22 @@ async def admin_phase0_stats(window: int = 30):
         settled_ae = int(row["settled_atomic_edge"] or 0)
         wins_ae = int(row["wins_atomic_edge"] or 0)
         hit_rate_pct = round(wins_ae * 100.0 / settled_ae, 1) if settled_ae > 0 else None
-        clv_avg_pct = round(float(row["avg_clv_pct"]), 2) if row["avg_clv_pct"] is not None else None
+        model_edge_pinnacle_pre_pct = round(float(row["avg_model_edge_pct"]), 2) if row["avg_model_edge_pct"] is not None else None
         brier_score = round(float(row["avg_brier_score"]), 4) if row["avg_brier_score"] is not None else None
+
+        # Fetch real CLV from MiroFish (source of truth, all-time aggregate)
+        clv_avg_pct = None
+        clv_source = "unavailable"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as _hx:
+                _mf = await _hx.get("https://mirofish-service-production.up.railway.app/summary")
+                if _mf.status_code == 200:
+                    _raw = _mf.json().get("avg_clv")
+                    if _raw is not None:
+                        clv_avg_pct = round(float(_raw), 2)
+                        clv_source = "mirofish"
+        except Exception as _e:
+            logger.warning(f"/admin/phase0-stats MiroFish CLV fetch failed: {_e}")
 
         gate_1_pass = settled_ae >= 30
         gate_2_pass = hit_rate_pct is not None and hit_rate_pct > 55.0
@@ -9910,12 +9924,17 @@ async def admin_phase0_stats(window: int = 30):
             "wins_atomic_edge": wins_ae,
             "hit_rate_pct": hit_rate_pct,
             "clv_avg_pct": clv_avg_pct,
+            "clv_source": clv_source,
+            "model_edge_pinnacle_pre_pct": model_edge_pinnacle_pre_pct,
             "brier_score": brier_score,
             "max_drawdown_pct": None,
             "phase0_gate_status": {
                 "gate_1_30_picks": _verdict(gate_1_pass, f"{settled_ae}/30"),
                 "hit_rate_55pct": _verdict(gate_2_pass, f"{hit_rate_pct}%" if hit_rate_pct is not None else "n/a"),
-                "clv_2pct": _verdict(gate_3_pass, f"{clv_avg_pct}%" if clv_avg_pct is not None else "n/a"),
+                "clv_2pct": (
+                    "PENDING (mirofish unavailable)" if clv_source == "unavailable"
+                    else _verdict(gate_3_pass, f"{clv_avg_pct}%" if clv_avg_pct is not None else "n/a")
+                ),
                 "brier_under_025": _verdict(gate_4_pass, f"{brier_score}" if brier_score is not None else "n/a"),
                 "drawdown_under_20pct": "DEFERRED (sequential P&L not in single-aggregate SQL)",
             },
@@ -9923,6 +9942,9 @@ async def admin_phase0_stats(window: int = 30):
                 "naming": "Path uses 'phase0' for caller compatibility; threshold logic = compute_phase1_gate per CLAUDE.md.",
                 "tier_filter": "hit_rate_pct restricted to tier IN ('ATOMIC','EDGE'); MONITORED/SKIP excluded.",
                 "drawdown": "max_drawdown_pct deferred — requires per-pick chronological stake+result traversal.",
+                "clv_avg_pct": "Real closing-line value from MiroFish (Pinnacle no-vig). All-time aggregate, not window-bounded.",
+                "model_edge_pinnacle_pre_pct": "Pre-game model-edge vs Pinnacle no-vig from picks_v2.pinnacle_clv. Window-bounded. NOT classical CLV.",
+                "clv_source": "'mirofish' = live truth source; 'unavailable' = MiroFish unreachable, gate_3 returns PENDING.",
             },
             "computed_at": datetime.now(timezone.utc).isoformat(),
         }
