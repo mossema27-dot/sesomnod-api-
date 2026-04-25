@@ -10062,6 +10062,114 @@ async def admin_scheduler_jobs_alias(request: Request):
     return await admin_scheduler_health(request)
 
 
+# 60s TTL cache for /admin/picks-by-league-tier keyed by (window, tier_filter).
+_picks_by_league_cache: dict[tuple[int, str], tuple[float, dict]] = {}
+
+# Whitelist for tier_filter — values are SQL fragments, NEVER built from user input.
+_PICKS_TIER_FILTER_CLAUSES: dict[str, str] = {
+    "all":         "",
+    "atomic":      "AND tier = 'ATOMIC'",
+    "edge":        "AND tier = 'EDGE'",
+    "monitored":   "AND tier = 'MONITORED'",
+    "atomic_edge": "AND tier IN ('ATOMIC','EDGE')",
+}
+
+
+@app.get("/admin/picks-by-league-tier")
+async def admin_picks_by_league_tier(window: int = 30, tier_filter: str = "all"):
+    """League-distribution analysis with tier breakdown.
+
+    Window-bounded aggregate over picks_v2.league. Per-league columns:
+    total, tier counts, settled_atomic_edge wins, hit_rate, avg_model_edge.
+    Read-only. NULL leagues collapse to '(unknown)'. 60s in-memory cache
+    keyed by (window, tier_filter).
+    """
+    if window not in (7, 30, 60, 90):
+        window = 30
+    if tier_filter not in _PICKS_TIER_FILTER_CLAUSES:
+        tier_filter = "all"
+
+    cache_key = (window, tier_filter)
+    cached = _picks_by_league_cache.get(cache_key)
+    if cached and (time.time() - cached[0]) < _PHASE0_CACHE_TTL_SEC:
+        return cached[1]
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    tier_clause = _PICKS_TIER_FILTER_CLAUSES[tier_filter]
+    sql = f"""
+        WITH base AS (
+            SELECT
+                COALESCE(NULLIF(league, ''), '(unknown)') AS league_name,
+                tier,
+                status,
+                outcome,
+                pinnacle_clv,
+                clv_missing
+            FROM picks_v2
+            WHERE created_at >= NOW() - ($1 || ' days')::interval
+              {tier_clause}
+        )
+        SELECT
+            league_name,
+            COUNT(*)                                                                                AS total,
+            COUNT(*) FILTER (WHERE tier='ATOMIC')                                                   AS atomic,
+            COUNT(*) FILTER (WHERE tier='EDGE')                                                     AS edge,
+            COUNT(*) FILTER (WHERE tier='MONITORED')                                                AS monitored,
+            COUNT(*) FILTER (WHERE status='RESULT_LOGGED' AND tier IN ('ATOMIC','EDGE'))            AS settled_atomic_edge,
+            COUNT(*) FILTER (WHERE outcome='WIN' AND status='RESULT_LOGGED' AND tier IN ('ATOMIC','EDGE')) AS wins_atomic_edge,
+            AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE)   AS avg_model_edge_pct
+        FROM base
+        GROUP BY league_name
+        ORDER BY total DESC
+    """
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(sql, str(window))
+
+        distribution = []
+        total_all = 0
+        for r in rows:
+            settled_ae = int(r["settled_atomic_edge"] or 0)
+            wins_ae = int(r["wins_atomic_edge"] or 0)
+            hit_rate = round(wins_ae * 100.0 / settled_ae, 1) if settled_ae > 0 else None
+            edge_avg = round(float(r["avg_model_edge_pct"]), 2) if r["avg_model_edge_pct"] is not None else None
+            total_all += int(r["total"] or 0)
+            distribution.append({
+                "league": r["league_name"],
+                "total": int(r["total"] or 0),
+                "atomic": int(r["atomic"] or 0),
+                "edge": int(r["edge"] or 0),
+                "monitored": int(r["monitored"] or 0),
+                "settled_atomic_edge": settled_ae,
+                "wins_atomic_edge": wins_ae,
+                "hit_rate_pct": hit_rate,
+                "avg_model_edge_pct": edge_avg,
+            })
+
+        payload = {
+            "window_days": window,
+            "tier_filter": tier_filter,
+            "total_picks": total_all,
+            "league_distribution": distribution,
+            "_notes": {
+                "avg_model_edge_pct": "Pre-game model-edge from picks_v2.pinnacle_clv. NOT real CLV (see /admin/phase0-stats clv_source).",
+                "hit_rate_pct": "wins_atomic_edge / settled_atomic_edge (not vs total). Null when settled_atomic_edge=0.",
+                "league_unknown": "Picks with NULL or empty league grouped under '(unknown)'.",
+                "tier_filter": "Whitelist: all, atomic, edge, monitored, atomic_edge.",
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        _picks_by_league_cache[cache_key] = (time.time(), payload)
+        return payload
+    except Exception as e:
+        logger.error(f"/admin/picks-by-league-tier error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 # ─────────────────────────────────────────────────────────
 # DECISION RECEIPT ENGINE — PUBLIC PROOF ENDPOINTS
 # ─────────────────────────────────────────────────────────
