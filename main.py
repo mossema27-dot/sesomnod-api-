@@ -4534,6 +4534,55 @@ async def _no_bet_verdict_job():
 
 
 # ─────────────────────────────────────────────────────────
+# SCANNER HEALTH ALERT JOB (defined before scheduler setup)
+# ─────────────────────────────────────────────────────────
+# In-memory idempotency: én warning per UTC-dato, uavhengig av 09:00 vs 18:00 trigger.
+_scanner_health_warned_dates: dict[str, bool] = {}
+
+
+async def _scanner_health_alert_job():
+    logger.info("[ScannerHealth] Health-check job: starting")
+    try:
+        if not db_state.connected or not db_state.pool:
+            logger.info("[ScannerHealth] SKIP: DB offline")
+            return
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if _scanner_health_warned_dates.get(today_utc):
+            logger.info(f"[ScannerHealth] SKIP: warning already sent for {today_utc}")
+            return
+        async with db_state.pool.acquire() as conn:
+            last_ts = await conn.fetchval(
+                """
+                SELECT MAX(created_at)
+                FROM picks_v2
+                WHERE tier IN ('ATOMIC', 'EDGE')
+                  AND created_at > NOW() - INTERVAL '7 days'
+                """
+            )
+        now_utc = datetime.now(timezone.utc)
+        if last_ts is None:
+            hours = 168  # 7-dagers vindu — ingen treff
+        else:
+            hours = int((now_utc - last_ts).total_seconds() // 3600)
+        if hours < 24:
+            logger.info(f"[ScannerHealth] OK: siste ATOMIC/EDGE {hours}t siden")
+            return
+        msg = (
+            f"🟡 Scanner-helse: ingen ATOMIC/EDGE picks siste {hours}t. "
+            f"Mulige årsaker: stille slate, modell-kalibrering, eller signal-svikt. "
+            f"Sjekk /admin/phase0-stats."
+        )
+        try:
+            await _send_telegram_markdownv2(msg)
+            _scanner_health_warned_dates[today_utc] = True
+            logger.warning(f"[ScannerHealth] WARNING sendt — {hours}t uten ATOMIC/EDGE")
+        except Exception as send_err:
+            logger.error(f"[ScannerHealth] Telegram-send feilet: {send_err}")
+    except Exception as e:
+        logger.error(f"[ScannerHealth] Top-level exception: {e}")
+
+
+# ─────────────────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -4749,6 +4798,20 @@ async def lifespan(app: FastAPI):
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
         )
 
+    # Scanner health alert — 09:00 + 18:00 UTC daglig
+    # Etter morning_brief 06:45 og før evening-analysis 18:05.
+    if not scheduler.get_job("scanner_health_alert"):
+        scheduler.add_job(
+            _scanner_health_alert_job,
+            trigger=CronTrigger(hour="9,18", minute=0, timezone="UTC"),
+            id="scanner_health_alert",
+            replace_existing=True,
+            name="Scanner Health Alert 09/18 UTC",
+            misfire_grace_time=600,
+            max_instances=1,
+            coalesce=True,
+        )
+
     scheduler.start()
     # Expose scheduler to request handlers (read-only) and capture per-job execution history.
     app.state.scheduler = scheduler
@@ -4756,7 +4819,8 @@ async def lifespan(app: FastAPI):
     logger.info(
         "[Scheduler] Startet — "
         "3-vindu: Early 07:00 (8L) | Evening 18:00 (4L) | Pre-KO 20:00 (cache) | "
-        "Post: 09:00 | Morning brief: 06:45 | CLV: 30min | CLV-rapport: man 08:00 | NoBet-verdict: 23:30 UTC"
+        "Post: 09:00 | Morning brief: 06:45 | CLV: 30min | CLV-rapport: man 08:00 | "
+        "NoBet-verdict: 23:30 UTC | ScannerHealth: 09/18 UTC"
     )
 
     if db_state.connected:
