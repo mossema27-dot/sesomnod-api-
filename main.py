@@ -4723,6 +4723,32 @@ async def lifespan(app: FastAPI):
             name="Morning Brief 06:45 UTC",
         )
 
+    # DB health poll — verifies pool liveness every 60s so /health.last_success_ago_sec
+    # reflects real DB connectivity, not boot-time only.
+    async def _db_health_poll():
+        try:
+            if not db_state.pool:
+                return
+            async with db_state.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            await db_state.mark_ok(db_state.pool)
+        except Exception as e:
+            logger.warning(f"[DBHealth] poll failed: {e}")
+
+    if not scheduler.get_job("db_health_poll"):
+        scheduler.add_job(
+            _db_health_poll,
+            "interval",
+            seconds=60,
+            id="db_health_poll",
+            replace_existing=True,
+            name="DB Health Poll",
+            misfire_grace_time=30,
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
+        )
+
     scheduler.start()
     # Expose scheduler to request handlers (read-only) and capture per-job execution history.
     app.state.scheduler = scheduler
@@ -4853,6 +4879,29 @@ async def lifespan(app: FastAPI):
                         '{"strategy":"rolling_poisson_vs_bet365","edge_threshold":0.03,"rolling_window":38,"half_kelly":true,"cap":0.10,"min_confidence":0.30}',
                     )
                     if summary.picks:
+                        from datetime import date as _date_cls
+                        converted = 0
+                        skipped = 0
+                        valid_picks = []
+                        for p in summary.picks:
+                            md = p.match_date
+                            if isinstance(md, str):
+                                try:
+                                    md = _date_cls.fromisoformat(md)
+                                    converted += 1
+                                except (ValueError, TypeError):
+                                    skipped += 1
+                                    logger.warning(f"[Backtest] Skipping pick with invalid match_date: {p.match_date!r}")
+                                    continue
+                            elif not isinstance(md, _date_cls):
+                                skipped += 1
+                                logger.warning(f"[Backtest] Skipping pick with non-date match_date type: {type(p.match_date).__name__}")
+                                continue
+                            valid_picks.append((md, p))
+                        if converted:
+                            logger.info(f"[Backtest] Converted {converted} match_date strings to date")
+                        if skipped:
+                            logger.warning(f"[Backtest] Skipped {skipped} picks with invalid match_date")
                         await conn.executemany("""
                             INSERT INTO backtest_picks (
                                 backtest_run_id, match_date, home_team, away_team,
@@ -4862,12 +4911,12 @@ async def lifespan(app: FastAPI):
                                 cumulative_profit, was_correct
                             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                         """, [
-                            (run_id, p.match_date, p.home_team, p.away_team,
+                            (run_id, md, p.home_team, p.away_team,
                              p.league, p.predicted_outcome, p.actual_outcome,
                              p.model_prob, p.bet365_odds, p.edge_pct,
                              p.brier_contribution, p.profit_units,
                              p.cumulative_profit, p.was_correct)
-                            for p in summary.picks
+                            for md, p in valid_picks
                         ])
                 logger.info(
                     "[Backtest] Done: %d picks | hit=%.1f%% | ROI=%.1f%% | CLV=%.1f%%",
