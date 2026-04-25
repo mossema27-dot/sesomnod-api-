@@ -2620,7 +2620,7 @@ async def run_analysis():
                         json.dumps(payload, default=str), v2_id,
                     )
                 msg = format_smartpick_telegram(payload, escape_fn=_mdv2_escape)
-                result = await _send_telegram_markdownv2(msg)
+                result = await _send_smartpick_with_image(payload, msg)
                 if result["status"] == "ok":
                     posted_ok = True
                     logger.info(
