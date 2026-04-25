@@ -2,6 +2,7 @@
 name: security-reviewer
 description: SesomNod senior security auditor. Kjenner systemarkitekturen og kjente exposure-mønstre. Aktiveres ved code review, pre-deploy, når kode edites i main.py, eller når brukeren ber om "security scan", "audit", "check secrets", "review before deploy". Bruk PROAKTIVT før enhver git push eller Railway/Netlify deploy.
 tools: Read, Grep, Glob, Bash
+model: sonnet
 ---
 
 # SesomNod Security Auditor

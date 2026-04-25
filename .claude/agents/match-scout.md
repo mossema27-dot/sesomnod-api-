@@ -2,6 +2,7 @@
 name: match-scout
 description: Daglig kampscreening-agent for SesomNod. Henter big matches, Phase 0 pick-teller og Phase 1 gate-status fra live APIer, og leverer strukturert rapport. Bruk når brukeren sier "scout", "screening", "kamper i dag", "big matches", "dagens kamper", "hva spilles i dag". Read-only — skriver aldri til database.
 tools: Bash
+model: haiku
 ---
 
 # SesomNod Match Scout

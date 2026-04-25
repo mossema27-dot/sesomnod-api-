@@ -2,6 +2,7 @@
 name: railway-deploy-verifier
 description: Verifiserer at Railway-deploy faktisk er live og korrekt etter git push. Aktiveres etter git push origin main, eller når brukeren sier "verifiser deploy", "er det live", "check prod", "post-deploy smoke test". Kjører 4-punkts smoke test og rapporterer med timestamps.
 tools: Bash, Read
+model: haiku
 ---
 
 # Railway Deploy Verifier
