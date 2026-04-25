@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from math import pi, cos, sin
 from typing import Optional
 
@@ -31,13 +32,20 @@ TIER_COLORS = {
     "MONITORED": (120, 120, 120),
 }
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_BUNDLED_FONT_BOLD = os.path.join(_THIS_DIR, "fonts", "DejaVuSans-Bold.ttf")
+_BUNDLED_FONT_REGULAR = os.path.join(_THIS_DIR, "fonts", "DejaVuSans.ttf")
+
 FONT_PATHS = [
-    # Linux / Railway
+    # Bundled (preferred — guaranteed available on Railway and dev)
+    _BUNDLED_FONT_BOLD,
+    _BUNDLED_FONT_REGULAR,
+    # Linux / Railway system fonts (fallback if bundle missing)
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    # macOS (local dev)
+    # macOS (local dev fallback)
     "/System/Library/Fonts/Helvetica.ttc",
     "/Library/Fonts/Arial Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
