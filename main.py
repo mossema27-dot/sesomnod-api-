@@ -4258,6 +4258,49 @@ async def _get_omega_for_fixture(
 # ─────────────────────────────────────────────────────────
 # AUTO-SETTLEMENT: picks_v2 + pick_receipts (defined before scheduler setup)
 # ─────────────────────────────────────────────────────────
+def _normalize_dk_pick_to_english(raw: str, home: str, away: str) -> str:
+    """
+    Map Norwegian (or mixed) dk_pick text to the canonical English token
+    consumed by the elif chain in _auto_settle_results.
+
+    The default pick_label produced by main.py:3459 is `f"{home} vinner"` (norsk),
+    so without normalization the auto-settle elif chain never matches and every
+    new pick stalls forever — verified by Railway logs 2026-04-26.
+
+    Backward compatible: English input passes through unchanged.
+    """
+    s = (raw or "").lower().strip()
+    if not s:
+        return s
+
+    if s in ("uavgjort", "x", "remis"):
+        return "draw"
+    if s in ("hjemme", "hjemmeseier"):
+        return "home"
+    if s in ("borte", "bortesier", "borteseier"):
+        return "away"
+
+    if s.endswith(" vinner"):
+        team = s[: -len(" vinner")].strip()
+        h = (home or "").lower().strip()
+        a = (away or "").lower().strip()
+        if team and h and (team in h or h in team):
+            return "home"
+        if team and a and (team in a or a in team):
+            return "away"
+
+    if "begge lag scorer ikke" in s or "btts nei" in s:
+        return "btts no"
+    if "begge lag scorer" in s or "btts ja" in s:
+        return "btts"
+
+    if " mål" in s:
+        s = s.replace(" mål", "").strip()
+    s = s.replace(",", ".")
+
+    return s
+
+
 async def _auto_settle_results():
     """
     Runs every 60 minutes. Settles picks_v2 rows using football-data.org results.
@@ -4390,7 +4433,8 @@ async def _auto_settle_results():
                 btts = home_score > 0 and away_score > 0
 
                 # Determine outcome from dagens_kamp.pick field
-                dk_pick = str(pick["dk_pick"] or pick.get("dk_market_hint") or "").lower().strip()
+                dk_pick_raw = str(pick["dk_pick"] or pick.get("dk_market_hint") or "").lower().strip()
+                dk_pick = _normalize_dk_pick_to_english(dk_pick_raw, pick_home, pick_away)
                 pick_won = None
 
                 if dk_pick == "draw":
@@ -4417,7 +4461,10 @@ async def _auto_settle_results():
                     pick_won = total_goals < 4
 
                 if pick_won is None:
-                    logger.info(f"[AutoSettle] Could not determine outcome for pick {pick['pv_id']}: dk_pick='{dk_pick}'")
+                    logger.info(
+                        f"[AutoSettle] Could not determine outcome for pick {pick['pv_id']}: "
+                        f"dk_pick_raw='{dk_pick_raw}' normalized='{dk_pick}'"
+                    )
                     continue
 
                 outcome_str = "WIN" if pick_won else "LOSS"
