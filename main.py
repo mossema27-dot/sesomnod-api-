@@ -11190,6 +11190,154 @@ async def admin_backfill_dc_probs(body: dict | None = None):
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.get("/admin/test-decision-desk-v2")
+async def admin_test_decision_desk_v2(window_days: int = 7, max_age_days: int = 30):
+    """
+    Phase 3 V2 — generer Decision Desk fra picks_v2 med dc_*-data populert.
+    Read-only test-endpoint. Bruker probability_event_generator + dominance V2.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.smartpick_narratives import (
+            build_decision_desk_v2, format_decision_desk_v2_telegram,
+        )
+    except ImportError as e:
+        return JSONResponse(status_code=500, content={"error": f"import: {e}"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, home_team, away_team, league, kickoff_time,
+                       odds, soft_edge, soft_ev, atomic_score, tier,
+                       signals_triggered,
+                       dc_home_win_prob, dc_draw_prob, dc_away_win_prob,
+                       dc_btts_prob, dc_lambda_home, dc_lambda_away,
+                       dc_over_15, dc_over_25, dc_over_35,
+                       dc_under_25, dc_under_35
+                FROM picks_v2
+                WHERE tier IN ('ATOMIC','EDGE')
+                  AND created_at > NOW() - ($1 || ' days')::interval
+                  AND dc_home_win_prob IS NOT NULL
+                  AND dc_home_win_prob > 0
+                ORDER BY id DESC
+                LIMIT 100
+                """,
+                str(max_age_days),
+            )
+
+        picks = [dict(r) for r in rows]
+        for p in picks:
+            sigs = p.get("signals_triggered")
+            if isinstance(sigs, str):
+                try:
+                    p["signals_triggered"] = json.loads(sigs)
+                except Exception:
+                    p["signals_triggered"] = []
+
+        desk = build_decision_desk_v2(picks, scanned_matches=len(picks))
+        telegram_preview = format_decision_desk_v2_telegram(desk)
+        return {
+            **desk,
+            "telegram_preview_chars": len(telegram_preview),
+            "telegram_preview": telegram_preview,
+        }
+    except Exception as e:
+        logger.error(f"[DecisionDeskV2] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/event-tracker")
+async def admin_event_tracker(window_days: int = 30):
+    """
+    Per event-type analytics over en window. Grupperer settled picks
+    etter dk.market_hint (eller fallback til pick.label) og rapporterer
+    hit-rate + avg edge + dominance score per event-type.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    COALESCE(NULLIF(dk.market_hint, ''), 'UNKNOWN') AS event_type,
+                    COUNT(*) AS count,
+                    COUNT(*) FILTER (WHERE pv.outcome = 'WIN') AS wins,
+                    AVG(pv.soft_edge) FILTER (WHERE pv.soft_edge IS NOT NULL) AS avg_edge,
+                    AVG(pv.atomic_score) FILTER (WHERE pv.atomic_score IS NOT NULL) AS avg_atomic
+                FROM picks_v2 pv
+                LEFT JOIN dagens_kamp dk
+                    ON pv.home_team = dk.home_team
+                    AND pv.away_team = dk.away_team
+                    AND pv.kickoff_time::date = dk.kickoff::date
+                WHERE pv.status = 'RESULT_LOGGED'
+                  AND pv.created_at > NOW() - ($1 || ' days')::interval
+                  AND NOT (pv.atomic_score = 0 AND (pv.soft_ev IS NULL OR ABS(pv.soft_ev) < 0.05))
+                GROUP BY event_type
+                ORDER BY count DESC
+                """,
+                str(window_days),
+            )
+
+        by_event_type = []
+        for r in rows:
+            count = int(r["count"] or 0)
+            wins = int(r["wins"] or 0)
+            hit_rate = round(wins * 100.0 / count, 1) if count else 0.0
+            avg_edge = round(float(r["avg_edge"]), 2) if r["avg_edge"] is not None else None
+            avg_atomic = round(float(r["avg_atomic"]), 2) if r["avg_atomic"] is not None else None
+
+            if count < 5:
+                verdict = "INSUFFICIENT_DATA"
+            elif count < 10 or hit_rate < 50:
+                verdict = "STOP" if hit_rate < 50 else "WEAK"
+            elif hit_rate >= 75 and count >= 20 and (avg_edge or 0) >= 5:
+                verdict = "STRONG"
+            elif hit_rate >= 60 and count >= 15:
+                verdict = "MEDIUM"
+            else:
+                verdict = "WEAK"
+
+            by_event_type.append({
+                "event_type": r["event_type"],
+                "count": count,
+                "wins": wins,
+                "hit_rate_pct": hit_rate,
+                "avg_edge_pct": avg_edge,
+                "avg_atomic_score": avg_atomic,
+                "verdict": verdict,
+            })
+
+        strong = [r for r in by_event_type if r["verdict"] == "STRONG"]
+        stop = [r for r in by_event_type if r["verdict"] == "STOP"]
+        if strong:
+            recommendation = (
+                f"PUSH HARD: {', '.join(r['event_type'] for r in strong)} "
+                "(STRONG hit-rate, sufficient sample)"
+            )
+        elif stop:
+            recommendation = (
+                f"STOPP: {', '.join(r['event_type'] for r in stop)} "
+                "(under 50% hit rate — modellen taper systematisk)"
+            )
+        else:
+            recommendation = (
+                "INSUFFICIENT_DATA: vent på flere settled picks per event-type"
+            )
+
+        return {
+            "window_days": window_days,
+            "by_event_type": by_event_type,
+            "recommendation": recommendation,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"[EventTracker] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/backfill-receipts")
 async def admin_backfill_receipts():
     """Backfill pick_receipts from picks_v2. Idempotent — skips existing."""

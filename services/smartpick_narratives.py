@@ -795,6 +795,10 @@ DECISION_MIN_EDGE_PCT = 5.0
 DECISION_MIN_CONFIDENCE = 0.6  # SILVER threshold
 DECISION_MAX_PLAYS_PER_DAY = 3
 
+# V2 (Phase 3, 2026-04-27): strengere — confidence GOLD (0.70), dominance >= 0.055
+DECISION_V2_MIN_CONFIDENCE = 0.70
+DECISION_V2_MIN_DOMINANCE = 0.055
+
 # Ekskluderte markeder (motor-status per CLAUDE.md MEMORY)
 EXCLUDED_MARKETS = {"btts", "btts_yes", "btts_no", "corners"}
 
@@ -1176,6 +1180,342 @@ def format_decision_desk_telegram(desk: dict, escape_fn=None) -> str:
         f"🎯 *Forventet hit:* {stats.get('expected_hit_count', 0)}/{count}",
         f"💰 *Total edge:* \\+{stats.get('total_edge_pct', 0)}%",
         f"🔍 *Filtrert bort:* {filtered_out} kamper",
+        "",
+        "🌐 sesomnod\\.com · Phase 3 · 18\\+ Spill ansvarlig",
+    ])
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DECISION ENGINE V2 — Probability Event-baseert, 3-lag filter, Dominance V2
+# Bruker services.probability_event_generator for å produsere 9 events per
+# pick (med dc_*-data), filtrere via 3 lag, score via V2-formel, og levere
+# max 3 dominant plays per dag.
+# ─────────────────────────────────────────────────────────────────────────
+
+def calculate_dominance_score_v2(market: dict) -> float:
+    """
+    DOMINANCE_V2 = (prob*0.4 + edge*0.4 + confidence*0.2) × log10(odds)
+
+    Justeringer fra V1:
+    - Edge vekt: 0.3 → 0.4 (straffer null-edge tyngre)
+    - Prob vekt: 0.5 → 0.4
+    - Multiplier: log10(odds) — straffer ultra-favoritter (~0% bidrag fra
+      Over 0.5 ved odds 1.05) men belønner reell payoff
+    """
+    import math as _math
+    prob = max(0.0, min(1.0, (market.get("probability") or 0.0) / 100.0))
+    edge = max(0.0, (market.get("edge") or 0.0) / 100.0)
+    confidence = max(0.0, min(1.0, market.get("confidence") or 0.0))
+    odds = max(1.01, market.get("odds") or 1.0)
+    base = prob * 0.4 + edge * 0.4 + confidence * 0.2
+    multiplier = _math.log10(odds)
+    return round(base * multiplier, 4)
+
+
+def passes_all_filters_v2(event: dict, pick: dict) -> tuple[bool, list[str]]:
+    """
+    3-lag filter for Decision Engine V2. Returnerer (passed, failed_reasons).
+
+    LAYER 1 — DATA QUALITY: confidence ≥ GOLD, completeness ∈ {FULL, SOLID},
+    ingen fallback-kilde
+    LAYER 2 — STATISTICAL: prob ≥ 65%, edge ≥ +5%
+    LAYER 3 — BUSINESS: ekskluderte markeder, Brasil/Argentina ATOMIC blocked,
+    dominance V2 ≥ 0.055
+    """
+    failed: list[str] = []
+
+    # LAYER 1
+    conf = event.get("confidence", 0.0)
+    if conf < DECISION_V2_MIN_CONFIDENCE:
+        failed.append(f"L1: confidence {conf:.2f} < GOLD ({DECISION_V2_MIN_CONFIDENCE})")
+    completeness = event.get("data_completeness") or ""
+    if completeness not in ("FULL", "SOLID"):
+        failed.append(f"L1: data_completeness {completeness or 'none'}")
+    calc_src = (event.get("calculation_source") or "").lower()
+    if "fallback" in calc_src or "1/odds" in calc_src:
+        failed.append(f"L1: fallback calculation_source")
+
+    # LAYER 2
+    prob = event.get("probability") or 0.0
+    edge = event.get("edge") or 0.0
+    if prob < DECISION_MIN_PROB_PCT:
+        failed.append(f"L2: prob {prob:.1f}% < {DECISION_MIN_PROB_PCT}%")
+    if edge < DECISION_MIN_EDGE_PCT:
+        failed.append(f"L2: edge +{edge:.1f}% < +{DECISION_MIN_EDGE_PCT}%")
+
+    # LAYER 3
+    label_lower = (event.get("label") or "").lower()
+    if any(x in label_lower for x in EXCLUDED_MARKETS):
+        failed.append(f"L3: market i ekskluderingsliste")
+    league = (pick.get("league") or "").lower()
+    tier = pick.get("tier") or ""
+    if tier == "ATOMIC" and any(x in league for x in ("brasil", "argentin")):
+        failed.append("L3: Brasil/Argentina ATOMIC blocked (0/2 historisk)")
+    dom = event.get("dominance_score_v2", 0.0)
+    if dom < DECISION_V2_MIN_DOMINANCE:
+        failed.append(f"L3: dominance V2 {dom:.4f} < {DECISION_V2_MIN_DOMINANCE}")
+
+    return (len(failed) == 0, failed)
+
+
+def _enrich_event_with_filter_meta(event: dict, pick: dict) -> dict:
+    """
+    Ta et raw event fra probability_event_generator og berik med:
+    - confidence (mappet fra atomic_score + data_completeness)
+    - dominance_score_v2
+    Disse trengs av passes_all_filters_v2.
+    """
+    score = int(pick.get("atomic_score") or 0)
+    completeness = event.get("data_completeness") or "LIMITED"
+    if score >= 9 and completeness == "FULL":
+        confidence = 0.95
+    elif score >= 7 and completeness in ("FULL", "SOLID"):
+        confidence = 0.85
+    elif score >= 4 and completeness in ("FULL", "SOLID"):
+        confidence = 0.70
+    else:
+        confidence = 0.55
+    enriched = dict(event)
+    # Felter passes_all_filters_v2 forventer i flat form:
+    enriched["probability"] = event.get("probability_pct", 0.0)
+    enriched["edge"] = event.get("edge_pct", 0.0) or 0.0
+    enriched["confidence"] = confidence
+    enriched["dominance_score_v2"] = calculate_dominance_score_v2(enriched)
+    return enriched
+
+
+def build_decision_play_v2(pick: dict) -> dict | None:
+    """
+    Bygg ett dominant play V2 fra én pick med dc_*-data.
+
+    Steg:
+    1. Generer alle events via probability_event_generator
+    2. Selv-validér events (mat. konsistens)
+    3. Berik hvert event med confidence + dominance_score_v2
+    4. Filtrer via 3-lag (passes_all_filters_v2)
+    5. Velg event med høyeste dominance_score_v2
+    6. Returner None hvis ingen passerer
+    """
+    if is_dummy_pick(pick):
+        return None
+
+    try:
+        from services.probability_event_generator import (
+            generate_events_for_match, validate_event_coherence,
+        )
+    except ImportError:
+        return None
+
+    raw_events = generate_events_for_match(pick)
+    if not raw_events:
+        return None
+
+    validation = validate_event_coherence(raw_events)
+    events = validation.get("events") or []
+    if not events:
+        return None
+
+    eligible = []
+    rejected = []
+    for ev in events:
+        enriched = _enrich_event_with_filter_meta(ev, pick)
+        passed, reasons = passes_all_filters_v2(enriched, pick)
+        if passed:
+            eligible.append(enriched)
+        else:
+            rejected.append({"label": ev["label"], "reasons": reasons,
+                              "probability_pct": ev["probability_pct"]})
+
+    if not eligible:
+        return None
+
+    eligible.sort(key=lambda x: x["dominance_score_v2"], reverse=True)
+    chosen = eligible[0]
+
+    why_not = []
+    for r in rejected[:6]:
+        primary = r["reasons"][0] if r["reasons"] else "ekskludert"
+        why_not.append(f"{r['label']}: {primary} (prob {r['probability_pct']}%)")
+
+    tag_label, tag_emoji = calculate_data_tag(pick)
+    tier = pick.get("tier") or "MONITORED"
+    score = int(pick.get("atomic_score") or 0)
+
+    if chosen["confidence"] >= 0.95:
+        tier_name, tier_emoji, stars = "PLATINUM", "🏆", "⭐⭐⭐⭐⭐"
+    elif chosen["confidence"] >= 0.85:
+        tier_name, tier_emoji, stars = "GOLD", "💎", "⭐⭐⭐⭐"
+    else:
+        tier_name, tier_emoji, stars = "SILVER", "🥈", "⭐⭐⭐"
+
+    kickoff = pick.get("kickoff_time") or pick.get("kickoff") or pick.get("commence_time")
+
+    return {
+        "pick_id": pick.get("id") or pick.get("pick_id"),
+        "match": {
+            "home_team": pick.get("home_team", ""),
+            "away_team": pick.get("away_team", ""),
+            "league": pick.get("league") or "",
+            "kickoff_oslo": _format_oslo(kickoff),
+        },
+        "chosen": {
+            "label": chosen["label"],
+            "category": chosen.get("category"),
+            "probability_pct": chosen["probability_pct"],
+            "confidence_interval": chosen.get("confidence_interval"),
+            "edge_pct": chosen.get("edge_pct"),
+            "odds": chosen.get("odds"),
+            "calculation_source": chosen.get("calculation_source"),
+            "dominance_score_v2": chosen["dominance_score_v2"],
+            "confidence": chosen["confidence"],
+        },
+        "why_points": chosen.get("why_points") or [],
+        "why_not_others": why_not,
+        "all_events_count": len(events),
+        "passed_filter_count": len(eligible),
+        "tier": {"name": tier_name, "emoji": tier_emoji, "stars": stars},
+        "data_tag": {"label": tag_label, "emoji": tag_emoji},
+        "atomic_score": score,
+        "asset_tier": tier,
+    }
+
+
+def build_decision_desk_v2(picks: list[dict], date_iso: str | None = None,
+                           scanned_matches: int | None = None) -> dict:
+    """
+    Phase 3 V2 — generer dagens Decision Desk fra liste pending picks
+    med dc_*-data populert. Maks DECISION_MAX_PLAYS_PER_DAY plays.
+    """
+    if date_iso is None:
+        date_iso = datetime.now(timezone.utc).date().isoformat()
+
+    plays_raw = []
+    for p in picks:
+        play = build_decision_play_v2(p)
+        if play:
+            plays_raw.append(play)
+
+    plays_raw.sort(key=lambda x: x["chosen"].get("dominance_score_v2", 0.0),
+                   reverse=True)
+    plays = plays_raw[:DECISION_MAX_PLAYS_PER_DAY]
+
+    if scanned_matches is None:
+        scanned_matches = len(picks)
+    qualified = len(plays)
+    filtered_out = max(0, scanned_matches - qualified)
+
+    if plays:
+        scores = [p["chosen"]["dominance_score_v2"] for p in plays]
+        edges = [p["chosen"].get("edge_pct") or 0.0 for p in plays]
+        probs = [p["chosen"]["probability_pct"] for p in plays]
+        stats = {
+            "avg_dominance_v2": round(sum(scores) / len(scores), 4),
+            "expected_hit_count": round(sum(probs) / 100.0, 1),
+            "total_edge_pct": round(sum(edges), 1),
+            "avg_probability_pct": round(sum(probs) / len(probs), 1),
+        }
+    else:
+        stats = {
+            "avg_dominance_v2": 0.0, "expected_hit_count": 0.0,
+            "total_edge_pct": 0.0, "avg_probability_pct": 0.0,
+        }
+
+    return {
+        "date": date_iso,
+        "phase": "Phase 3 V2 — Probability Event Engine",
+        "scanned_matches": scanned_matches,
+        "qualified_matches": qualified,
+        "filtered_out": filtered_out,
+        "dominant_plays": plays,
+        "stats": stats,
+        "no_qualified_today": qualified == 0,
+    }
+
+
+def format_decision_desk_v2_telegram(desk: dict, escape_fn=None) -> str:
+    """V2-format med konfidens-intervall, why_not_others, tier-emoji."""
+    e = escape_fn or _escape_mdv2
+    plays = desk.get("dominant_plays") or []
+    stats = desk.get("stats") or {}
+    date_norsk = _format_norsk_date(desk.get("date") or "")
+    scanned = desk.get("scanned_matches") or 0
+    filtered_out = desk.get("filtered_out") or 0
+
+    if not plays:
+        return (
+            "🔒 *SESOMNOD DECISION DESK V2*\n"
+            f"{date_norsk}\n\n"
+            "_Ingen kvalifiserte beslutninger i dag\\._\n\n"
+            f"Av *{scanned}* picks analysert ble ingen klassifisert "
+            "som DOMINANT etter 3\\-lags filter:\n"
+            "\\- L1: Konfidens ≥ GOLD \\+ data SOLID/FULL\n"
+            "\\- L2: Sannsynlighet ≥ 65% \\+ edge ≥ \\+5%\n"
+            "\\- L3: Dominance V2 ≥ 0\\.055\n\n"
+            "_Vi sender ikke svake spill\\. Vi venter til markedet "
+            "gir oss klar edge\\._\n\n"
+            "🌐 sesomnod\\.com"
+        )
+
+    count = len(plays)
+    lines = [
+        "🔥 *SESOMNOD DECISION DESK V2*",
+        f"{date_norsk} · Phase 3 · Probability Event Engine",
+        "",
+        f"Vi analyserte *{scanned}* picks\\.",
+        f"Vi sender *{count}* dominant beslutninger\\.",
+        "",
+    ]
+
+    for i, play in enumerate(plays, 1):
+        m = play["match"]
+        c = play["chosen"]
+        tier = play["tier"]
+        tag = play["data_tag"]
+        why = play.get("why_points") or []
+        why_not = play.get("why_not_others") or []
+        ci = c.get("confidence_interval") or [c["probability_pct"], c["probability_pct"]]
+        league_str = e(m["league"]) if m.get("league") else "\\—"
+        kickoff_str = e(m["kickoff_oslo"]) if m.get("kickoff_oslo") else "\\—"
+        edge_str = f"\\+{c.get('edge_pct') or 0:.1f}%" if c.get("edge_pct") is not None else "n/a"
+        odds_str = f"{c.get('odds') or 0:.2f}" if c.get("odds") else "n/a"
+
+        lines.append("═══════════════════════════════")
+        lines.append(f"🏆 *DOMINANT \\#{i} — {tier['emoji']} {e(tier['name'])}*")
+        lines.append(f"*{e(c['label'])}* — *{c['probability_pct']}%* "
+                     f"\\[{ci[0]}\\-{ci[1]}\\]")
+        lines.append(f"{e(m['home_team'])} vs {e(m['away_team'])} · {kickoff_str}")
+        lines.append(f"_{league_str}_")
+        lines.append("")
+        lines.append("🧠 *HVORFOR DET DOMINERER:*")
+        for p in why[:4]:
+            lines.append(f"{p['emoji']} {e(p['text'])}")
+        lines.append("")
+
+        if why_not:
+            lines.append("❌ *HVORFOR IKKE ANDRE EVENTS:*")
+            for r in why_not[:4]:
+                lines.append(f"\\- {e(r)}")
+            lines.append("")
+
+        lines.append(f"📊 Edge: *{edge_str}* \\| Odds: *{odds_str}*")
+        lines.append(
+            f"{tier['stars']} *{e(tier['name'])}* · {tag['emoji']} {e(tag['label'])}"
+        )
+        lines.append(
+            f"⚖️ Dominance V2: `{c.get('dominance_score_v2', 0):.4f}` "
+            f"\\| Events filtrert: {play.get('passed_filter_count', 0)}/"
+            f"{play.get('all_events_count', 0)}"
+        )
+        lines.append("")
+
+    lines.extend([
+        "═══════════════════════════════",
+        f"📊 *Avg DOMINANCE V2:* {stats.get('avg_dominance_v2', 0):.4f}",
+        f"🎯 *Forventet hit:* {stats.get('expected_hit_count', 0)}/{count}",
+        f"💰 *Total edge:* \\+{stats.get('total_edge_pct', 0)}%",
+        f"🔍 *Filtrert bort:* {filtered_out} picks",
         "",
         "🌐 sesomnod\\.com · Phase 3 · 18\\+ Spill ansvarlig",
     ])
