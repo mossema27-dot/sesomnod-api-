@@ -2703,6 +2703,17 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
         return None
     try:
         async with db_state.pool.acquire() as conn:
+            # _f returnerer None for None/0/missing — gir clean NULL i kolonnene.
+            def _dc(key: str):
+                v = pick.get(key)
+                if v is None:
+                    return None
+                try:
+                    fv = float(v)
+                    return fv if fv != 0 else None
+                except (TypeError, ValueError):
+                    return None
+
             v2_id = await conn.fetchval("""
                 INSERT INTO picks_v2 (
                     match_name, home_team, away_team, league,
@@ -2712,6 +2723,12 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                     telegram_posted, result, status,
                     home_odds_raw, draw_odds_raw, away_odds_raw, prob_source,
                     predicted_outcome,
+                    dc_home_win_prob, dc_draw_prob, dc_away_win_prob,
+                    dc_btts_prob,
+                    dc_lambda_home, dc_lambda_away,
+                    dc_over_15, dc_over_25, dc_over_35,
+                    dc_under_25, dc_under_35,
+                    dc_model_edge,
                     created_at, updated_at, timestamp
                 ) VALUES (
                     $1, $2, $3, $4,
@@ -2721,6 +2738,12 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                     $14, $15, 'PENDING',
                     $16, $17, $18, $19,
                     $20,
+                    $21, $22, $23,
+                    $24,
+                    $25, $26,
+                    $27, $28, $29,
+                    $30, $31,
+                    $32,
                     NOW(), NOW(), NOW()
                 )
                 RETURNING id
@@ -2745,6 +2768,12 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                 float(pick.get("away_odds_raw")) if pick.get("away_odds_raw") else None,
                 "implied" if pick.get("home_odds_raw") and pick.get("draw_odds_raw") and pick.get("away_odds_raw") else None,
                 _selection_to_predicted_outcome(pick.get("pick") or pick.get("selection") or ""),
+                _dc("dc_home_win_prob"), _dc("dc_draw_prob"), _dc("dc_away_win_prob"),
+                _dc("dc_btts_prob"),
+                _dc("dc_lambda_home"), _dc("dc_lambda_away"),
+                _dc("dc_over_15"), _dc("dc_over_25"), _dc("dc_over_35"),
+                _dc("dc_under_25"), _dc("dc_under_35"),
+                _dc("dc_model_edge"),
             )
         logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id} → picks_v2 id={v2_id}: {pick.get('match') or pick.get('home_team','?')}")
         return v2_id
@@ -6006,6 +6035,19 @@ async def enrich_picks_with_dc(picks: list[dict]) -> list[dict]:
 
             dc_result = await get_dixon_coles_probs(home, away, market_home_prob)
             pick["dixon_coles"] = dc_result.to_dict()
+            # Flat-mirror dc_*-felt for picks_v2-sync (VEI A 2026-04-27).
+            pick["dc_home_win_prob"] = dc_result.home_win_prob
+            pick["dc_draw_prob"] = dc_result.draw_prob
+            pick["dc_away_win_prob"] = dc_result.away_win_prob
+            pick["dc_btts_prob"] = dc_result.btts_prob
+            pick["dc_lambda_home"] = dc_result.lambda_home
+            pick["dc_lambda_away"] = dc_result.lambda_away
+            pick["dc_over_15"] = dc_result.over_15
+            pick["dc_over_25"] = dc_result.over_25
+            pick["dc_over_35"] = dc_result.over_35
+            pick["dc_under_25"] = dc_result.under_25
+            pick["dc_under_35"] = dc_result.under_35
+            pick["dc_model_edge"] = dc_result.model_edge_vs_market
 
             # Determine which probability to use for Kelly based on the pick type
             pick_label = str(pick.get("our_pick") or pick.get("market_hint") or "").lower()
@@ -11006,6 +11048,145 @@ async def admin_backfill_pending(body: dict | None = None):
 
     except Exception as e:
         logger.error(f"[Backfill] Top-level error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/backfill-dc-probs")
+async def admin_backfill_dc_probs(body: dict | None = None):
+    """
+    Re-kjør Dixon-Coles for picks_v2-rader uten dc_*-data og populer dem.
+    VEI A 2026-04-27: forutsetning for Phase 3 Probability Event Generator.
+
+    Body params:
+      dry_run: bool        (default true)
+      max_age_days: int    (default 14, clamped 1-60)
+      tiers: list[str]     (default ["ATOMIC","EDGE"])
+      force: bool          (default false) — required for writes
+      limit: int           (default 50)
+
+    Safety: writes require BOTH dry_run=false AND force=true.
+    """
+    body = body or {}
+    dry_run = bool(body.get("dry_run", True))
+    max_age_days = max(1, min(int(body.get("max_age_days", 14)), 60))
+    tiers = body.get("tiers") or ["ATOMIC", "EDGE"]
+    if not isinstance(tiers, list) or not all(isinstance(t, str) for t in tiers):
+        return JSONResponse(status_code=400, content={"error": "tiers must be list of strings"})
+    force = bool(body.get("force", False))
+    limit = max(1, min(int(body.get("limit", 50)), 200))
+    will_write = (not dry_run) and force
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        from services.dixon_coles_engine import get_dixon_coles_probs
+    except ImportError as e:
+        return JSONResponse(status_code=500, content={"error": f"engine import failed: {e}"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, home_team, away_team, league, odds, home_odds_raw
+                FROM picks_v2
+                WHERE tier = ANY($1::text[])
+                  AND created_at > NOW() - ($2 || ' days')::interval
+                  AND (dc_home_win_prob IS NULL OR dc_home_win_prob = 0)
+                ORDER BY id DESC
+                LIMIT $3
+                """,
+                tiers, str(max_age_days), limit,
+            )
+
+        report: dict = {
+            "scanned": len(rows),
+            "computed": 0,
+            "written": 0,
+            "skipped": [],
+            "samples": [],
+            "dry_run": dry_run,
+            "will_write": will_write,
+            "tiers": tiers,
+            "max_age_days": max_age_days,
+        }
+
+        for r in rows:
+            home = r["home_team"] or ""
+            away = r["away_team"] or ""
+            odds = float(r["odds"] or 2.0)
+            home_odds_raw = float(r["home_odds_raw"]) if r["home_odds_raw"] else None
+            market_home_prob = (1.0 / home_odds_raw) if home_odds_raw else (1.0 / odds)
+
+            try:
+                dc = await get_dixon_coles_probs(home, away, market_home_prob)
+            except Exception as eg:
+                report["skipped"].append({
+                    "id": r["id"], "match": f"{home} vs {away}",
+                    "reason": f"engine_error: {str(eg)[:100]}",
+                })
+                continue
+
+            if dc.fallback_used:
+                report["skipped"].append({
+                    "id": r["id"], "match": f"{home} vs {away}",
+                    "reason": "team not in Dixon-Coles dataset (fallback)",
+                })
+                continue
+
+            report["computed"] += 1
+
+            if len(report["samples"]) < 3:
+                report["samples"].append({
+                    "id": r["id"], "match": f"{home} vs {away}",
+                    "league": r["league"],
+                    "home_win_prob": dc.home_win_prob,
+                    "draw_prob": dc.draw_prob,
+                    "away_win_prob": dc.away_win_prob,
+                    "btts_prob": dc.btts_prob,
+                    "over_25": dc.over_25,
+                    "lambda_home": round(dc.lambda_home, 3),
+                    "lambda_away": round(dc.lambda_away, 3),
+                })
+
+            if will_write:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE picks_v2 SET
+                            dc_home_win_prob = $1,
+                            dc_draw_prob = $2,
+                            dc_away_win_prob = $3,
+                            dc_btts_prob = $4,
+                            dc_lambda_home = $5,
+                            dc_lambda_away = $6,
+                            dc_over_15 = $7,
+                            dc_over_25 = $8,
+                            dc_over_35 = $9,
+                            dc_under_25 = $10,
+                            dc_under_35 = $11,
+                            dc_model_edge = $12,
+                            updated_at = NOW()
+                        WHERE id = $13
+                        """,
+                        dc.home_win_prob, dc.draw_prob, dc.away_win_prob,
+                        dc.btts_prob,
+                        dc.lambda_home, dc.lambda_away,
+                        dc.over_15, dc.over_25, dc.over_35,
+                        dc.under_25, dc.under_35,
+                        dc.model_edge_vs_market,
+                        r["id"],
+                    )
+                report["written"] += 1
+
+        logger.info(
+            f"[BackfillDC] dry_run={dry_run} will_write={will_write} "
+            f"scanned={report['scanned']} computed={report['computed']} "
+            f"written={report['written']} skipped={len(report['skipped'])}"
+        )
+        return report
+    except Exception as e:
+        logger.error(f"[BackfillDC] Top-level error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 

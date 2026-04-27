@@ -22,7 +22,12 @@ MODEL_CACHE_SECONDS = MODEL_CACHE_HOURS * 3600
 
 @dataclass
 class DixonColesResult:
-    """Result from Dixon-Coles model prediction."""
+    """Result from Dixon-Coles model prediction.
+
+    2026-04-27 utvidelse (VEI A): nye felter eksponerer lambda + over/under
+    fra penaltyblog `prob_grid` som allerede beregnes internt. Kun additivt —
+    eksisterende felter og .to_dict()-output uberørt for backward compat.
+    """
     home_win_prob: float
     draw_prob: float
     away_win_prob: float
@@ -32,6 +37,14 @@ class DixonColesResult:
     away_team_found_in_data: bool
     data_sample_size: int
     fallback_used: bool
+    # Nye felter (VEI A 2026-04-27) — default 0.0 for backward compat
+    lambda_home: float = 0.0
+    lambda_away: float = 0.0
+    over_15: float = 0.0
+    over_25: float = 0.0
+    over_35: float = 0.0
+    under_25: float = 0.0
+    under_35: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict with rounded values."""
@@ -45,6 +58,14 @@ class DixonColesResult:
             "away_team_found_in_data": self.away_team_found_in_data,
             "data_sample_size": self.data_sample_size,
             "fallback_used": self.fallback_used,
+            # Nye felter
+            "lambda_home": round(self.lambda_home, 4),
+            "lambda_away": round(self.lambda_away, 4),
+            "over_15": round(self.over_15, 4),
+            "over_25": round(self.over_25, 4),
+            "over_35": round(self.over_35, 4),
+            "under_25": round(self.under_25, 4),
+            "under_35": round(self.under_35, 4),
         }
 
 
@@ -202,6 +223,32 @@ async def get_dixon_coles_probs(
         # Edge vs market
         model_edge = home_win - market_home_prob
 
+        # VEI A 2026-04-27: surface lambda + over/under fra eksisterende prob_grid.
+        # penaltyblog `totals(line)` returnerer (under, push, over).
+        # Ingen ny matematikk — kun lese ut allerede beregnede felt.
+        lambda_h = 0.0
+        lambda_a = 0.0
+        over_15 = 0.0
+        over_25 = 0.0
+        over_35 = 0.0
+        under_25 = 0.0
+        under_35 = 0.0
+        try:
+            hgd = prob_grid.home_goal_distribution()
+            agd = prob_grid.away_goal_distribution()
+            lambda_h = float(sum(k * p for k, p in enumerate(hgd)))
+            lambda_a = float(sum(k * p for k, p in enumerate(agd)))
+            t15 = prob_grid.totals(1.5)
+            t25 = prob_grid.totals(2.5)
+            t35 = prob_grid.totals(3.5)
+            over_15 = float(t15[2])
+            over_25 = float(t25[2])
+            over_35 = float(t35[2])
+            under_25 = float(t25[0])
+            under_35 = float(t35[0])
+        except Exception as ext_err:
+            logger.warning("Dixon-Coles: kunne ikke surface OU/lambda: %s", ext_err)
+
         result = DixonColesResult(
             home_win_prob=round(home_win, 4),
             draw_prob=round(draw, 4),
@@ -212,13 +259,21 @@ async def get_dixon_coles_probs(
             away_team_found_in_data=away_found,
             data_sample_size=data_size,
             fallback_used=False,
+            lambda_home=lambda_h,
+            lambda_away=lambda_a,
+            over_15=over_15,
+            over_25=over_25,
+            over_35=over_35,
+            under_25=under_25,
+            under_35=under_35,
         )
 
         logger.info(
-            "Dixon-Coles: %s vs %s → H=%.1f%% D=%.1f%% A=%.1f%% BTTS=%.1f%% edge=%.2f%%",
+            "Dixon-Coles: %s vs %s → H=%.1f%% D=%.1f%% A=%.1f%% BTTS=%.1f%% "
+            "O25=%.1f%% λ=%.2f+%.2f edge=%.2f%%",
             home_matched, away_matched,
             home_win * 100, draw * 100, away_win * 100, btts_prob * 100,
-            model_edge * 100,
+            over_25 * 100, lambda_h, lambda_a, model_edge * 100,
         )
         return result
 
