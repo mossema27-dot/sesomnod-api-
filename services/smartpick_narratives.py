@@ -396,6 +396,393 @@ def _escape_mdv2(text: str) -> str:
     return "".join("\\" + c if c in _MDV2_SPECIAL else c for c in s)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# DAILY SIGNALDESK — Probability-first MVP (Phase 2 pivot)
+# Universal Telegram-format for ENHVER ATOMIC/EDGE pick i picks_v2.
+# Pure functions; ingen DB-kall. Caller henter picks og passer som list[dict].
+# ─────────────────────────────────────────────────────────────────────────
+
+# Hit rate-analyse 2026-04-27 (n=28 settled): atomic_score=0+EV+0.0% er
+# dummy-picks som forurenser. Filtrer dem fra Daily Signaldesk.
+DUMMY_EV_THRESHOLD = 0.05  # picks med EV under 0.05% regnes som "ingen ekte edge"
+
+
+def is_dummy_pick(pick: dict) -> bool:
+    """Filter mot atomic_score=0 + EV~0% picks (per hit-rate analyse 2026-04-27)."""
+    score = int(pick.get("atomic_score") or 0)
+    ev = abs(_f(pick.get("soft_ev") or pick.get("ev")) or 0.0)
+    return score == 0 and ev < DUMMY_EV_THRESHOLD
+
+
+def calculate_data_tag(pick: dict) -> tuple[str, str]:
+    """
+    Data-completeness tag — kunde-vendt transparency.
+    Returnerer (label, emoji_dots) basert på atomic_score + populated signals.
+    """
+    populated = sum([
+        _f(pick.get("signal_xg_home")) is not None,
+        _f(pick.get("signal_xg_away")) is not None,
+        _is_active(pick.get("signal_velocity")),
+        _is_active(pick.get("signal_weather")),
+        bool(pick.get("signals_triggered")),
+    ])
+    score = int(pick.get("atomic_score") or 0)
+
+    if score >= 7 and populated >= 4:
+        return ("FULL DATA", "🟢🟢🟢")
+    if 4 <= score <= 9 and 2 <= populated <= 3:
+        return ("SOLID", "🟢🟢⚪")
+    if score <= 3 or populated == 1:
+        return ("LIMITED", "🟢⚪⚪")
+    return ("MODEL ONLY", "⚪⚪⚪")
+
+
+def generate_why_points(pick: dict) -> list[dict]:
+    """
+    Dynamic why-points per pick. Aldri 0 — alltid minimum 2 (model fallback).
+    Hver point: {emoji, text, source}. Returnerer max 5.
+    """
+    points: list[dict] = []
+
+    velocity = pick.get("signal_velocity")
+    if _is_active(velocity):
+        points.append({
+            "emoji": "💸",
+            "text": f"Sharp money beveger linjen ({velocity})",
+            "source": "Pinnacle velocity tracker",
+        })
+
+    xg_h = _f(pick.get("signal_xg_home"))
+    xg_a = _f(pick.get("signal_xg_away"))
+    if xg_h is not None and xg_a is not None:
+        if xg_h > 1.5 or xg_a > 1.5:
+            stronger_team = pick["home_team"] if xg_h >= xg_a else pick["away_team"]
+            stronger_xg = max(xg_h, xg_a)
+            points.append({
+                "emoji": "📈",
+                "text": f"{stronger_team} skaper {stronger_xg:.1f} xG i snitt",
+                "source": "xG-modell",
+            })
+        if abs(xg_h - xg_a) > 1.0:
+            points.append({
+                "emoji": "🎯",
+                "text": (
+                    f"xG-mismatch: {pick['home_team']} {xg_h:.1f} vs "
+                    f"{pick['away_team']} {xg_a:.1f}"
+                ),
+                "source": "xG-divergens",
+            })
+
+    if _is_active(pick.get("signal_weather")) and pick.get("weather_market_impact"):
+        points.append({
+            "emoji": "🌬️",
+            "text": f"Vær påvirker spillestil: {pick['weather_market_impact']}",
+            "source": "OpenWeather",
+        })
+
+    sigs = pick.get("signals_triggered")
+    if isinstance(sigs, list) and sigs:
+        named = [s for s in sigs if isinstance(s, str)]
+        if named:
+            label_map = {
+                "STRONG_EDGE_35PCT": "Sterk edge ≥3.5%",
+                "STRONG_EV_5PCT": "Sterk EV ≥5%",
+                "BRUTAL_OMEGA": "Brutal omega-konvergens",
+            }
+            for s in named[:2]:
+                label = label_map.get(s, s.replace("_", " ").title())
+                points.append({
+                    "emoji": "🧬",
+                    "text": label,
+                    "source": "Signal triggers",
+                })
+
+    score = int(pick.get("atomic_score") or 0)
+    if score >= 7:
+        points.append({
+            "emoji": "⚛️",
+            "text": f"{score}/9 atomic-signaler konvergerer",
+            "source": "Atomic Signal Architecture",
+        })
+
+    if len(points) < 2:
+        edge = _f(pick.get("soft_edge") or pick.get("edge")) or 0.0
+        if edge > 0:
+            points.append({
+                "emoji": "💰",
+                "text": f"Modell ser +{edge:.1f}% edge mot markedet",
+                "source": "Dixon-Coles + Pinnacle",
+            })
+        odds = _f(pick.get("odds")) or 0.0
+        if odds > 0:
+            implied = (1.0 / odds) * 100.0
+            points.append({
+                "emoji": "📊",
+                "text": f"Odds {odds:.2f} = {implied:.0f}% implisitt sannsynlighet",
+                "source": "Bookmaker odds",
+            })
+
+    return points[:5]
+
+
+def select_highest_prob_event(pick: dict) -> dict:
+    """
+    Identifiser dette pick'ets høyeste sannsynlighet event.
+    For nå: bruker dk_pick / market_type som primær (1X2). Over/Under og BTTS
+    krever motor-fix (BTTS hardkodet 50/50 per CLAUDE.md MEMORY).
+
+    Probability-fallback rekkefølge:
+    1. model_prob fra DB (hvis populert > 0)
+    2. market_prob + (edge / 100) — implisitt fra odds + edge
+    3. 1/odds + (edge / 100) — fallback når market_prob mangler
+    """
+    market_display = _resolve_market_display(pick)
+    model_prob = _f(pick.get("model_prob"))
+    market_prob = _f(pick.get("market_prob"))
+    odds = _f(pick.get("odds")) or 0.0
+    edge = _f(pick.get("soft_edge") or pick.get("edge")) or 0.0
+
+    if (market_prob is None or market_prob == 0) and odds > 0:
+        market_prob = 1.0 / odds
+
+    if (model_prob is None or model_prob == 0) and market_prob is not None:
+        model_prob = market_prob + (edge / 100.0)
+
+    return {
+        "label": market_display,
+        "model_prob_pct": round((model_prob or 0.0) * 100, 1),
+        "market_prob_pct": round((market_prob or 0.0) * 100, 1),
+        "edge_pct": round(edge, 1),
+        "odds": odds,
+    }
+
+
+def build_event_card(pick: dict, escape_fn=None) -> dict:
+    """Bundle pick til ett event-card payload (Daily Signaldesk thread item)."""
+    event = select_highest_prob_event(pick)
+    why_points = generate_why_points(pick)
+    tag_label, tag_emoji = calculate_data_tag(pick)
+    score = int(pick.get("atomic_score") or 0)
+    tier = pick.get("tier") or "MONITORED"
+
+    if score >= 7:
+        confidence_dots = "●●●●●"
+        confidence_level = "HØY"
+    elif score >= 4:
+        confidence_dots = "●●●○○"
+        confidence_level = "MEDIUM"
+    else:
+        confidence_dots = "●●○○○"
+        confidence_level = "LAV"
+
+    kickoff = pick.get("kickoff_time") or pick.get("kickoff") or pick.get("commence_time")
+
+    return {
+        "pick_id": pick.get("id") or pick.get("pick_id"),
+        "match": {
+            "home_team": pick.get("home_team", ""),
+            "away_team": pick.get("away_team", ""),
+            "league": pick.get("league") or "",
+            "kickoff_oslo": _format_oslo(kickoff),
+        },
+        "event": event,
+        "why_points": why_points,
+        "data_tag": {"label": tag_label, "emoji": tag_emoji},
+        "system": {
+            "atomic_score": score,
+            "tier": tier,
+            "confidence_dots": confidence_dots,
+            "confidence_level": confidence_level,
+        },
+    }
+
+
+MIN_PROB_PCT = 30.0  # under 30% = ikke "høysannsynlighet" — ekskluderes
+
+
+def build_daily_signaldesk(picks: list[dict], date_iso: str | None = None,
+                           max_events: int = 5,
+                           min_prob_pct: float = MIN_PROB_PCT) -> dict:
+    """
+    Bygg dagens Signaldesk fra liste med picks_v2-rader (caller henter fra DB).
+
+    Filterkjede (i rekkefølge):
+    1. Tier ∈ {ATOMIC, EDGE}
+    2. Ikke dummy-pick (atomic=0 + EV~0%)
+    3. Event model_prob_pct >= min_prob_pct (default 30%)
+    4. Sorter event.model_prob_pct descending, velg topp max_events
+    """
+    if date_iso is None:
+        date_iso = datetime.now(timezone.utc).date().isoformat()
+
+    eligible = [
+        p for p in picks
+        if (p.get("tier") in ("ATOMIC", "EDGE")) and not is_dummy_pick(p)
+    ]
+    cards = [build_event_card(p) for p in eligible]
+    cards = [c for c in cards if c["event"]["model_prob_pct"] >= min_prob_pct]
+    cards.sort(key=lambda c: c["event"]["model_prob_pct"], reverse=True)
+    selected = cards[:max_events]
+
+    if selected:
+        probs = [c["event"]["model_prob_pct"] for c in selected]
+        edges = [c["event"]["edge_pct"] for c in selected]
+        stats = {
+            "avg_probability_pct": round(sum(probs) / len(probs), 1),
+            "expected_hit_count": round(sum(probs) / 100.0, 1),
+            "total_edge_pct": round(sum(edges), 1),
+            "event_count": len(selected),
+        }
+    else:
+        stats = {
+            "avg_probability_pct": 0.0,
+            "expected_hit_count": 0.0,
+            "total_edge_pct": 0.0,
+            "event_count": 0,
+        }
+
+    return {
+        "date": date_iso,
+        "phase": "Phase 2 — Probability System",
+        "events": selected,
+        "stats": stats,
+        "filtered_count": {
+            "input_total": len(picks),
+            "dummy_filtered": sum(1 for p in picks if is_dummy_pick(p)),
+            "tier_filtered": sum(
+                1 for p in picks
+                if p.get("tier") not in ("ATOMIC", "EDGE")
+            ),
+            "eligible": len(eligible),
+            "selected": len(selected),
+        },
+    }
+
+
+def _format_norsk_date(iso_date: str) -> str:
+    months = ["jan","feb","mar","apr","mai","jun","jul","aug","sep","okt","nov","des"]
+    try:
+        d = datetime.fromisoformat(iso_date)
+        return f"{d.day}\\. {months[d.month - 1]} {d.year}"
+    except Exception:
+        return iso_date
+
+
+def format_signaldesk_telegram(signaldesk: dict, escape_fn=None) -> str:
+    """Render Daily Signaldesk stack as MarkdownV2 (top-of-thread post)."""
+    e = escape_fn or _escape_mdv2
+    events = signaldesk.get("events") or []
+    stats = signaldesk.get("stats") or {}
+    date_norsk = _format_norsk_date(signaldesk.get("date") or "")
+    phase = signaldesk.get("phase") or "Phase 2"
+
+    if not events:
+        return (
+            "🔥 *SESOMNOD SIGNALDESK*\n"
+            f"{date_norsk} · {e(phase)}\n\n"
+            "_Ingen høysannsynlighets\\-events i dag\\._\n\n"
+            "Vi venter heller enn å presse picks som ikke konvergerer\\. "
+            "Disiplin \\> volum\\.\n\n"
+            "🌐 sesomnod\\.com · 18\\+ Spill ansvarlig"
+        )
+
+    lines = [
+        "🔥 *SESOMNOD SIGNALDESK*",
+        f"{date_norsk} · {e(phase)}",
+        "",
+        f"_Dagens {len(events)} høyeste sannsynligheter:_",
+        "",
+    ]
+
+    for i, c in enumerate(events, 1):
+        tier_emoji = "⚛️" if c["system"]["tier"] == "ATOMIC" else "🟡"
+        match_short = f"{c['match']['home_team']} vs {c['match']['away_team']}"
+        if len(match_short) > 38:
+            match_short = match_short[:35] + "..."
+        lines.append(
+            f"{i}\\. {tier_emoji} {e(c['event']['label'])} — "
+            f"*{c['event']['model_prob_pct']}%*"
+        )
+        lines.append(
+            f"   {e(match_short)} @ *{c['event']['odds']:.2f}* "
+            f"\\| {c['data_tag']['emoji']}"
+        )
+        lines.append("")
+
+    lines.extend([
+        "═══════════════════════════════",
+        f"📊 *Avg sannsynlighet:* {stats.get('avg_probability_pct', 0)}%",
+        f"📈 *Forventet hit:* {stats.get('expected_hit_count', 0)}/{len(events)}",
+        f"💰 *Total edge:* \\+{stats.get('total_edge_pct', 0)}%",
+        "",
+        "_Full analyse av hver event følger nedenfor →_",
+        "",
+        "🌐 sesomnod\\.com · 18\\+ Spill ansvarlig",
+    ])
+
+    return "\n".join(lines)
+
+
+def format_event_card_telegram(card: dict, position: int, total: int,
+                               ladder: dict | None = None,
+                               escape_fn=None) -> str:
+    """Render single event-card as MarkdownV2 (thread reply under stack)."""
+    e = escape_fn or _escape_mdv2
+    m = card["match"]
+    ev = card["event"]
+    why = card.get("why_points") or []
+    tag = card["data_tag"]
+    sys_ = card["system"]
+
+    league_str = e(m['league']) if m.get('league') else "\\—"
+    kickoff_str = e(m['kickoff_oslo']) if m.get('kickoff_oslo') else "\\—"
+    lines = [
+        f"🔥 *\\#{position}/{total}: {e(ev['label'])}*",
+        f"*{e(m['home_team'])} vs {e(m['away_team'])}* · {league_str}",
+        f"🕐 {kickoff_str}",
+        "",
+        "═══════════════════════════════",
+        f"🎯 *Sannsynlighet: {ev['model_prob_pct']}%*",
+        f"📊 Modell: *{ev['model_prob_pct']}%* \\| Marked: *{ev['market_prob_pct']}%*",
+        f"💰 Edge: *\\+{ev['edge_pct']}%* \\| Odds: *{ev['odds']:.2f}*",
+        "",
+        "═══════════════════════════════",
+        "🧠 *HVORFOR DETTE ER MEST SANNSYNLIG:*",
+        "",
+    ]
+
+    for p in why:
+        lines.append(f"{p['emoji']} {e(p['text'])}")
+    lines.append("")
+
+    if ladder:
+        cur = ladder.get("current_nok", 1000)
+        growth = ladder.get("growth_pct", 0)
+        next_pick = ladder.get("next_pick") or ""
+        next_odds = ladder.get("next_odds") or 0.0
+        potential = ladder.get("potential_nok", 0)
+        lines.extend([
+            "═══════════════════════════════",
+            "🤖 *ORAKLION LIVE LADDER*",
+            f"Start: 1 000 → Nå: *{cur} kr* \\({growth}%\\)",
+            f"Neste: {e(next_pick)} @ {next_odds:.2f}",
+            f"Potensial: *{potential} kr*",
+            "",
+        ])
+
+    lines.extend([
+        "═══════════════════════════════",
+        "🧬 *SYSTEM SIGNAL*",
+        f"Omega: `{sys_['atomic_score']}/9` · *{e(sys_['tier'])}*",
+        f"Konfidens: {sys_['confidence_dots']} {e(sys_['confidence_level'])}",
+        f"Data: {e(tag['label'])} {tag['emoji']}",
+        "",
+        "🌐 sesomnod\\.com",
+    ])
+
+    return "\n".join(lines)
+
+
 def format_smartpick_telegram(payload: dict, escape_fn=None) -> str:
     """
     Render SmartPick payload as MarkdownV2 Telegram message.
