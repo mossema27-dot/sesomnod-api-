@@ -10620,6 +10620,266 @@ async def manual_settle(body: dict):
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.post("/admin/backfill-pending")
+async def admin_backfill_pending(body: dict | None = None):
+    """
+    Bulk-settle pending picks_v2 rows beyond the 48h auto-settle window.
+
+    Reuses _normalize_dk_pick_to_english + the same outcome-decision branches
+    as _auto_settle_results, so behavior is identical to a hypothetical
+    "auto-settle with widened window".
+
+    Body params (all optional):
+      dry_run: bool        (default true) — when true, returns plan only, no writes
+      max_age_days: int    (default 14)   — overrides 48h window for this run
+      tiers: list[str]     (default ["ATOMIC","EDGE"]) — only these tiers count
+      force: bool          (default false) — must be true (with dry_run=false) to write
+
+    Safety:
+      - Writes require BOTH dry_run=false AND force=true
+      - Idempotent: skips rows already RESULT_LOGGED
+      - Argentina is skipped (no API coverage), reported as needs_manual
+    """
+    body = body or {}
+    dry_run = bool(body.get("dry_run", True))
+    max_age_days = int(body.get("max_age_days", 14))
+    max_age_days = max(1, min(max_age_days, 60))
+    tiers = body.get("tiers") or ["ATOMIC", "EDGE"]
+    if not isinstance(tiers, list) or not all(isinstance(t, str) for t in tiers):
+        return JSONResponse(status_code=400, content={"error": "tiers must be list of strings"})
+    force = bool(body.get("force", False))
+    will_write = (not dry_run) and force
+
+    fd_key = cfg.FOOTBALL_DATA_API_KEY
+    if not fd_key:
+        return JSONResponse(status_code=503, content={"error": "FOOTBALL_DATA_API_KEY missing"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            pending = await conn.fetch(
+                f"""
+                SELECT
+                    pv.id AS pv_id,
+                    pv.home_team, pv.away_team,
+                    pv.odds, pv.soft_edge,
+                    pv.kickoff_time, pv.league, pv.tier,
+                    dk.pick AS dk_pick,
+                    dk.market_hint AS dk_market_hint
+                FROM picks_v2 pv
+                LEFT JOIN dagens_kamp dk
+                    ON pv.home_team = dk.home_team
+                    AND pv.away_team = dk.away_team
+                    AND pv.kickoff_time::date = dk.kickoff::date
+                WHERE (pv.status IS NULL OR pv.status != 'RESULT_LOGGED')
+                  AND pv.outcome IS NULL
+                  AND pv.tier = ANY($1::text[])
+                  AND pv.kickoff_time > NOW() - ($2 || ' days')::interval
+                  AND pv.kickoff_time < NOW() - INTERVAL '90 minutes'
+                ORDER BY pv.kickoff_time DESC
+                """,
+                tiers, str(max_age_days),
+            )
+
+        if not pending:
+            return {"scanned": 0, "settled": 0, "would_settle": 0, "needs_manual": [],
+                    "dry_run": dry_run, "will_write": will_write,
+                    "tiers": tiers, "max_age_days": max_age_days}
+
+        # Batch fetch finished matches per unique kickoff date (1 API call per date)
+        dates = sorted({p["kickoff_time"].date().isoformat() for p in pending})
+        finished_by_date: dict[str, list] = {}
+        async with httpx.AsyncClient(timeout=15) as client:
+            for d in dates:
+                try:
+                    r = await client.get(
+                        "https://api.football-data.org/v4/matches",
+                        headers={"X-Auth-Token": fd_key},
+                        params={"dateFrom": d, "dateTo": d, "status": "FINISHED"},
+                    )
+                    finished_by_date[d] = r.json().get("matches", []) if r.status_code == 200 else []
+                except Exception as fe:
+                    logger.warning(f"[Backfill] API fetch failed for {d}: {fe}")
+                    finished_by_date[d] = []
+
+        report: dict = {
+            "scanned": len(pending),
+            "settled": 0,
+            "would_settle": 0,
+            "by_outcome": {"WIN": 0, "LOSS": 0},
+            "by_tier": {},
+            "needs_manual": [],
+            "dry_run": dry_run,
+            "will_write": will_write,
+            "tiers": tiers,
+            "max_age_days": max_age_days,
+        }
+
+        for pick in pending:
+            tier = pick["tier"] or "UNKNOWN"
+            report["by_tier"].setdefault(tier, 0)
+
+            pick_home = str(pick["home_team"] or "").lower().strip()
+            pick_away = str(pick["away_team"] or "").lower().strip()
+            pick_league = str(pick["league"] or "").lower().strip()
+
+            if "argentin" in pick_league:
+                report["needs_manual"].append({
+                    "pv_id": pick["pv_id"],
+                    "match": f"{pick['home_team']} vs {pick['away_team']}",
+                    "league": pick["league"], "tier": tier,
+                    "reason": "Argentina league not in football-data.org free tier",
+                })
+                continue
+
+            d_key = pick["kickoff_time"].date().isoformat()
+            finished = finished_by_date.get(d_key, [])
+            matched = None
+            for attempt in ("name", "shortName"):
+                for m in finished:
+                    api_home = m.get("homeTeam", {}).get(attempt, "").lower().strip()
+                    api_away = m.get("awayTeam", {}).get(attempt, "").lower().strip()
+                    home_ok = (
+                        pick_home[:6] in api_home or api_home[:6] in pick_home
+                        or pick_home in api_home or api_home in pick_home
+                    )
+                    away_ok = (
+                        pick_away[:6] in api_away or api_away[:6] in pick_away
+                        or pick_away in api_away or api_away in pick_away
+                    )
+                    if home_ok and away_ok:
+                        matched = m
+                        break
+                if matched:
+                    break
+
+            if not matched:
+                report["needs_manual"].append({
+                    "pv_id": pick["pv_id"],
+                    "match": f"{pick['home_team']} vs {pick['away_team']}",
+                    "league": pick["league"], "tier": tier,
+                    "reason": "No API match (likely not in free-tier coverage)",
+                })
+                continue
+
+            score = matched.get("score", {}).get("fullTime", {})
+            home_score = score.get("home")
+            away_score = score.get("away")
+            if home_score is None or away_score is None:
+                report["needs_manual"].append({
+                    "pv_id": pick["pv_id"],
+                    "match": f"{pick['home_team']} vs {pick['away_team']}",
+                    "league": pick["league"], "tier": tier,
+                    "reason": "API returned match but no fullTime score",
+                })
+                continue
+
+            result_str = f"{home_score}-{away_score}"
+            total_goals = home_score + away_score
+            btts = home_score > 0 and away_score > 0
+
+            dk_pick_raw = str(pick["dk_pick"] or pick.get("dk_market_hint") or "").lower().strip()
+            dk_pick = _normalize_dk_pick_to_english(dk_pick_raw, pick_home, pick_away)
+            pick_won = None
+
+            if dk_pick == "draw":
+                pick_won = home_score == away_score
+            elif dk_pick in ("home", "home win", "1"):
+                pick_won = home_score > away_score
+            elif dk_pick in ("away", "away win", "2"):
+                pick_won = away_score > home_score
+            elif "over 3.5" in dk_pick:
+                pick_won = total_goals > 3
+            elif "over 2.5" in dk_pick or "over2.5" in dk_pick:
+                pick_won = total_goals > 2
+            elif "over 1.5" in dk_pick:
+                pick_won = total_goals > 1
+            elif "over 0.5" in dk_pick:
+                pick_won = total_goals > 0
+            elif "btts no" in dk_pick:
+                pick_won = not btts
+            elif "btts" in dk_pick:
+                pick_won = btts
+            elif "under 2.5" in dk_pick:
+                pick_won = total_goals < 3
+            elif "under 3.5" in dk_pick:
+                pick_won = total_goals < 4
+
+            if pick_won is None:
+                report["needs_manual"].append({
+                    "pv_id": pick["pv_id"],
+                    "match": f"{pick['home_team']} vs {pick['away_team']}",
+                    "league": pick["league"], "tier": tier,
+                    "score": result_str,
+                    "dk_pick_raw": dk_pick_raw,
+                    "normalized": dk_pick,
+                    "reason": "Pick format not recognized after normalization",
+                })
+                continue
+
+            outcome_str = "WIN" if pick_won else "LOSS"
+            soft_edge = float(pick["soft_edge"] or 0)
+            confidence = min(0.9, max(0.5, 0.5 + soft_edge / 100.0))
+            actual = 1.0 if pick_won else 0.0
+            brier = round((confidence - actual) ** 2, 4)
+
+            report["would_settle"] += 1
+            report["by_outcome"][outcome_str] += 1
+            report["by_tier"][tier] += 1
+
+            if will_write:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE picks_v2 SET
+                            result = $1, outcome = $2,
+                            status = 'RESULT_LOGGED', brier_score = $3,
+                            updated_at = NOW()
+                        WHERE id = $4
+                          AND (status IS NULL OR status != 'RESULT_LOGGED')
+                        """,
+                        result_str, outcome_str, brier, pick["pv_id"],
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE dagens_kamp SET
+                            result = $1, home_score = $2, away_score = $3,
+                            updated_at = NOW()
+                        WHERE home_team = $4 AND away_team = $5
+                          AND kickoff::date = $6::date
+                          AND result IS NULL
+                        """,
+                        outcome_str, home_score, away_score,
+                        pick["home_team"], pick["away_team"],
+                        pick["kickoff_time"],
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE pick_receipts SET
+                            result_outcome = $1, brier_score = $2, settled_at = NOW()
+                        WHERE pick_id = $3 AND result_outcome IS NULL
+                        """,
+                        outcome_str, brier, pick["pv_id"],
+                    )
+                report["settled"] += 1
+                logger.info(
+                    f"[Backfill] pv_id={pick['pv_id']} {pick['home_team']} vs {pick['away_team']}: "
+                    f"{result_str} -> {outcome_str} (dk_pick={dk_pick}, tier={tier})"
+                )
+
+        logger.info(
+            f"[Backfill] dry_run={dry_run} will_write={will_write} "
+            f"scanned={report['scanned']} would_settle={report['would_settle']} "
+            f"settled={report['settled']} needs_manual={len(report['needs_manual'])}"
+        )
+        return report
+
+    except Exception as e:
+        logger.error(f"[Backfill] Top-level error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/backfill-receipts")
 async def admin_backfill_receipts():
     """Backfill pick_receipts from picks_v2. Idempotent — skips existing."""
