@@ -10096,10 +10096,17 @@ async def admin_phase0_stats(window: int = 30):
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
 
+    # Strategi C: ekskluder dummy-picks (atomic_score=0 + EV~0%) fra Phase 0-aggregat.
+    # Hit-rate analyse 2026-04-27 viste 5 dummy-picks som forurenset trackrecord.
+    # Filter speilet fra services/smartpick_narratives.is_dummy_pick (samme threshold).
+    DUMMY_FILTER_SQL = (
+        "NOT (atomic_score = 0 AND (soft_ev IS NULL OR ABS(soft_ev) < 0.05))"
+    )
+
     try:
         async with db_state.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT
                     COUNT(*) FILTER (WHERE status='RESULT_LOGGED')                                    AS settled_count,
                     COUNT(*) FILTER (WHERE tier='ATOMIC')                                             AS atomic_count,
@@ -10108,9 +10115,11 @@ async def admin_phase0_stats(window: int = 30):
                     COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED')      AS settled_atomic_edge,
                     COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_atomic_edge,
                     AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE) AS avg_model_edge_pct,
-                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED')    AS avg_brier_score
+                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED')    AS avg_brier_score,
+                    COUNT(*) FILTER (WHERE atomic_score = 0 AND (soft_ev IS NULL OR ABS(soft_ev) < 0.05)) AS dummy_excluded_count
                 FROM picks_v2
                 WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND {DUMMY_FILTER_SQL}
                 """,
                 str(window),
             )
@@ -10167,9 +10176,11 @@ async def admin_phase0_stats(window: int = 30):
                 "brier_under_025": _verdict(gate_4_pass, f"{brier_score}" if brier_score is not None else "n/a"),
                 "drawdown_under_20pct": "DEFERRED (sequential P&L not in single-aggregate SQL)",
             },
+            "dummy_excluded_count": int(row["dummy_excluded_count"] or 0),
             "_notes": {
                 "naming": "Path uses 'phase0' for caller compatibility; threshold logic = compute_phase1_gate per CLAUDE.md.",
                 "tier_filter": "hit_rate_pct restricted to tier IN ('ATOMIC','EDGE'); MONITORED/SKIP excluded.",
+                "dummy_filter": "Strategi C 2026-04-27: ekskluderer picks med atomic_score=0 + |EV|<0.05 (signal-korrupte rescues). Speiler is_dummy_pick i smartpick_narratives.",
                 "drawdown": "max_drawdown_pct deferred — requires per-pick chronological stake+result traversal.",
                 "clv_avg_pct": "Real closing-line value from MiroFish (Pinnacle no-vig). All-time aggregate, not window-bounded.",
                 "model_edge_pinnacle_pre_pct": "Pre-game model-edge vs Pinnacle no-vig from picks_v2.pinnacle_clv. Window-bounded. NOT classical CLV.",
