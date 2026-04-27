@@ -10099,27 +10099,27 @@ async def admin_phase0_stats(window: int = 30):
     # Strategi C: ekskluder dummy-picks (atomic_score=0 + EV~0%) fra Phase 0-aggregat.
     # Hit-rate analyse 2026-04-27 viste 5 dummy-picks som forurenset trackrecord.
     # Filter speilet fra services/smartpick_narratives.is_dummy_pick (samme threshold).
-    DUMMY_FILTER_SQL = (
-        "NOT (atomic_score = 0 AND (soft_ev IS NULL OR ABS(soft_ev) < 0.05))"
-    )
+    # 2026-04-27 hotfix: bruk FILTER på counts (ikke WHERE) så dummy_excluded_count
+    # faktisk teller dummy-radene som ble ekskludert fra hovedaggregatene.
+    DUMMY_COND = "(atomic_score = 0 AND (soft_ev IS NULL OR ABS(soft_ev) < 0.05))"
+    NOT_DUMMY = f"NOT {DUMMY_COND}"
 
     try:
         async with db_state.pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
                 SELECT
-                    COUNT(*) FILTER (WHERE status='RESULT_LOGGED')                                    AS settled_count,
-                    COUNT(*) FILTER (WHERE tier='ATOMIC')                                             AS atomic_count,
-                    COUNT(*) FILTER (WHERE tier='EDGE')                                               AS edge_count,
-                    COUNT(*) FILTER (WHERE tier='MONITORED')                                          AS monitored_count,
-                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED')      AS settled_atomic_edge,
-                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_atomic_edge,
-                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE) AS avg_model_edge_pct,
-                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED')    AS avg_brier_score,
-                    COUNT(*) FILTER (WHERE atomic_score = 0 AND (soft_ev IS NULL OR ABS(soft_ev) < 0.05)) AS dummy_excluded_count
+                    COUNT(*) FILTER (WHERE status='RESULT_LOGGED' AND {NOT_DUMMY})                                    AS settled_count,
+                    COUNT(*) FILTER (WHERE tier='ATOMIC' AND {NOT_DUMMY})                                             AS atomic_count,
+                    COUNT(*) FILTER (WHERE tier='EDGE' AND {NOT_DUMMY})                                               AS edge_count,
+                    COUNT(*) FILTER (WHERE tier='MONITORED' AND {NOT_DUMMY})                                          AS monitored_count,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND {NOT_DUMMY})      AS settled_atomic_edge,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN' AND {NOT_DUMMY}) AS wins_atomic_edge,
+                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE AND {NOT_DUMMY}) AS avg_model_edge_pct,
+                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED' AND {NOT_DUMMY})    AS avg_brier_score,
+                    COUNT(*) FILTER (WHERE {DUMMY_COND}) AS dummy_excluded_count
                 FROM picks_v2
                 WHERE created_at >= NOW() - ($1 || ' days')::interval
-                  AND {DUMMY_FILTER_SQL}
                 """,
                 str(window),
             )
