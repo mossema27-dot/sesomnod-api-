@@ -4373,7 +4373,7 @@ async def _auto_settle_results():
                     AND pv.kickoff_time::date = dk.kickoff::date
                 WHERE (pv.status IS NULL OR pv.status != 'RESULT_LOGGED')
                   AND pv.outcome IS NULL
-                  AND pv.kickoff_time > NOW() - INTERVAL '48 hours'
+                  AND pv.kickoff_time > NOW() - INTERVAL '7 days'
                   AND pv.kickoff_time < NOW() - INTERVAL '90 minutes'
             """)
 
@@ -4562,6 +4562,108 @@ def _scheduler_job_event(event):
         "last_success": event.exception is None,
         "last_error": (str(event.exception)[:200] if event.exception else None),
     }
+
+
+# ─────────────────────────────────────────────────────────
+# STUCK PICK ALERT JOB (defined before scheduler setup)
+# ─────────────────────────────────────────────────────────
+# Forsikrer mot norsk-bug 2.0: enhver ATOMIC/EDGE pick som henger
+# pending mer enn 24h etter kickoff varsler Telegram. Idempotent —
+# samme pick varsles maks én gang per UTC-dato.
+_stuck_pick_alerted: dict[str, set[int]] = {}
+
+
+async def _stuck_pick_alert_job():
+    if not db_state.connected or not db_state.pool:
+        logger.info("[StuckAlert] SKIP: DB offline")
+        return
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        logger.info("[StuckAlert] SKIP: Telegram not configured")
+        return
+    try:
+        async with db_state.pool.acquire() as conn:
+            stuck = await conn.fetch(
+                """
+                SELECT
+                    pv.id AS pv_id,
+                    pv.home_team, pv.away_team,
+                    pv.tier, pv.league,
+                    pv.kickoff_time,
+                    EXTRACT(EPOCH FROM (NOW() - pv.kickoff_time))/3600 AS hours_ago,
+                    dk.pick AS dk_pick
+                FROM picks_v2 pv
+                LEFT JOIN dagens_kamp dk
+                    ON pv.home_team = dk.home_team
+                    AND pv.away_team = dk.away_team
+                    AND pv.kickoff_time::date = dk.kickoff::date
+                WHERE (pv.status IS NULL OR pv.status != 'RESULT_LOGGED')
+                  AND pv.outcome IS NULL
+                  AND pv.tier IN ('ATOMIC','EDGE')
+                  AND pv.kickoff_time < NOW() - INTERVAL '24 hours'
+                  AND pv.kickoff_time > NOW() - INTERVAL '14 days'
+                ORDER BY pv.kickoff_time DESC
+                LIMIT 20
+                """
+            )
+        if not stuck:
+            logger.info("[StuckAlert] No stuck picks")
+            return
+
+        today_key = datetime.now(timezone.utc).date().isoformat()
+        already = _stuck_pick_alerted.setdefault(today_key, set())
+        new_picks = [p for p in stuck if p["pv_id"] not in already]
+        if not new_picks:
+            logger.info(f"[StuckAlert] {len(stuck)} stuck, all already alerted today")
+            return
+
+        for p in new_picks:
+            already.add(p["pv_id"])
+
+        # Trim memory: keep only today's date keys
+        for k in list(_stuck_pick_alerted.keys()):
+            if k != today_key:
+                _stuck_pick_alerted.pop(k, None)
+
+        lines = ["🔴 *STUCK PICK ALERT*", ""]
+        for p in new_picks[:10]:
+            raw = str(p["dk_pick"] or "").lower().strip()
+            home = str(p["home_team"] or "").lower().strip()
+            away = str(p["away_team"] or "").lower().strip()
+            try:
+                norm = _normalize_dk_pick_to_english(raw, home, away)
+            except Exception:
+                norm = "?"
+            hours = int(p["hours_ago"] or 0)
+            lines.append(
+                f"• `pv_id={p['pv_id']}` {_mdv2_escape(p['home_team'])} vs "
+                f"{_mdv2_escape(p['away_team'])}"
+            )
+            lines.append(
+                f"  pending {hours}h \\| tier=*{_mdv2_escape(p['tier'] or '?')}*"
+            )
+            lines.append(
+                f"  dk\\_pick=`{_mdv2_escape(raw)}` → norm=`{_mdv2_escape(norm)}`"
+            )
+            lines.append("")
+
+        if len(new_picks) > 10:
+            lines.append(f"\\.\\.\\. \\+{len(new_picks) - 10} flere")
+            lines.append("")
+
+        lines.append(
+            "Fix: `POST /admin/backfill-pending` "
+            "med `{\"dry_run\":false,\"force\":true}` "
+            "eller manuell `/admin/manual-settle`\\."
+        )
+
+        msg = "\n".join(lines)
+        result = await _send_telegram_markdownv2(msg)
+        logger.info(
+            f"[StuckAlert] Sent {len(new_picks)} stuck picks "
+            f"(total stuck={len(stuck)}) → {result.get('status')}"
+        )
+    except Exception as e:
+        logger.error(f"[StuckAlert] Error: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -4802,6 +4904,22 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             name="Auto Result Settlement",
             misfire_grace_time=300,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Stuck-pick alert: ATOMIC/EDGE picks pending >24h after kickoff —
+    # forsikrer mot norsk-bug 2.0. Telegram-varsel hver 6. time, idempotent
+    # per UTC-dato.
+    if not scheduler.get_job("stuck_pick_alert"):
+        scheduler.add_job(
+            _stuck_pick_alert_job,
+            "interval",
+            hours=6,
+            id="stuck_pick_alert",
+            replace_existing=True,
+            name="Stuck Pick Alert (>24h, ATOMIC+EDGE)",
+            misfire_grace_time=600,
             max_instances=1,
             coalesce=True,
         )
