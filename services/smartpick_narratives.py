@@ -783,6 +783,406 @@ def format_event_card_telegram(card: dict, position: int, total: int,
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# DECISION ENGINE — Phase 3: Dominance, ikke valg-liste
+# Vi viser HVA som er beste valg + HVORFOR alt annet er dårligere.
+# Pure functions; ingen DB-kall. Caller henter picks og passer som list[dict].
+# ─────────────────────────────────────────────────────────────────────────
+
+# Filter-grenser (ikke-forhandlingsbare per Don)
+DECISION_MIN_PROB_PCT = 65.0
+DECISION_MIN_EDGE_PCT = 5.0
+DECISION_MIN_CONFIDENCE = 0.6  # SILVER threshold
+DECISION_MAX_PLAYS_PER_DAY = 3
+
+# Ekskluderte markeder (motor-status per CLAUDE.md MEMORY)
+EXCLUDED_MARKETS = {"btts", "btts_yes", "btts_no", "corners"}
+
+
+def _count_populated_signals(pick: dict) -> int:
+    """Tell hvor mange signal-felter pick'en har faktisk data for."""
+    return sum([
+        _f(pick.get("signal_xg_home")) is not None,
+        _f(pick.get("signal_xg_away")) is not None,
+        _is_active(pick.get("signal_velocity")),
+        _is_active(pick.get("signal_weather")),
+        bool(pick.get("signals_triggered")),
+    ])
+
+
+def calculate_dominance_score(market: dict) -> float:
+    """
+    DOMINANCE_SCORE = (prob*0.5 + edge*0.3 + confidence*0.2) / risk_factor
+
+    risk_factor = 1.0 + (1 - prob)  → høy prob gir lav risk → høyere score.
+    Resultat clamped til [0, 1].
+    """
+    prob = max(0.0, min(1.0, (market.get("probability") or 0.0) / 100.0))
+    edge = max(0.0, (market.get("edge") or 0.0) / 100.0)
+    confidence = max(0.0, min(1.0, market.get("confidence") or 0.0))
+    risk_factor = 1.0 + (1.0 - prob)
+    raw = (prob * 0.5 + edge * 0.3 + confidence * 0.2) / risk_factor
+    return round(min(1.0, raw), 4)
+
+
+def calculate_market_confidence(pick: dict, market: dict) -> float:
+    """
+    Konfidens 0-1 basert på data-completeness + signal-konvergens.
+    Brukes som "konfidens"-vekt i dominance-score.
+    """
+    populated = _count_populated_signals(pick)
+    score = int(pick.get("atomic_score") or 0)
+    edge = market.get("edge") or 0.0
+
+    if score >= 9 and populated >= 4 and edge >= 12:
+        return 0.95
+    if score >= 7 and populated >= 3 and edge >= 8:
+        return 0.85
+    if score >= 7 and populated >= 2 and edge >= 5:
+        return 0.70
+    if score >= 4 and populated >= 1:
+        return 0.55
+    return 0.40
+
+
+def generate_all_markets_for_pick(pick: dict) -> list[dict]:
+    """
+    Generer alle markeder vi har modell for, per pick.
+
+    Per 2026-04-27 har vi pålitelig modell for:
+    - 1X2 main pick (fra dk_pick + model_prob/market_prob)
+
+    DEFERED (motor-fix kreves):
+    - BTTS (hardkodet 50/50 i dixon_coles_engine.py per CLAUDE.md MEMORY)
+    - Over/Under 1.5/2.5/3.5 (krever signal_xg_home + signal_xg_away populert
+      for hver pick — i dag 0/12 — pipeline-fix venter)
+    - Corners (ikke i picks_v2 schema)
+
+    Når xG-pipeline fikses: legg til Poisson OU-markeder her.
+    """
+    markets: list[dict] = []
+    main_event = select_highest_prob_event(pick)
+    label_lower = (main_event.get("label") or "").lower()
+
+    if not any(x in label_lower for x in EXCLUDED_MARKETS):
+        confidence = calculate_market_confidence(pick, {
+            "edge": main_event.get("edge_pct") or 0.0,
+        })
+        markets.append({
+            "label": main_event["label"],
+            "market_key": "main_pick",
+            "probability": main_event["model_prob_pct"],
+            "market_implied": main_event["market_prob_pct"],
+            "edge": main_event["edge_pct"],
+            "odds": main_event["odds"],
+            "confidence": confidence,
+            "data_source": "Dixon-Coles + Pinnacle",
+            "excluded_reason": None,
+        })
+
+    # Stub for Over/Under når xG er populert
+    xg_h = _f(pick.get("signal_xg_home"))
+    xg_a = _f(pick.get("signal_xg_away"))
+    if xg_h is not None and xg_a is not None:
+        total_xg = xg_h + xg_a
+        # Enkel Poisson approximation for OU 2.5: P(total > 2.5) når λ = total_xg
+        # P(0..2 mål) = e^-λ * (1 + λ + λ²/2). Vi gjør konservativ approks:
+        try:
+            import math
+            lam = total_xg
+            p0 = math.exp(-lam)
+            p1 = p0 * lam
+            p2 = p1 * lam / 2.0
+            p_over_25 = max(0.0, min(1.0, 1.0 - (p0 + p1 + p2)))
+            edge_25 = (p_over_25 * 100) - 55.0  # rough market-implied baseline
+            confidence_25 = calculate_market_confidence(pick, {"edge": edge_25})
+            markets.append({
+                "label": "Over 2.5 mål",
+                "market_key": "over_25",
+                "probability": round(p_over_25 * 100, 1),
+                "market_implied": 55.0,
+                "edge": round(edge_25, 1),
+                "odds": round(1.0 / max(0.01, p_over_25 - (edge_25 / 100)), 2),
+                "confidence": confidence_25,
+                "data_source": "Poisson(λ=total_xG)",
+                "excluded_reason": None,
+            })
+        except Exception:
+            pass
+
+    return markets
+
+
+def select_dominant_play(markets: list[dict]) -> dict | None:
+    """
+    Filtrer + velg DEN ENE høyeste dominance_score.
+    Filter-grenser ikke-forhandlingsbare:
+      probability >= 65, edge >= +5%, confidence >= 0.6, ikke EXCLUDED-marked.
+    """
+    eligible = []
+    for m in markets:
+        label_lower = (m.get("label") or "").lower()
+        if any(x in label_lower for x in EXCLUDED_MARKETS):
+            continue
+        if (m.get("probability") or 0.0) < DECISION_MIN_PROB_PCT:
+            continue
+        if (m.get("edge") or 0.0) < DECISION_MIN_EDGE_PCT:
+            continue
+        if (m.get("confidence") or 0.0) < DECISION_MIN_CONFIDENCE:
+            continue
+        m_with_score = dict(m)
+        m_with_score["dominance_score"] = calculate_dominance_score(m)
+        eligible.append(m_with_score)
+
+    if not eligible:
+        return None
+    eligible.sort(key=lambda x: x["dominance_score"], reverse=True)
+    return eligible[0]
+
+
+def generate_why_not_others(markets: list[dict], chosen: dict) -> list[str]:
+    """Eksklusjons-grunn for hvert ikke-valgt marked. Returner max 4 linjer."""
+    reasons: list[str] = []
+    chosen_label = (chosen or {}).get("label", "")
+    chosen_prob = (chosen or {}).get("probability", 0.0)
+
+    for m in markets:
+        if m.get("label") == chosen_label:
+            continue
+        label_lower = (m.get("label") or "").lower()
+        prob = m.get("probability") or 0.0
+        edge = m.get("edge") or 0.0
+        conf = m.get("confidence") or 0.0
+        label = m.get("label") or "?"
+
+        if any(x in label_lower for x in EXCLUDED_MARKETS):
+            reasons.append(f"{label}: deferes (motor under kalibrering)")
+        elif prob < 55.0:
+            reasons.append(f"{label}: {prob:.0f}% (coinflip — ingen edge)")
+        elif edge < 3.0:
+            reasons.append(f"{label}: edge +{edge:.1f}% (markedet er pris-effektivt)")
+        elif conf < DECISION_MIN_CONFIDENCE:
+            reasons.append(f"{label}: utilstrekkelig data-konfidens")
+        elif prob < chosen_prob:
+            diff = chosen_prob - prob
+            reasons.append(
+                f"{label}: {prob:.0f}% ({diff:.0f}pp lavere safety enn dominant play)"
+            )
+        else:
+            reasons.append(f"{label}: dominance_score under valgt play")
+
+    return reasons[:4]
+
+
+def calculate_tier(market: dict, pick: dict) -> tuple[str, str, str]:
+    """
+    Returner (tier_name, tier_emoji, star_string).
+
+    PLATINUM: atomic >= 9 + signals >= 4 + edge > 12% + Big5
+    GOLD:     atomic >= 7 + signals >= 3 + edge > 8%
+    SILVER:   atomic >= 7 + signals >= 2 + edge > 5%
+    EXCLUDED: alt under
+    """
+    score = int(pick.get("atomic_score") or 0)
+    edge = market.get("edge") or 0.0
+    populated = _count_populated_signals(pick)
+    league = (pick.get("league") or "").lower()
+    is_big5 = any(
+        l in league for l in ("premier", "la liga", "bundesliga", "serie a", "ligue 1")
+    )
+
+    if score >= 9 and populated >= 4 and edge > 12 and is_big5:
+        return ("PLATINUM", "🏆", "⭐⭐⭐⭐⭐")
+    if score >= 7 and populated >= 3 and edge > 8:
+        return ("GOLD", "💎", "⭐⭐⭐⭐")
+    if score >= 7 and populated >= 2 and edge > 5:
+        return ("SILVER", "🥈", "⭐⭐⭐")
+    return ("EXCLUDED", "❌", "")
+
+
+def build_decision_play(pick: dict) -> dict | None:
+    """
+    Bygg ett dominant play fra én pick. Returner None hvis ingen kvalifiserer.
+
+    Inkluderer pick-meta + valgt market + why_not_others + tier.
+    """
+    if is_dummy_pick(pick):
+        return None
+    markets = generate_all_markets_for_pick(pick)
+    chosen = select_dominant_play(markets)
+    if chosen is None:
+        return None
+
+    tier_name, tier_emoji, star_string = calculate_tier(chosen, pick)
+    if tier_name == "EXCLUDED":
+        return None
+
+    why = generate_why_points(pick)
+    why_not = generate_why_not_others(markets, chosen)
+    tag_label, tag_emoji = calculate_data_tag(pick)
+    kickoff = pick.get("kickoff_time") or pick.get("kickoff") or pick.get("commence_time")
+
+    return {
+        "pick_id": pick.get("id") or pick.get("pick_id"),
+        "match": {
+            "home_team": pick.get("home_team", ""),
+            "away_team": pick.get("away_team", ""),
+            "league": pick.get("league") or "",
+            "kickoff_oslo": _format_oslo(kickoff),
+        },
+        "chosen": chosen,
+        "all_markets": markets,
+        "why_points": why,
+        "why_not_others": why_not,
+        "tier": {"name": tier_name, "emoji": tier_emoji, "stars": star_string},
+        "data_tag": {"label": tag_label, "emoji": tag_emoji},
+    }
+
+
+def build_decision_desk(picks: list[dict], date_iso: str | None = None,
+                        scanned_matches: int | None = None) -> dict:
+    """
+    Generer dagens Decision Desk fra liste pending picks_v2-rader.
+
+    Returnerer max DECISION_MAX_PLAYS_PER_DAY plays sortert etter
+    dominance_score descending. Empty-state hvis 0 kvalifiserer.
+    """
+    if date_iso is None:
+        date_iso = datetime.now(timezone.utc).date().isoformat()
+
+    plays_raw = []
+    for p in picks:
+        play = build_decision_play(p)
+        if play:
+            plays_raw.append(play)
+
+    plays_raw.sort(
+        key=lambda x: x["chosen"].get("dominance_score", 0.0), reverse=True
+    )
+    plays = plays_raw[:DECISION_MAX_PLAYS_PER_DAY]
+
+    if scanned_matches is None:
+        scanned_matches = len(picks)
+    qualified = len(plays)
+    filtered_out = max(0, scanned_matches - qualified)
+
+    if plays:
+        scores = [p["chosen"].get("dominance_score", 0.0) for p in plays]
+        edges = [p["chosen"].get("edge", 0.0) for p in plays]
+        probs = [p["chosen"].get("probability", 0.0) for p in plays]
+        stats = {
+            "avg_dominance_score": round(sum(scores) / len(scores), 4),
+            "expected_hit_count": round(sum(probs) / 100.0, 1),
+            "total_edge_pct": round(sum(edges), 1),
+        }
+    else:
+        stats = {
+            "avg_dominance_score": 0.0,
+            "expected_hit_count": 0.0,
+            "total_edge_pct": 0.0,
+        }
+
+    return {
+        "date": date_iso,
+        "phase": "Phase 3 — Decision Engine",
+        "scanned_matches": scanned_matches,
+        "qualified_matches": qualified,
+        "filtered_out": filtered_out,
+        "dominant_plays": plays,
+        "stats": stats,
+        "no_qualified_today": qualified == 0,
+    }
+
+
+def format_decision_desk_telegram(desk: dict, escape_fn=None) -> str:
+    """Render Decision Desk som MarkdownV2-streng for Telegram."""
+    e = escape_fn or _escape_mdv2
+    plays = desk.get("dominant_plays") or []
+    stats = desk.get("stats") or {}
+    date_norsk = _format_norsk_date(desk.get("date") or "")
+    phase = desk.get("phase") or "Phase 3"
+    scanned = desk.get("scanned_matches") or 0
+    filtered_out = desk.get("filtered_out") or 0
+
+    if not plays:
+        return (
+            "🔒 *SESOMNOD DECISION DESK*\n"
+            f"{date_norsk}\n\n"
+            "_Ingen kvalifiserte beslutninger i dag\\._\n\n"
+            f"Av *{scanned}* kamper analysert ble ingen klassifisert "
+            "som DOMINANT etter våre filtre:\n"
+            "\\- Sannsynlighet ≥ 65%\n"
+            "\\- Edge ≥ \\+5%\n"
+            "\\- Konfidens ≥ SILVER\n"
+            "\\- Bevist modell\\-marked\n\n"
+            "_Vi sender ikke svake spill\\. Vi venter til markedet "
+            "gir oss klar edge\\._\n\n"
+            "Tilbake i morgen kl 09:00\\.\n\n"
+            "🌐 sesomnod\\.com"
+        )
+
+    count = len(plays)
+    lines = [
+        "🔥 *SESOMNOD DECISION DESK*",
+        f"{date_norsk} · {e(phase)}",
+        "",
+        f"Vi analyserte *{scanned}* kamper\\.",
+        f"Vi sender *{count}* beslutninger\\.",
+        "",
+    ]
+
+    for i, play in enumerate(plays, 1):
+        m = play["match"]
+        c = play["chosen"]
+        tier = play["tier"]
+        tag = play["data_tag"]
+        why = play.get("why_points") or []
+        why_not = play.get("why_not_others") or []
+
+        league_str = e(m["league"]) if m.get("league") else "\\—"
+        kickoff_str = e(m["kickoff_oslo"]) if m.get("kickoff_oslo") else "\\—"
+
+        lines.append("═══════════════════════════════")
+        lines.append(f"🏆 *DOMINANT \\#{i} — {tier['emoji']} {e(tier['name'])}*")
+        lines.append(f"*{e(c['label'])}* — *{c['probability']}%*")
+        lines.append(f"{e(m['home_team'])} vs {e(m['away_team'])} · {kickoff_str}")
+        lines.append(f"_{league_str}_")
+        lines.append("")
+        lines.append("🧠 *HVORFOR DET DOMINERER:*")
+        for p in why[:4]:
+            lines.append(f"{p['emoji']} {e(p['text'])}")
+        lines.append("")
+
+        if why_not:
+            lines.append("❌ *HVORFOR IKKE ANDRE SPILL:*")
+            for r in why_not:
+                lines.append(f"\\- {e(r)}")
+            lines.append("")
+
+        lines.append(
+            f"📊 Modell: *{c['probability']}%* \\| "
+            f"Marked: *{c['market_implied']}%* \\| "
+            f"Edge: *\\+{c['edge']}%*"
+        )
+        lines.append(
+            f"{tier['stars']} *{e(tier['name'])}* · {tag['emoji']} {e(tag['label'])}"
+        )
+        lines.append(f"⚖️ Dominance score: `{c.get('dominance_score', 0):.3f}`")
+        lines.append("")
+
+    lines.extend([
+        "═══════════════════════════════",
+        f"📊 *Avg DOMINANCE\\-score:* {stats.get('avg_dominance_score', 0):.3f}",
+        f"🎯 *Forventet hit:* {stats.get('expected_hit_count', 0)}/{count}",
+        f"💰 *Total edge:* \\+{stats.get('total_edge_pct', 0)}%",
+        f"🔍 *Filtrert bort:* {filtered_out} kamper",
+        "",
+        "🌐 sesomnod\\.com · Phase 3 · 18\\+ Spill ansvarlig",
+    ])
+
+    return "\n".join(lines)
+
+
 def format_smartpick_telegram(payload: dict, escape_fn=None) -> str:
     """
     Render SmartPick payload as MarkdownV2 Telegram message.
