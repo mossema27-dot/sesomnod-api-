@@ -11413,7 +11413,7 @@ async def admin_batch_recompute_edge_events(
             from services.probability_event_generator import _data_completeness, enrich_implied_inline
             preview = []
             total = 0
-            for pick in picks[:5]:
+            for pick in picks:
                 payloads = compute_all_edge_events_for_pick(pick)
                 total += len(payloads)
                 completeness = _data_completeness(pick)
@@ -11442,7 +11442,7 @@ async def admin_batch_recompute_edge_events(
             return {
                 "dry_run": True,
                 "picks_count": len(picks),
-                "preview_first_5": preview,
+                "preview_first_5": preview[:10],
                 "preview_total_events": total,
             }
 
