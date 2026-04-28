@@ -327,10 +327,15 @@ async def fetch_fixture_score(fixture_id: int,
 
 # ── DON-ALERT (intern Telegram) ─────────────────────────────────────────────
 async def _maybe_alert_first_picks(pool, payload: dict) -> bool:
-    """Send intern Telegram-alert for picks #1-3. Graceful skip ved manglende env."""
+    """
+    Send intern Telegram-alert for picks #1-3.
+
+    HARD ISOLATION: kun DON_INTERNAL_TELEGRAM_CHAT_ID (ingen fallback til
+    kunde-kanalen TELEGRAM_CHAT_ID). Hvis env mangler → graceful skip,
+    picks lagres fortsatt. Don setter env via Railway dashboard når klar.
+    """
     token = os.environ.get("TELEGRAM_TOKEN", "")
-    intern_chat = (os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID")
-                   or os.environ.get("TELEGRAM_CHAT_ID", ""))
+    intern_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT COUNT(*) AS n FROM sniper_bets_v1")
@@ -338,8 +343,14 @@ async def _maybe_alert_first_picks(pool, payload: dict) -> bool:
 
     if n_total > ALERT_FIRST_N_PICKS:
         return False
-    if not token or not intern_chat:
-        logger.info("[Sniper] Don-alert skipped: TELEGRAM_TOKEN or chat_id mangler")
+    if not token:
+        logger.info("[Sniper] Don-alert skipped: TELEGRAM_TOKEN ikke satt")
+        return False
+    if not intern_chat:
+        logger.info(
+            "[Sniper] Don-alert skipped: DON_INTERNAL_TELEGRAM_CHAT_ID "
+            "ikke satt (sett i Railway dashboard for aktivering)"
+        )
         return False
 
     try:

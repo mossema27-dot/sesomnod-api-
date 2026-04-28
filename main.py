@@ -11599,6 +11599,57 @@ async def admin_api_football_raw(date: str = "", league: int = 39, season: int =
     return out
 
 
+@app.get("/admin/telegram-getupdates")
+async def admin_telegram_getupdates():
+    """
+    Hent siste Telegram-meldinger til SesomNodBot (Pro plan endpoint).
+    Brukes for å finne Don's private chat_id uten å eksponere TELEGRAM_TOKEN
+    lokalt. Returnerer kun chat-metadata, ikke message-innhold.
+    """
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    if not token:
+        return JSONResponse(status_code=500,
+            content={"error": "TELEGRAM_TOKEN missing in env"})
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"limit": 20},
+            )
+            data = r.json()
+        chats = {}
+        for upd in (data.get("result") or []):
+            msg = upd.get("message") or upd.get("edited_message") or {}
+            chat = msg.get("chat") or {}
+            cid = chat.get("id")
+            if cid is None:
+                continue
+            if cid not in chats:
+                chats[cid] = {
+                    "chat_id": cid,
+                    "type": chat.get("type"),
+                    "title": chat.get("title"),
+                    "username": chat.get("username"),
+                    "first_name": chat.get("first_name"),
+                    "message_count": 0,
+                }
+            chats[cid]["message_count"] += 1
+        return {
+            "ok": data.get("ok"),
+            "updates_count": len(data.get("result") or []),
+            "unique_chats": list(chats.values()),
+            "instructions": (
+                "Send melding til @SesomNodBot fra din private Telegram-konto, "
+                "deretter curl dette endpointet. Finn din 'chat_id' i listen "
+                "(type='private') og sett DON_INTERNAL_TELEGRAM_CHAT_ID i "
+                "Railway dashboard."
+            ),
+        }
+    except Exception as e:
+        logger.error(f"[TelegramGetUpdates] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/init-sniper-schema")
 async def admin_init_sniper_schema():
     """Idempotent CREATE TABLE for sniper_bets_v1 + sniper_market_intelligence."""
