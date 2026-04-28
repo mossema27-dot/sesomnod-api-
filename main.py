@@ -11391,12 +11391,14 @@ async def admin_batch_recompute_edge_events(
     max_age_days: int = 30,
     dry_run: bool = False,
     include_all_tiers: bool = False,
+    require_dc_data: bool = True,
 ):
     """
     Truth Layer — batch upsert edge_events_v1 fra picks_v2 (siste N dager).
     Idempotent (ON CONFLICT DO UPDATE). Bruker shared picks-query.
 
     include_all_tiers=True dropper tier-filter (inkluderer MONITORED).
+    require_dc_data=False dropper dc_home_win_prob-filter (diagnose).
     """
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
@@ -11407,8 +11409,12 @@ async def admin_batch_recompute_edge_events(
             compute_all_edge_events_for_pick,
         )
 
-        tiers = [] if include_all_tiers else None  # [] = ingen filter, None = default ATOMIC+EDGE
-        sql, params = get_base_picks_query(max_age_days=max_age_days, tiers=tiers)
+        tiers = [] if include_all_tiers else None
+        sql, params = get_base_picks_query(
+            max_age_days=max_age_days,
+            tiers=tiers,
+            require_dc_data=require_dc_data,
+        )
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         picks = [normalize_picks_row(r) for r in rows]
