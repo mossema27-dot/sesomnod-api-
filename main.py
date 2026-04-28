@@ -11206,35 +11206,11 @@ async def admin_test_decision_desk_v2(window_days: int = 7, max_age_days: int = 
         return JSONResponse(status_code=500, content={"error": f"import: {e}"})
 
     try:
+        from services.picks_query_shared import get_base_picks_query, normalize_picks_row
+        sql, params = get_base_picks_query(max_age_days=max_age_days)
         async with db_state.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, home_team, away_team, league, kickoff_time,
-                       odds, soft_edge, soft_ev, atomic_score, tier,
-                       signals_triggered,
-                       dc_home_win_prob, dc_draw_prob, dc_away_win_prob,
-                       dc_btts_prob, dc_lambda_home, dc_lambda_away,
-                       dc_over_15, dc_over_25, dc_over_35,
-                       dc_under_25, dc_under_35
-                FROM picks_v2
-                WHERE tier IN ('ATOMIC','EDGE')
-                  AND created_at > NOW() - ($1 || ' days')::interval
-                  AND dc_home_win_prob IS NOT NULL
-                  AND dc_home_win_prob > 0
-                ORDER BY id DESC
-                LIMIT 100
-                """,
-                str(max_age_days),
-            )
-
-        picks = [dict(r) for r in rows]
-        for p in picks:
-            sigs = p.get("signals_triggered")
-            if isinstance(sigs, str):
-                try:
-                    p["signals_triggered"] = json.loads(sigs)
-                except Exception:
-                    p["signals_triggered"] = []
+            rows = await conn.fetch(sql, *params)
+        picks = [normalize_picks_row(r) for r in rows]
 
         desk = build_decision_desk_v2(picks, scanned_matches=len(picks))
         telegram_preview = format_decision_desk_v2_telegram(desk)
@@ -11255,45 +11231,21 @@ async def admin_pre_dominant_pool(window_days: int = 7, max_age_days: int = 30):
     intern kalibrerings-analyse. Sendes ALDRI til kunder.
 
     Pre-dominant: prob ∈ [60,65) ELLER edge ∈ [3,5) ELLER conf ≥ SILVER.
+    Bruker shared SQL — samme query som /admin/test-decision-desk-v2.
     """
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
     try:
         from services.smartpick_narratives import build_pre_dominant_pool
+        from services.picks_query_shared import get_base_picks_query, normalize_picks_row
     except ImportError as e:
         return JSONResponse(status_code=500, content={"error": f"import: {e}"})
 
     try:
+        sql, params = get_base_picks_query(max_age_days=max_age_days)
         async with db_state.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, home_team, away_team, league, kickoff_time,
-                       odds, soft_edge, soft_ev, atomic_score, tier,
-                       signals_triggered,
-                       dc_home_win_prob, dc_draw_prob, dc_away_win_prob,
-                       dc_btts_prob, dc_lambda_home, dc_lambda_away,
-                       dc_over_15, dc_over_25, dc_over_35,
-                       dc_under_25, dc_under_35
-                FROM picks_v2
-                WHERE tier IN ('ATOMIC','EDGE')
-                  AND created_at > NOW() - ($1 || ' days')::interval
-                  AND dc_home_win_prob IS NOT NULL
-                  AND dc_home_win_prob > 0
-                ORDER BY id DESC
-                LIMIT 100
-                """,
-                str(max_age_days),
-            )
-
-        picks = [dict(r) for r in rows]
-        for p in picks:
-            sigs = p.get("signals_triggered")
-            if isinstance(sigs, str):
-                try:
-                    p["signals_triggered"] = json.loads(sigs)
-                except Exception:
-                    p["signals_triggered"] = []
-
+            rows = await conn.fetch(sql, *params)
+        picks = [normalize_picks_row(r) for r in rows]
         return build_pre_dominant_pool(picks)
     except Exception as e:
         logger.error(f"[PreDominantPool] error: {e}")
@@ -11314,6 +11266,251 @@ async def admin_dominant_log(days: int = 7):
         return get_dominant_log(days=days)
     except Exception as e:
         logger.error(f"[DominantLog] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/init-edge-events-schema")
+async def admin_init_edge_events_schema():
+    """
+    Truth Layer — idempotent CREATE TABLE + indexes for edge_events_v1.
+    Trygg å kjøre flere ganger (CREATE IF NOT EXISTS).
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.edge_truth_engine import EDGE_EVENTS_V1_SCHEMA
+        async with db_state.pool.acquire() as conn:
+            await conn.execute(EDGE_EVENTS_V1_SCHEMA)
+        return {"status": "ok", "schema_applied": True}
+    except Exception as e:
+        logger.error(f"[InitEdgeSchema] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/batch-recompute-edge-events")
+async def admin_batch_recompute_edge_events(
+    max_age_days: int = 30,
+    dry_run: bool = False,
+):
+    """
+    Truth Layer — batch upsert edge_events_v1 fra picks_v2 (siste N dager).
+    Idempotent (ON CONFLICT DO UPDATE). Bruker shared picks-query.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.picks_query_shared import get_base_picks_query, normalize_picks_row
+        from services.edge_truth_engine import (
+            batch_populate_edge_events,
+            compute_all_edge_events_for_pick,
+        )
+
+        sql, params = get_base_picks_query(max_age_days=max_age_days)
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        picks = [normalize_picks_row(r) for r in rows]
+
+        if dry_run:
+            preview = []
+            total = 0
+            for pick in picks[:5]:
+                payloads = compute_all_edge_events_for_pick(pick)
+                total += len(payloads)
+                preview.append({
+                    "pick_id": pick["id"],
+                    "match": f"{pick.get('home_team', '')} vs {pick.get('away_team', '')}",
+                    "events_count": len(payloads),
+                })
+            return {
+                "dry_run": True,
+                "picks_count": len(picks),
+                "preview_first_5": preview,
+                "preview_total_events": total,
+            }
+
+        result = await batch_populate_edge_events(db_state.pool, picks)
+        return {"dry_run": False, "picks_count": len(picks), **result}
+    except Exception as e:
+        logger.error(f"[BatchRecompute] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/edge-truth-dashboard")
+async def admin_edge_truth_dashboard(window_days: int = 30):
+    """
+    Truth Dashboard — aggregat over edge_events_v1 for siste N dager.
+
+    Inkluderer:
+    - summary (totals, dominant, pre-dominant, edge-distribusjon)
+    - by_event_type (per event-type stats)
+    - by_league (per liga stats)
+    - near_miss_analysis
+    - case_diagnosis (auto-A/B/C)
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            summary_row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total_events,
+                    COUNT(DISTINCT pick_id) AS picks_with_events,
+                    COUNT(*) FILTER (WHERE edge_pct >= 2.0) AS events_above_2pct,
+                    COUNT(*) FILTER (WHERE edge_pct >= 5.0) AS events_above_5pct,
+                    COUNT(*) FILTER (WHERE is_dominant) AS dominant_count,
+                    COUNT(*) FILTER (WHERE is_pre_dominant) AS pre_dominant_count,
+                    COUNT(*) FILTER (WHERE near_miss) AS near_miss_count,
+                    COUNT(*) FILTER (WHERE extreme_edge_flag) AS extreme_count,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY edge_pct) AS median_edge_pct,
+                    AVG(edge_pct) AS mean_edge_pct,
+                    MIN(edge_pct) AS min_edge_pct,
+                    MAX(edge_pct) AS max_edge_pct
+                FROM edge_events_v1
+                WHERE kickoff_time > NOW() - ($1 || ' days')::interval
+                   OR computed_at > NOW() - ($1 || ' days')::interval
+                """,
+                str(window_days),
+            )
+
+            by_event_rows = await conn.fetch(
+                """
+                SELECT
+                    event_type,
+                    COUNT(*) AS count,
+                    COUNT(*) FILTER (WHERE is_dominant) AS dominant,
+                    COUNT(*) FILTER (WHERE is_pre_dominant) AS pre_dominant,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY edge_pct) AS median_edge_pct,
+                    AVG(edge_pct) AS mean_edge_pct,
+                    AVG(model_prob_pct) AS mean_model_prob
+                FROM edge_events_v1
+                WHERE kickoff_time > NOW() - ($1 || ' days')::interval
+                   OR computed_at > NOW() - ($1 || ' days')::interval
+                GROUP BY event_type
+                ORDER BY count DESC
+                """,
+                str(window_days),
+            )
+
+            by_league_rows = await conn.fetch(
+                """
+                SELECT
+                    league,
+                    COUNT(*) AS events_count,
+                    COUNT(DISTINCT pick_id) AS picks_count,
+                    COUNT(*) FILTER (WHERE is_dominant) AS dominant,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY edge_pct) AS median_edge_pct
+                FROM edge_events_v1
+                WHERE kickoff_time > NOW() - ($1 || ' days')::interval
+                   OR computed_at > NOW() - ($1 || ' days')::interval
+                GROUP BY league
+                ORDER BY events_count DESC
+                LIMIT 20
+                """,
+                str(window_days),
+            )
+
+            near_miss_row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE distance_to_edge_threshold > -1.0
+                                     AND distance_to_edge_threshold < 0)
+                        AS within_1pp_edge_gate,
+                    COUNT(*) FILTER (WHERE distance_to_prob_threshold > -3.0
+                                     AND distance_to_prob_threshold < 0)
+                        AS within_3pp_prob_gate,
+                    COUNT(*) FILTER (WHERE near_miss) AS near_miss_total
+                FROM edge_events_v1
+                WHERE kickoff_time > NOW() - ($1 || ' days')::interval
+                   OR computed_at > NOW() - ($1 || ' days')::interval
+                """,
+                str(window_days),
+            )
+
+        def _verdict_for_count(n: int) -> str:
+            if n >= 30:
+                return "STATISTICALLY_SIGNIFICANT"
+            if n >= 10:
+                return "MEDIUM_SAMPLE"
+            if n >= 3:
+                return "WEAK_SAMPLE"
+            return "INSUFFICIENT_DATA"
+
+        summary = dict(summary_row) if summary_row else {}
+        # Clean numeric formatting
+        for k in ("median_edge_pct", "mean_edge_pct", "min_edge_pct", "max_edge_pct"):
+            if summary.get(k) is not None:
+                summary[k] = round(float(summary[k]), 2)
+
+        by_event_type = []
+        for r in by_event_rows:
+            d = dict(r)
+            for k in ("median_edge_pct", "mean_edge_pct", "mean_model_prob"):
+                if d.get(k) is not None:
+                    d[k] = round(float(d[k]), 2)
+            d["verdict"] = _verdict_for_count(d["count"])
+            by_event_type.append(d)
+
+        by_league = []
+        for r in by_league_rows:
+            d = dict(r)
+            if d.get("median_edge_pct") is not None:
+                d["median_edge_pct"] = round(float(d["median_edge_pct"]), 2)
+            d["verdict"] = _verdict_for_count(d["events_count"])
+            by_league.append(d)
+
+        near_miss = dict(near_miss_row) if near_miss_row else {}
+
+        # Case diagnosis
+        dom = summary.get("dominant_count") or 0
+        pre = summary.get("pre_dominant_count") or 0
+        e2 = summary.get("events_above_2pct") or 0
+        e5 = summary.get("events_above_5pct") or 0
+        total = summary.get("total_events") or 0
+
+        if total == 0:
+            case = {"case": "NO_DATA",
+                    "reasoning": "edge_events_v1 er tom — kjør /admin/batch-recompute-edge-events først",
+                    "recommended_action": "POST /admin/batch-recompute-edge-events"}
+        elif dom >= 3:
+            case = {"case": "A",
+                    "reasoning": f"{dom} dominant plays — system leverer edge",
+                    "recommended_action": "Hold scope, observer kalibrering"}
+        elif pre >= 5 and dom == 0:
+            case = {"case": "B",
+                    "reasoning": f"{pre} pre-dominant, 0 dominant — modellen finner edge men filter stopper",
+                    "recommended_action": "Observer 30+ picks før filter-justering"}
+        elif e5 < 3 and e2 < 10:
+            case = {"case": "C",
+                    "reasoning": f"Kun {e2} events ≥2% edge, {e5} ≥5% — markedet er effektivt",
+                    "recommended_action": "Pivot til odds-integrasjon (#33) for Over/Under/BTTS"}
+        else:
+            case = {"case": "UNDEFINED",
+                    "reasoning": f"dom={dom}, pre={pre}, e2={e2}, e5={e5}",
+                    "recommended_action": "Vent på 30+ picks for klarere signal"}
+
+        # Calibration recommendation based on near-miss
+        n1 = near_miss.get("within_1pp_edge_gate") or 0
+        cal_rec = (
+            f"{n1} events innenfor 1pp under edge-gate (5%). "
+            "Vent på 30+ pre-dominant før filter-justering vurderes."
+        ) if n1 > 0 else "Ingen near-miss events i vindu."
+
+        return {
+            "computed_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+            "window_days": window_days,
+            "summary": summary,
+            "by_event_type": by_event_type,
+            "by_league": by_league,
+            "near_miss_analysis": {
+                **near_miss,
+                "calibration_recommendation": cal_rec,
+            },
+            "case_diagnosis": case,
+        }
+    except Exception as e:
+        logger.error(f"[EdgeTruthDashboard] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
