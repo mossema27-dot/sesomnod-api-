@@ -11294,9 +11294,8 @@ async def admin_backfill_odds_from_dagens_kamp(
                        p2.away_odds_raw AS p2_away,
                        dk.away_odds_raw AS dk_away
                 FROM picks_v2 p2
-                LEFT JOIN dagens_kamp dk
-                    ON p2.match_name = dk.match_name
-                   AND p2.kickoff_time = dk.kickoff_time
+                INNER JOIN dagens_kamp dk
+                    ON p2.match_name = dk.match
                 WHERE p2.kickoff_time > NOW() - ($1 || ' days')::interval
                   AND p2.home_odds_raw IS NULL
                   AND dk.home_odds_raw IS NOT NULL
@@ -11332,7 +11331,7 @@ async def admin_backfill_odds_from_dagens_kamp(
                     "preview": preview[:10],
                 }
 
-            # Wet-run: faktisk UPDATE
+            # Wet-run: faktisk UPDATE (samme join-konvensjon som lifespan-backfill)
             update_rows = await conn.fetch(
                 """
                 UPDATE picks_v2 p2 SET
@@ -11340,8 +11339,7 @@ async def admin_backfill_odds_from_dagens_kamp(
                     draw_odds_raw = dk.draw_odds_raw,
                     away_odds_raw = dk.away_odds_raw
                 FROM dagens_kamp dk
-                WHERE p2.match_name = dk.match_name
-                  AND p2.kickoff_time = dk.kickoff_time
+                WHERE p2.match_name = dk.match
                   AND dk.home_odds_raw IS NOT NULL
                   AND p2.home_odds_raw IS NULL
                   AND p2.kickoff_time > NOW() - ($1 || ' days')::interval
