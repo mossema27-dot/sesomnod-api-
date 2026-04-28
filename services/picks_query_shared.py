@@ -42,6 +42,7 @@ def get_base_picks_query(
     """
     if tiers is None:
         tiers = ["ATOMIC", "EDGE"]
+    # tiers=[] (eksplisitt tom liste) → ingen tier-filter
 
     sql = f"SELECT {_BASE_COLUMNS} FROM picks_v2 WHERE 1=1"
     params: list = []
