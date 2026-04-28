@@ -11444,12 +11444,15 @@ async def admin_verify_pinnacle(days_ahead: int = 3):
             }
             for offset in range(days_ahead + 1):
                 target = (today + timedelta(days=offset)).isoformat()
+                # Big5 europeisk sesong starter aug og krysser nyttår.
+                # Apr 2026 = season 2025 (start-år av 2025/26-sesongen).
+                season = today.year if today.month >= 8 else today.year - 1
                 try:
                     r = await client.get(
                         f"{base_url}/fixtures",
                         headers=headers,
                         params={"date": target, "league": league_id,
-                                "season": today.year},
+                                "season": season},
                     )
                     fix_data = r.json().get("response") or []
                 except Exception as e:
