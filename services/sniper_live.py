@@ -362,7 +362,7 @@ async def _maybe_alert_first_picks(pool, payload: dict) -> bool:
             f"Marked implied: {payload['market_implied_prob']*100:.1f}%\n"
             f"Edge: +{payload['edge_pct']:.1f}%\n"
             f"Odds: {payload['odds_open']}\n"
-            f"Kickoff: {payload['kickoff_time']}\n"
+            f"Kickoff: {payload.get('kickoff_iso') or payload.get('kickoff_time')}\n"
             f"[INTERN — verifiser før auto-mode]"
         )
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -487,18 +487,29 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                     stats["quarantined_high_edge"] += 1
                     continue
 
+                # asyncpg krever datetime-objekt for TIMESTAMPTZ, ikke ISO-string
+                try:
+                    kickoff_dt = datetime.fromisoformat(
+                        kickoff_iso.replace("Z", "+00:00")
+                    ) if kickoff_iso else None
+                except (TypeError, ValueError):
+                    kickoff_dt = None
+                if kickoff_dt is None:
+                    continue
+                now_dt = datetime.now(timezone.utc)
                 payload = {
                     "match_id": str(fix_id),
                     "league": league_name,
                     "home_team": home_norm,
                     "away_team": away_norm,
-                    "kickoff_time": kickoff_iso,
+                    "kickoff_time": kickoff_dt,
+                    "kickoff_iso": kickoff_iso,
                     "model_prob": prob_over_25,
                     "market_implied_prob": implied,
                     "edge_pct": edge * 100,
                     "lambda_total": lambda_total,
                     "odds_open": odds_open,
-                    "odds_open_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "odds_open_timestamp": now_dt,
                 }
 
                 async with pool.acquire() as conn:
@@ -582,7 +593,7 @@ async def update_odds_t60(pool) -> dict:
                         clv_t60_pct = $3, updated_at = NOW()
                     WHERE id = $4;
                     """,
-                    new_odds, now.isoformat(), clv, row["id"],
+                    new_odds, now, clv, row["id"],
                 )
             updates += 1
     return {"checked": len(rows), "updated": updates, "failures": failures}
@@ -631,7 +642,7 @@ async def update_odds_close(pool) -> dict:
                         updated_at = NOW()
                     WHERE id = $5;
                     """,
-                    new_odds, now.isoformat(), clv, is_positive, row["id"],
+                    new_odds, now, clv, is_positive, row["id"],
                 )
             updates += 1
     return {"checked": len(rows), "updated": updates, "failures": failures}
@@ -667,7 +678,7 @@ async def settle_picks(pool) -> dict:
             home_g, away_g, status = await fetch_fixture_score(
                 int(row["match_id"]), client,
             )
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_dt = datetime.now(timezone.utc)
 
             # Always update last_settle_attempt_at + fixture_status
             async with pool.acquire() as conn:
@@ -678,7 +689,7 @@ async def settle_picks(pool) -> dict:
                         updated_at = NOW()
                     WHERE id = $3;
                     """,
-                    status, now_iso, row["id"],
+                    status, now_dt, row["id"],
                 )
 
             # Avlyst / abandonert / awarded → VOID med profit=0
