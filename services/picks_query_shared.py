@@ -48,7 +48,10 @@ def get_base_picks_query(
     idx = 1
 
     if max_age_days is not None and max_age_days > 0:
-        sql += f" AND created_at > NOW() - (${idx} || ' days')::interval"
+        # kickoff_time-basert: matcher backfill-job semantikk og er
+        # semantisk korrekt for Truth Layer (vi vil se utfall, ikke når
+        # rad ble laget).
+        sql += f" AND kickoff_time > NOW() - (${idx} || ' days')::interval"
         params.append(str(max_age_days))
         idx += 1
 
