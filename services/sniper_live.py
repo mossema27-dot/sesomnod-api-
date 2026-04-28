@@ -64,6 +64,9 @@ API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 
 # ── SCHEMA ──────────────────────────────────────────────────────────────────
 SNIPER_SCHEMA = """
+-- Schema er additive: ALTER med IF NOT EXISTS for backward compat.
+-- Trygg å re-kjøre.
+
 CREATE TABLE IF NOT EXISTS sniper_bets_v1 (
     id BIGSERIAL PRIMARY KEY,
     match_id TEXT NOT NULL,
@@ -116,6 +119,12 @@ CREATE INDEX IF NOT EXISTS idx_sniper_clv
     WHERE clv_close_pct IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sniper_pick_ts
     ON sniper_bets_v1(pick_timestamp);
+
+-- BUG 3 + observability: track snapshot retries, last settle, fixture status
+ALTER TABLE sniper_bets_v1
+    ADD COLUMN IF NOT EXISTS snapshot_failed_count INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_settle_attempt_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS fixture_status TEXT;
 
 CREATE TABLE IF NOT EXISTS sniper_market_intelligence (
     id BIGSERIAL PRIMARY KEY,
@@ -262,18 +271,37 @@ def _parse_pinnacle_market_intel(odds_response: list[dict]) -> dict:
 
 
 async def fetch_fixture_odds(fixture_id: int,
-                              client: httpx.AsyncClient) -> list[dict]:
-    """Hent odds for én fixture (kun Pinnacle blokkering)."""
-    try:
-        r = await client.get(
-            f"{API_FOOTBALL_BASE}/odds",
-            headers=_api_headers(),
-            params={"fixture": fixture_id, "bookmaker": PINNACLE_BOOKMAKER_ID},
-        )
-        return r.json().get("response") or []
-    except Exception as e:
-        logger.warning("[Sniper] odds fetch %s: %s", fixture_id, e)
-        return []
+                              client: httpx.AsyncClient,
+                              max_attempts: int = 3,
+                              retry_delay_sec: float = 30.0) -> list[dict]:
+    """
+    Hent odds for én fixture (kun Pinnacle). BUG 2: retry-logikk.
+
+    Inntil max_attempts forsøk. Mellom-forsøk: sleep retry_delay_sec.
+    Returnerer tom liste hvis alle attempts feiler.
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = await client.get(
+                f"{API_FOOTBALL_BASE}/odds",
+                headers=_api_headers(),
+                params={"fixture": fixture_id,
+                        "bookmaker": PINNACLE_BOOKMAKER_ID},
+            )
+            data = r.json().get("response") or []
+            if data:
+                return data
+            last_err = "empty response"
+        except Exception as e:
+            last_err = str(e)[:100]
+        if attempt < max_attempts:
+            logger.info("[Sniper] odds %s attempt %d/%d failed (%s), retry in %ds",
+                        fixture_id, attempt, max_attempts, last_err, retry_delay_sec)
+            await asyncio.sleep(retry_delay_sec)
+    logger.warning("[Sniper] odds %s exhausted %d attempts: %s",
+                   fixture_id, max_attempts, last_err)
+    return []
 
 
 async def fetch_fixture_score(fixture_id: int,
@@ -463,6 +491,9 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                 }
 
                 async with pool.acquire() as conn:
+                    # BUG 4 fix: ON CONFLICT DO NOTHING (ikke DO UPDATE) garanterer
+                    # at catchup-jobs IKKE overskriver odds_open når picken allerede
+                    # er logget av primary 06:30-jobben. Original-pris bevares.
                     inserted = await conn.fetchrow(
                         """
                         INSERT INTO sniper_bets_v1
@@ -499,24 +530,37 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
 
 # ── ODDS-SNAPSHOTS ──────────────────────────────────────────────────────────
 async def update_odds_t60(pool) -> dict:
-    """For picks med kickoff i 55-65 min: snapshot odds → odds_t60."""
+    """
+    BUG 1: utvidet vindu 50-70 min (var 55-65). Tåler scheduler-jitter.
+    BUG 2: retry via fetch_fixture_odds.
+    Tracker snapshot_failed_count for observability.
+    """
     now = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, match_id, odds_open, kickoff_time
+            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count
             FROM sniper_bets_v1
             WHERE odds_t60 IS NULL
-              AND kickoff_time > NOW() + INTERVAL '55 minutes'
-              AND kickoff_time < NOW() + INTERVAL '65 minutes';
+              AND kickoff_time > NOW() + INTERVAL '50 minutes'
+              AND kickoff_time < NOW() + INTERVAL '70 minutes';
             """
         )
     updates = 0
+    failures = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         for row in rows:
             odds_response = await fetch_fixture_odds(int(row["match_id"]), client)
             new_odds, _ = _parse_pinnacle_over_25(odds_response)
             if not new_odds:
+                failures += 1
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE sniper_bets_v1 SET snapshot_failed_count = "
+                        "COALESCE(snapshot_failed_count, 0) + 1, updated_at = NOW() "
+                        "WHERE id = $1;",
+                        row["id"],
+                    )
                 continue
             clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
             async with pool.acquire() as conn:
@@ -530,28 +574,40 @@ async def update_odds_t60(pool) -> dict:
                     new_odds, now.isoformat(), clv, row["id"],
                 )
             updates += 1
-    return {"checked": len(rows), "updated": updates}
+    return {"checked": len(rows), "updated": updates, "failures": failures}
 
 
 async def update_odds_close(pool) -> dict:
-    """For picks med kickoff i 4-6 min: snapshot odds → odds_close + CLV."""
+    """
+    BUG 1: utvidet vindu 3-7 min (var 4-6). Bedre fangst av T-5-tidspunkt.
+    BUG 2: retry via fetch_fixture_odds.
+    """
     now = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, match_id, odds_open, kickoff_time
+            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count
             FROM sniper_bets_v1
             WHERE odds_close IS NULL
-              AND kickoff_time > NOW() + INTERVAL '4 minutes'
-              AND kickoff_time < NOW() + INTERVAL '6 minutes';
+              AND kickoff_time > NOW() + INTERVAL '3 minutes'
+              AND kickoff_time < NOW() + INTERVAL '7 minutes';
             """
         )
     updates = 0
+    failures = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         for row in rows:
             odds_response = await fetch_fixture_odds(int(row["match_id"]), client)
             new_odds, _ = _parse_pinnacle_over_25(odds_response)
             if not new_odds:
+                failures += 1
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE sniper_bets_v1 SET snapshot_failed_count = "
+                        "COALESCE(snapshot_failed_count, 0) + 1, updated_at = NOW() "
+                        "WHERE id = $1;",
+                        row["id"],
+                    )
                 continue
             clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
             is_positive = new_odds < float(row["odds_open"])
@@ -567,12 +623,22 @@ async def update_odds_close(pool) -> dict:
                     new_odds, now.isoformat(), clv, is_positive, row["id"],
                 )
             updates += 1
-    return {"checked": len(rows), "updated": updates}
+    return {"checked": len(rows), "updated": updates, "failures": failures}
 
 
 # ── SETTLEMENT ──────────────────────────────────────────────────────────────
 async def settle_picks(pool) -> dict:
-    """For picks 2t+ post-kickoff: hent score → result + profit_units."""
+    """
+    BUG 3: settlement med fixture_status-håndtering.
+
+    API-Football short status:
+      FT/AET/PEN  → ferdig spilt → WIN (≥3 mål) eller LOSS (<3)
+      CANC/ABD/AWD → avlyst/abandonert → VOID, profit = 0
+      PST          → utsatt → forbli PENDING, oppdater last_settle_attempt_at
+      NS/1H/HT/2H/LIVE/etc → ikke ferdig → forbli PENDING
+
+    Lagrer fixture_status uansett for observability.
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -583,35 +649,73 @@ async def settle_picks(pool) -> dict:
             """
         )
     settled = 0
+    voided = 0
+    pending_kept = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         for row in rows:
             home_g, away_g, status = await fetch_fixture_score(
                 int(row["match_id"]), client,
             )
-            if home_g is None or away_g is None:
-                continue
-            if status not in ("FT", "AET", "PEN"):
-                continue
-            total = home_g + away_g
-            if total >= 3:
-                result = "WIN"
-                profit = float(row["odds_open"]) - 1.0
-            else:
-                result = "LOSS"
-                profit = -1.0
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # Always update last_settle_attempt_at + fixture_status
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
                     UPDATE sniper_bets_v1 SET
-                        home_goals = $1, away_goals = $2, total_goals = $3,
-                        result = $4, profit_units = $5, settled_at = NOW(),
+                        fixture_status = $1, last_settle_attempt_at = $2,
                         updated_at = NOW()
-                    WHERE id = $6;
+                    WHERE id = $3;
                     """,
-                    home_g, away_g, total, result, profit, row["id"],
+                    status, now_iso, row["id"],
                 )
-            settled += 1
-    return {"checked": len(rows), "settled": settled}
+
+            # Avlyst / abandonert / awarded → VOID med profit=0
+            if status in ("CANC", "ABD", "AWD"):
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE sniper_bets_v1 SET
+                            result = 'VOID', profit_units = 0.0,
+                            settled_at = NOW(), updated_at = NOW()
+                        WHERE id = $1;
+                        """,
+                        row["id"],
+                    )
+                voided += 1
+                continue
+
+            # Ferdig spilt → WIN/LOSS
+            if status in ("FT", "AET", "PEN") and home_g is not None and away_g is not None:
+                total = home_g + away_g
+                if total >= 3:
+                    result = "WIN"
+                    profit = float(row["odds_open"]) - 1.0
+                else:
+                    result = "LOSS"
+                    profit = -1.0
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE sniper_bets_v1 SET
+                            home_goals = $1, away_goals = $2, total_goals = $3,
+                            result = $4, profit_units = $5, settled_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = $6;
+                        """,
+                        home_g, away_g, total, result, profit, row["id"],
+                    )
+                settled += 1
+                continue
+
+            # Ikke ferdig (NS, 1H, HT, 2H, LIVE, PST, etc.) → forbli PENDING
+            pending_kept += 1
+    return {
+        "checked": len(rows),
+        "settled": settled,
+        "voided": voided,
+        "kept_pending": pending_kept,
+    }
 
 
 # ── KILL-SWITCHES (3-trinns CLV-validation) ─────────────────────────────────
