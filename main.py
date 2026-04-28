@@ -11585,9 +11585,10 @@ async def admin_verify_pinnacle(days_ahead: int = 3):
             }
             for offset in range(days_ahead + 1):
                 target = (today + timedelta(days=offset)).isoformat()
-                # API-Football bruker current-year-konvensjon for crossing-sesonger.
-                # Apr 2026 fixtures returneres med season=2026 (verifisert via raw probe).
-                season = today.year
+                # API-Football bruker START-year for Big5 crossing-sesonger
+                # (verifisert 2026-04-28 via api-football-scan-big5: season=2025
+                # for kamper i mai 2026 = 2025/26-sesongen).
+                season = today.year if today.month >= 8 else today.year - 1
                 try:
                     r = await client.get(
                         f"{base_url}/fixtures",
