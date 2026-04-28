@@ -22,7 +22,7 @@ _BASE_COLUMNS = """
     dc_btts_prob, dc_lambda_home, dc_lambda_away,
     dc_over_15, dc_over_25, dc_over_35,
     dc_under_25, dc_under_35,
-    outcome, status, settled_at, created_at
+    outcome, status, result, created_at, updated_at
 """
 
 
