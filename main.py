@@ -11269,6 +11269,107 @@ async def admin_dominant_log(days: int = 7):
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.post("/admin/backfill-odds-from-dagens-kamp")
+async def admin_backfill_odds_from_dagens_kamp(
+    max_age_days: int = 30,
+    dry_run: bool = True,
+):
+    """
+    Backfill picks_v2.{home,draw,away}_odds_raw fra dagens_kamp.
+    Idempotent: kun rader hvor picks_v2.*_odds_raw er NULL og dagens_kamp har data.
+    Trygt: ingen INSERT, ingen DELETE — kun UPDATE av NULL-rader.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            preview_rows = await conn.fetch(
+                """
+                SELECT p2.id, p2.match_name, p2.kickoff_time,
+                       p2.home_odds_raw AS p2_home,
+                       dk.home_odds_raw AS dk_home,
+                       p2.draw_odds_raw AS p2_draw,
+                       dk.draw_odds_raw AS dk_draw,
+                       p2.away_odds_raw AS p2_away,
+                       dk.away_odds_raw AS dk_away
+                FROM picks_v2 p2
+                LEFT JOIN dagens_kamp dk
+                    ON p2.match_name = dk.match_name
+                   AND p2.kickoff_time = dk.kickoff_time
+                WHERE p2.kickoff_time > NOW() - ($1 || ' days')::interval
+                  AND p2.home_odds_raw IS NULL
+                  AND dk.home_odds_raw IS NOT NULL
+                ORDER BY p2.kickoff_time DESC
+                LIMIT 30
+                """,
+                str(max_age_days),
+            )
+
+            preview = [
+                {
+                    "pick_id": r["id"],
+                    "match": r["match_name"],
+                    "kickoff": r["kickoff_time"].isoformat() if r["kickoff_time"] else None,
+                    "before": {
+                        "home_odds_raw": r["p2_home"],
+                        "draw_odds_raw": r["p2_draw"],
+                        "away_odds_raw": r["p2_away"],
+                    },
+                    "from_dagens_kamp": {
+                        "home_odds_raw": float(r["dk_home"]) if r["dk_home"] else None,
+                        "draw_odds_raw": float(r["dk_draw"]) if r["dk_draw"] else None,
+                        "away_odds_raw": float(r["dk_away"]) if r["dk_away"] else None,
+                    },
+                }
+                for r in preview_rows
+            ]
+
+            if dry_run:
+                return {
+                    "dry_run": True,
+                    "rows_to_update": len(preview),
+                    "preview": preview[:10],
+                }
+
+            # Wet-run: faktisk UPDATE
+            update_rows = await conn.fetch(
+                """
+                UPDATE picks_v2 p2 SET
+                    home_odds_raw = dk.home_odds_raw,
+                    draw_odds_raw = dk.draw_odds_raw,
+                    away_odds_raw = dk.away_odds_raw
+                FROM dagens_kamp dk
+                WHERE p2.match_name = dk.match_name
+                  AND p2.kickoff_time = dk.kickoff_time
+                  AND dk.home_odds_raw IS NOT NULL
+                  AND p2.home_odds_raw IS NULL
+                  AND p2.kickoff_time > NOW() - ($1 || ' days')::interval
+                RETURNING p2.id, p2.match_name,
+                          p2.home_odds_raw, p2.draw_odds_raw, p2.away_odds_raw
+                """,
+                str(max_age_days),
+            )
+
+            return {
+                "dry_run": False,
+                "rows_updated": len(update_rows),
+                "sample_updated": [
+                    {
+                        "pick_id": r["id"],
+                        "match": r["match_name"],
+                        "home_odds_raw": float(r["home_odds_raw"]) if r["home_odds_raw"] else None,
+                        "draw_odds_raw": float(r["draw_odds_raw"]) if r["draw_odds_raw"] else None,
+                        "away_odds_raw": float(r["away_odds_raw"]) if r["away_odds_raw"] else None,
+                    }
+                    for r in update_rows[:5]
+                ],
+            }
+    except Exception as e:
+        logger.error(f"[BackfillOddsRaw] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/init-edge-events-schema")
 async def admin_init_edge_events_schema():
     """
