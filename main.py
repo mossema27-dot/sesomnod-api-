@@ -11368,6 +11368,91 @@ async def admin_backfill_odds_from_dagens_kamp(
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.get("/admin/api-football-raw")
+async def admin_api_football_raw(date: str = "", league: int = 39, season: int = 0):
+    """
+    Raw API-Football probe for debug. Default: tomorrow, league 39 (Premier).
+    Tester /fixtures, /odds, /status (api-quota) for diagnose.
+    """
+    api_key = os.environ.get("FOOTBALL_API_KEY", "")
+    if not api_key:
+        return JSONResponse(status_code=500, content={"error": "FOOTBALL_API_KEY missing"})
+    headers = {"X-RapidAPI-Key": api_key, "X-RapidAPI-Host": "v3.football.api-sports.io"}
+    base = "https://v3.football.api-sports.io"
+
+    today = datetime.now(timezone.utc).date()
+    if not date:
+        date = (today + timedelta(days=1)).isoformat()
+    if not season:
+        season = today.year if today.month >= 8 else today.year - 1
+
+    out = {"requested": {"date": date, "league": league, "season": season}, "calls": []}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Status (quota)
+        try:
+            r = await client.get(f"{base}/status", headers=headers)
+            out["calls"].append({"name": "status", "http": r.status_code,
+                                 "body": r.json() if r.status_code == 200 else r.text[:300]})
+        except Exception as e:
+            out["calls"].append({"name": "status", "error": str(e)[:200]})
+
+        # Fixtures with season
+        try:
+            r = await client.get(f"{base}/fixtures", headers=headers,
+                                 params={"date": date, "league": league, "season": season})
+            body = r.json() if r.status_code == 200 else r.text[:300]
+            out["calls"].append({
+                "name": "fixtures (date+league+season)",
+                "http": r.status_code,
+                "params": {"date": date, "league": league, "season": season},
+                "results_count": (body.get("results") if isinstance(body, dict) else None),
+                "errors": (body.get("errors") if isinstance(body, dict) else None),
+                "first_fixture": ((body.get("response") or [None])[0]
+                                  if isinstance(body, dict) and body.get("response") else None),
+            })
+        except Exception as e:
+            out["calls"].append({"name": "fixtures-with-season", "error": str(e)[:200]})
+
+        # Fixtures without season
+        try:
+            r = await client.get(f"{base}/fixtures", headers=headers,
+                                 params={"date": date, "league": league})
+            body = r.json() if r.status_code == 200 else r.text[:300]
+            out["calls"].append({
+                "name": "fixtures (date+league, no season)",
+                "http": r.status_code,
+                "results_count": (body.get("results") if isinstance(body, dict) else None),
+                "errors": (body.get("errors") if isinstance(body, dict) else None),
+                "first_fixture": ((body.get("response") or [None])[0]
+                                  if isinstance(body, dict) and body.get("response") else None),
+            })
+        except Exception as e:
+            out["calls"].append({"name": "fixtures-no-season", "error": str(e)[:200]})
+
+        # Fixtures by date only (no league filter)
+        try:
+            r = await client.get(f"{base}/fixtures", headers=headers,
+                                 params={"date": date})
+            body = r.json() if r.status_code == 200 else r.text[:300]
+            sample_leagues = []
+            if isinstance(body, dict):
+                for f in (body.get("response") or [])[:5]:
+                    lg = f.get("league") or {}
+                    sample_leagues.append({"id": lg.get("id"), "name": lg.get("name"),
+                                            "season": lg.get("season")})
+            out["calls"].append({
+                "name": "fixtures (date only)",
+                "http": r.status_code,
+                "results_count": (body.get("results") if isinstance(body, dict) else None),
+                "sample_leagues": sample_leagues,
+            })
+        except Exception as e:
+            out["calls"].append({"name": "fixtures-date-only", "error": str(e)[:200]})
+
+    return out
+
+
 @app.get("/admin/verify-pinnacle")
 async def admin_verify_pinnacle(days_ahead: int = 3):
     """
