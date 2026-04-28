@@ -201,13 +201,26 @@ def _f(v: Any) -> float | None:
 
 
 def _data_completeness(pick: dict) -> str:
-    """FULL hvis dc_lambda_home + dc_over_25 + atomic_score >= 7. Ellers grade."""
+    """
+    FULL: full DC-surface (lambda + over_25 + atomic≥7) — alle 16 events.
+    SOLID: 1X2-coverage (dc_home_win_prob + home_odds_raw) — 8 edge-events.
+    LIMITED: ikke engang 1X2 — drop.
+
+    Pre-VEI-A picks (deployet før b026ca4 2026-04-27) har 1X2-coverage
+    men mangler lambda/over_25-surface. Disse skal fortsatt produsere
+    edge-events for 1X2 + DC + DNB.
+    """
     score = int(pick.get("atomic_score") or 0)
+    has_1x2 = _f(pick.get("dc_home_win_prob")) is not None
+    has_odds = (_f(pick.get("home_odds_raw")) is not None
+                and _f(pick.get("draw_odds_raw")) is not None
+                and _f(pick.get("away_odds_raw")) is not None)
     has_lambda = _f(pick.get("dc_lambda_home")) is not None
     has_ou = _f(pick.get("dc_over_25")) is not None
-    if has_lambda and has_ou and score >= 7:
+
+    if has_1x2 and has_odds and has_lambda and has_ou and score >= 7:
         return "FULL"
-    if has_lambda and has_ou:
+    if has_1x2 and has_odds:
         return "SOLID"
     return "LIMITED"
 
