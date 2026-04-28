@@ -1214,6 +1214,180 @@ def calculate_dominance_score_v2(market: dict) -> float:
     return round(base * multiplier, 4)
 
 
+def compute_filter_diagnostics(event: dict, pick: dict) -> dict:
+    """
+    B1.2 — Fail-reason diagnostics per event.
+
+    Beregner distance til hver gate-grense + near-miss-flagg. Brukes av
+    /admin/pre-dominant-pool og av build_decision_play_v2 for å lagre
+    kalibrerings-data uten å endre passes_all_filters_v2-signatur.
+
+    Returnerer:
+    {
+      "failed_prob": bool,
+      "failed_edge": bool,
+      "failed_conf": bool,
+      "failed_business": bool,
+      "distance_to_threshold": {
+        "prob_pp": float,   # event_prob - 65 (positiv = passer L2-prob)
+        "edge_pp": float,   # event_edge - 5  (positiv = passer L2-edge)
+        "conf_pp": float,   # confidence - 0.70 (positiv = passer L1)
+      },
+      "near_miss": bool,    # alle |distance| ≤ 1pp innenfor failing-side
+      "pre_dominant": bool, # prob ∈ [60,65) ELLER edge ∈ [3,5) ELLER SILVER-conf
+    }
+    """
+    prob = float(event.get("probability") or event.get("probability_pct") or 0.0)
+    edge = float(event.get("edge") or event.get("edge_pct") or 0.0)
+    conf = float(event.get("confidence") or 0.0)
+
+    prob_pp = round(prob - DECISION_MIN_PROB_PCT, 2)
+    edge_pp = round(edge - DECISION_MIN_EDGE_PCT, 2)
+    conf_pp = round(conf - DECISION_V2_MIN_CONFIDENCE, 4)
+
+    failed_prob = prob < DECISION_MIN_PROB_PCT
+    failed_edge = edge < DECISION_MIN_EDGE_PCT
+    failed_conf = conf < DECISION_V2_MIN_CONFIDENCE
+
+    label_lower = (event.get("label") or "").lower()
+    completeness = event.get("data_completeness") or ""
+    calc_src = (event.get("calculation_source") or "").lower()
+    league = (pick.get("league") or "").lower()
+    tier = pick.get("tier") or ""
+    failed_business = (
+        any(x in label_lower for x in EXCLUDED_MARKETS)
+        or completeness not in ("FULL", "SOLID")
+        or "fallback" in calc_src
+        or "1/odds" in calc_src
+        or (tier == "ATOMIC" and any(x in league for x in ("brasil", "argentin")))
+    )
+
+    near_miss_components = []
+    if failed_prob:
+        near_miss_components.append(abs(prob_pp) <= 1.0)
+    if failed_edge:
+        near_miss_components.append(abs(edge_pp) <= 1.0)
+    if failed_conf:
+        near_miss_components.append(abs(conf_pp) <= 0.05)
+    near_miss = bool(near_miss_components) and all(near_miss_components)
+
+    pre_dominant = (
+        not failed_business
+        and (
+            (failed_prob and 60.0 <= prob < DECISION_MIN_PROB_PCT)
+            or (failed_edge and 3.0 <= edge < DECISION_MIN_EDGE_PCT)
+            or (failed_conf and conf >= DECISION_MIN_CONFIDENCE)
+        )
+    )
+
+    return {
+        "failed_prob": failed_prob,
+        "failed_edge": failed_edge,
+        "failed_conf": failed_conf,
+        "failed_business": failed_business,
+        "distance_to_threshold": {
+            "prob_pp": prob_pp,
+            "edge_pp": edge_pp,
+            "conf_pp": conf_pp,
+        },
+        "near_miss": near_miss,
+        "pre_dominant": pre_dominant,
+    }
+
+
+# ── C.1/C.2: in-memory dominant log (FIFO max 1000) ─────────────────────────
+# Mistes ved Railway redeploy (akseptert). Senere migrering til JSONB-kolonne.
+_DOMINANT_LOG: list[dict] = []
+_DOMINANT_LOG_MAX = 1000
+_DOMINANT_LOG_RESET_AT = datetime.now(timezone.utc).isoformat()
+
+
+def _log_dominant_play(payload: dict) -> None:
+    """Append til in-memory log, FIFO-trim ved overflow."""
+    _DOMINANT_LOG.append(payload)
+    if len(_DOMINANT_LOG) > _DOMINANT_LOG_MAX:
+        del _DOMINANT_LOG[: len(_DOMINANT_LOG) - _DOMINANT_LOG_MAX]
+
+
+def get_dominant_log(days: int = 7) -> dict:
+    """C.2 — returner siste N dager av dominant-log."""
+    if days <= 0:
+        return {
+            "reset_at": _DOMINANT_LOG_RESET_AT,
+            "count": 0,
+            "entries": [],
+            "note": "days must be > 0",
+        }
+    cutoff = datetime.now(timezone.utc).timestamp() - (days * 86400)
+    filtered = []
+    for entry in _DOMINANT_LOG:
+        ts = entry.get("timestamp")
+        try:
+            entry_ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError):
+            continue
+        if entry_ts >= cutoff:
+            filtered.append(entry)
+    return {
+        "reset_at": _DOMINANT_LOG_RESET_AT,
+        "count": len(filtered),
+        "total_in_memory": len(_DOMINANT_LOG),
+        "days_window": days,
+        "entries": filtered,
+    }
+
+
+# ── C.3: PROOF narrative light ──────────────────────────────────────────────
+def build_proof_narrative_light(pick: dict, event: dict) -> str:
+    """
+    Kort proof-narrativ — kun datapunkter, ingen storytelling.
+    Max 6 punkter. Returnerer Telegram-MarkdownV2-klar streng.
+    """
+    prob = event.get("probability_pct") or event.get("probability") or 0.0
+    market = event.get("market_implied_pct")
+    edge = event.get("edge_pct") or event.get("edge")
+    odds = event.get("odds")
+    lambda_h = pick.get("dc_lambda_home") or 0.0
+    lambda_a = pick.get("dc_lambda_away") or 0.0
+    lambda_total = float(lambda_h) + float(lambda_a)
+    conf = event.get("confidence") or 0.0
+    dom = event.get("dominance_score_v2") or 0.0
+
+    if conf >= 0.95:
+        tier_name, stars = "PLATINUM", "⭐⭐⭐⭐⭐"
+    elif conf >= 0.85:
+        tier_name, stars = "GOLD", "⭐⭐⭐⭐"
+    elif conf >= 0.70:
+        tier_name, stars = "SILVER", "⭐⭐⭐"
+    else:
+        tier_name, stars = "BRONZE", "⭐⭐"
+
+    lines = ["🧠 *PROOF SUMMARY*", ""]
+
+    if market is not None:
+        lines.append(f"📊 Modell: {prob}% | Marked: {market}%")
+    else:
+        lines.append(f"📊 Modell: {prob}%")
+
+    if edge is not None:
+        edge_sign = "+" if edge >= 0 else ""
+        lines.append(f"💰 Edge: {edge_sign}{edge}% (gate: ≥{DECISION_MIN_EDGE_PCT}%)")
+
+    if lambda_total > 0:
+        lines.append(
+            f"🎯 Dixon-Coles total: λ = {lambda_total:.2f} "
+            f"({float(lambda_h):.2f}+{float(lambda_a):.2f})"
+        )
+
+    if odds:
+        lines.append(f"💎 Odds: {odds}")
+
+    lines.append(f"🔢 Confidence: {tier_name} ({stars})")
+    lines.append(f"⚖️ Dominance V2: {dom:.4f}")
+
+    return "\n".join(lines)
+
+
 def passes_all_filters_v2(event: dict, pick: dict) -> tuple[bool, list[str]]:
     """
     3-lag filter for Decision Engine V2. Returnerer (passed, failed_reasons).
@@ -1322,11 +1496,19 @@ def build_decision_play_v2(pick: dict) -> dict | None:
     for ev in events:
         enriched = _enrich_event_with_filter_meta(ev, pick)
         passed, reasons = passes_all_filters_v2(enriched, pick)
+        diagnostics = compute_filter_diagnostics(enriched, pick)
         if passed:
+            enriched["_diagnostics"] = diagnostics
             eligible.append(enriched)
         else:
-            rejected.append({"label": ev["label"], "reasons": reasons,
-                              "probability_pct": ev["probability_pct"]})
+            rejected.append({
+                "label": ev["label"],
+                "reasons": reasons,
+                "probability_pct": ev["probability_pct"],
+                "edge_pct": enriched.get("edge_pct") or 0.0,
+                "confidence": enriched.get("confidence") or 0.0,
+                "diagnostics": diagnostics,
+            })
 
     if not eligible:
         return None
@@ -1352,8 +1534,41 @@ def build_decision_play_v2(pick: dict) -> dict | None:
 
     kickoff = pick.get("kickoff_time") or pick.get("kickoff") or pick.get("commence_time")
 
+    # C.1: auto-log dominant play (in-memory FIFO)
+    pick_id = pick.get("id") or pick.get("pick_id")
+    _log_dominant_play({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pick_id": pick_id,
+        "match": f"{pick.get('home_team', '')} vs {pick.get('away_team', '')}",
+        "league": pick.get("league") or "",
+        "event": chosen["label"],
+        "model_prob_pct": chosen["probability_pct"],
+        "market_prob_pct": chosen.get("market_implied_pct"),
+        "edge_pct": chosen.get("edge_pct"),
+        "odds": chosen.get("odds"),
+        "tier": tier_name,
+        "dominance_score_v2": chosen["dominance_score_v2"],
+        "atomic_score": score,
+    })
+
+    # C.3: build proof narrative light
+    proof_light = build_proof_narrative_light(pick, chosen)
+
+    # B1.2: include rejected diagnostics for pre-dominant analysis
+    rejected_diagnostics = [
+        {
+            "label": r["label"],
+            "probability_pct": r["probability_pct"],
+            "edge_pct": r.get("edge_pct", 0.0),
+            "confidence": r.get("confidence", 0.0),
+            "reasons": r["reasons"],
+            "diagnostics": r.get("diagnostics") or {},
+        }
+        for r in rejected
+    ]
+
     return {
-        "pick_id": pick.get("id") or pick.get("pick_id"),
+        "pick_id": pick_id,
         "match": {
             "home_team": pick.get("home_team", ""),
             "away_team": pick.get("away_team", ""),
@@ -1379,6 +1594,100 @@ def build_decision_play_v2(pick: dict) -> dict | None:
         "data_tag": {"label": tag_label, "emoji": tag_emoji},
         "atomic_score": score,
         "asset_tier": tier,
+        "proof_narrative_light": proof_light,
+        "rejected_diagnostics": rejected_diagnostics,
+    }
+
+
+def build_pre_dominant_pool(picks: list[dict], date_iso: str | None = None) -> dict:
+    """
+    B1.3 — Pre-Dominant pool: events som er nær gate men ikke passerer.
+
+    Pre-Dominant betingelse (per Don 2026-04-28):
+    - prob ∈ [60%, 65%) ELLER edge ∈ [3%, 5%) ELLER conf ≥ SILVER (0.6)
+    - business-filter må passere (ikke ekskludert market, ikke ATOMIC-block)
+
+    Returner aggregat for kalibrerings-analyse. Ikke for kunde-output.
+    """
+    if date_iso is None:
+        date_iso = datetime.now(timezone.utc).date().isoformat()
+
+    try:
+        from services.probability_event_generator import (
+            generate_events_for_match, validate_event_coherence,
+        )
+    except ImportError:
+        return {"date": date_iso, "pre_dominant_count": 0, "events": [],
+                "error": "probability_event_generator unavailable"}
+
+    pre_dominant_events: list[dict] = []
+    edge_close = 0
+    prob_close = 0
+    conf_close = 0
+    near_miss_total = 0
+    scanned = 0
+
+    for pick in picks:
+        if is_dummy_pick(pick):
+            continue
+        raw_events = generate_events_for_match(pick)
+        if not raw_events:
+            continue
+        validation = validate_event_coherence(raw_events)
+        events = validation.get("events") or []
+        if not events:
+            continue
+        scanned += 1
+        for ev in events:
+            enriched = _enrich_event_with_filter_meta(ev, pick)
+            passed, _ = passes_all_filters_v2(enriched, pick)
+            if passed:
+                continue  # disse fanges av build_decision_play_v2
+            diag = compute_filter_diagnostics(enriched, pick)
+            if not diag.get("pre_dominant"):
+                continue
+
+            prob = enriched.get("probability") or 0.0
+            edge = enriched.get("edge") or 0.0
+            conf = enriched.get("confidence") or 0.0
+
+            if 3.0 <= edge < DECISION_MIN_EDGE_PCT:
+                edge_close += 1
+            if 60.0 <= prob < DECISION_MIN_PROB_PCT:
+                prob_close += 1
+            if DECISION_MIN_CONFIDENCE <= conf < DECISION_V2_MIN_CONFIDENCE:
+                conf_close += 1
+            if diag.get("near_miss"):
+                near_miss_total += 1
+
+            pre_dominant_events.append({
+                "pick_id": pick.get("id") or pick.get("pick_id"),
+                "match": f"{pick.get('home_team', '')} vs {pick.get('away_team', '')}",
+                "league": pick.get("league") or "",
+                "event": enriched["label"],
+                "probability_pct": enriched["probability_pct"],
+                "edge_pct": enriched.get("edge_pct"),
+                "confidence": conf,
+                "dominance_score_v2": enriched.get("dominance_score_v2"),
+                "diagnostics": diag,
+            })
+
+    return {
+        "date": date_iso,
+        "scanned_matches": scanned,
+        "pre_dominant_count": len(pre_dominant_events),
+        "by_failure_pattern": {
+            "edge_close_to_5pct": edge_close,
+            "prob_close_to_65pct": prob_close,
+            "conf_silver_only": conf_close,
+            "near_miss_total": near_miss_total,
+        },
+        "events": pre_dominant_events,
+        "calibration_insight_draft": (
+            "TBD — krever ≥5 dager observasjon før mønster er statistisk signifikant"
+            if len(pre_dominant_events) > 0 else
+            "Ingen pre-dominant events i dag"
+        ),
     }
 
 

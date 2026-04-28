@@ -11248,6 +11248,75 @@ async def admin_test_decision_desk_v2(window_days: int = 7, max_age_days: int = 
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.get("/admin/pre-dominant-pool")
+async def admin_pre_dominant_pool(window_days: int = 7, max_age_days: int = 30):
+    """
+    B1.3 — Pre-Dominant Pool: events nær gate (men ikke passerer) for
+    intern kalibrerings-analyse. Sendes ALDRI til kunder.
+
+    Pre-dominant: prob ∈ [60,65) ELLER edge ∈ [3,5) ELLER conf ≥ SILVER.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.smartpick_narratives import build_pre_dominant_pool
+    except ImportError as e:
+        return JSONResponse(status_code=500, content={"error": f"import: {e}"})
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, home_team, away_team, league, kickoff_time,
+                       odds, soft_edge, soft_ev, atomic_score, tier,
+                       signals_triggered,
+                       dc_home_win_prob, dc_draw_prob, dc_away_win_prob,
+                       dc_btts_prob, dc_lambda_home, dc_lambda_away,
+                       dc_over_15, dc_over_25, dc_over_35,
+                       dc_under_25, dc_under_35
+                FROM picks_v2
+                WHERE tier IN ('ATOMIC','EDGE')
+                  AND created_at > NOW() - ($1 || ' days')::interval
+                  AND dc_home_win_prob IS NOT NULL
+                  AND dc_home_win_prob > 0
+                ORDER BY id DESC
+                LIMIT 100
+                """,
+                str(max_age_days),
+            )
+
+        picks = [dict(r) for r in rows]
+        for p in picks:
+            sigs = p.get("signals_triggered")
+            if isinstance(sigs, str):
+                try:
+                    p["signals_triggered"] = json.loads(sigs)
+                except Exception:
+                    p["signals_triggered"] = []
+
+        return build_pre_dominant_pool(picks)
+    except Exception as e:
+        logger.error(f"[PreDominantPool] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/dominant-log")
+async def admin_dominant_log(days: int = 7):
+    """
+    C.2 — In-memory dominant-log fra build_decision_play_v2 instrumentering.
+    Mistes ved Railway redeploy (akseptert). Returnerer entries siste N dager.
+    """
+    try:
+        from services.smartpick_narratives import get_dominant_log
+    except ImportError as e:
+        return JSONResponse(status_code=500, content={"error": f"import: {e}"})
+    try:
+        return get_dominant_log(days=days)
+    except Exception as e:
+        logger.error(f"[DominantLog] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.get("/admin/event-tracker")
 async def admin_event_tracker(window_days: int = 30):
     """
