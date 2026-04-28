@@ -4953,6 +4953,96 @@ async def lifespan(app: FastAPI):
             coalesce=True,
         )
 
+    # ── Sniper Engine (CLV-validation pipeline) ─────────────────────────
+    async def _sniper_pick_gen_job():
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import generate_picks
+            stats = await generate_picks(db_state.pool, days_ahead=2)
+            logger.info("[Sniper] pick_gen stats: %s", stats)
+        except Exception as e:
+            logger.error("[Sniper] pick_gen failed: %s", e, exc_info=True)
+
+    async def _sniper_t60_job():
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import update_odds_t60
+            stats = await update_odds_t60(db_state.pool)
+            if stats["checked"] > 0:
+                logger.info("[Sniper] t60 stats: %s", stats)
+        except Exception as e:
+            logger.error("[Sniper] t60 failed: %s", e, exc_info=True)
+
+    async def _sniper_close_job():
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import update_odds_close
+            stats = await update_odds_close(db_state.pool)
+            if stats["checked"] > 0:
+                logger.info("[Sniper] close stats: %s", stats)
+        except Exception as e:
+            logger.error("[Sniper] close failed: %s", e, exc_info=True)
+
+    async def _sniper_settle_job():
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import settle_picks
+            stats = await settle_picks(db_state.pool)
+            if stats["checked"] > 0:
+                logger.info("[Sniper] settle stats: %s", stats)
+        except Exception as e:
+            logger.error("[Sniper] settle failed: %s", e, exc_info=True)
+
+    if not scheduler.get_job("sniper_pick_generation"):
+        scheduler.add_job(
+            _sniper_pick_gen_job,
+            trigger=CronTrigger(hour=6, minute=30, timezone="UTC"),
+            id="sniper_pick_generation",
+            replace_existing=True,
+            name="Sniper Pick Generation (06:30 UTC)",
+            misfire_grace_time=900, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("sniper_pick_generation_catchup"):
+        scheduler.add_job(
+            _sniper_pick_gen_job,
+            trigger=CronTrigger(hour=14, minute=0, timezone="UTC"),
+            id="sniper_pick_generation_catchup",
+            replace_existing=True,
+            name="Sniper Pick Catch-up (14:00 UTC)",
+            misfire_grace_time=900, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("sniper_odds_t60"):
+        scheduler.add_job(
+            _sniper_t60_job,
+            trigger=CronTrigger(minute="*/5", hour="12-22", timezone="UTC"),
+            id="sniper_odds_t60",
+            replace_existing=True,
+            name="Sniper T-60 Odds Snapshot",
+            misfire_grace_time=120, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("sniper_odds_close"):
+        scheduler.add_job(
+            _sniper_close_job,
+            trigger=CronTrigger(minute="*", hour="12-22", timezone="UTC"),
+            id="sniper_odds_close",
+            replace_existing=True,
+            name="Sniper T-5 Closing Odds",
+            misfire_grace_time=60, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("sniper_settlement"):
+        scheduler.add_job(
+            _sniper_settle_job,
+            trigger=CronTrigger(minute="*/30", hour="14-23", timezone="UTC"),
+            id="sniper_settlement",
+            replace_existing=True,
+            name="Sniper Result Settlement",
+            misfire_grace_time=600, max_instances=1, coalesce=True,
+        )
+
     # Daglig morgen-brief 06:45 UTC (08:45 Oslo)
     if not scheduler.get_job("morning_brief"):
         scheduler.add_job(
@@ -11507,6 +11597,87 @@ async def admin_api_football_raw(date: str = "", league: int = 39, season: int =
             out["calls"].append({"name": "fixtures-date-only", "error": str(e)[:200]})
 
     return out
+
+
+@app.post("/admin/init-sniper-schema")
+async def admin_init_sniper_schema():
+    """Idempotent CREATE TABLE for sniper_bets_v1 + sniper_market_intelligence."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import SNIPER_SCHEMA
+        async with db_state.pool.acquire() as conn:
+            await conn.execute(SNIPER_SCHEMA)
+        return {"status": "ok", "schema_applied": True}
+    except Exception as e:
+        logger.error(f"[InitSniperSchema] error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-generate-picks-manual")
+async def admin_sniper_generate_picks_manual(days_ahead: int = 2):
+    """Manuell trigger for sniper pick-generation (uten å vente på cron)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import generate_picks
+        stats = await generate_picks(db_state.pool, days_ahead=days_ahead)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        logger.error(f"[SniperGenManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-update-odds-t60-manual")
+async def admin_sniper_update_t60_manual():
+    """Manuell trigger for T-60 snapshot (test)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import update_odds_t60
+        return {"status": "ok", "stats": await update_odds_t60(db_state.pool)}
+    except Exception as e:
+        logger.error(f"[SniperT60Manual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-update-odds-close-manual")
+async def admin_sniper_update_close_manual():
+    """Manuell trigger for closing-snapshot (test)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import update_odds_close
+        return {"status": "ok", "stats": await update_odds_close(db_state.pool)}
+    except Exception as e:
+        logger.error(f"[SniperCloseManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-settle-manual")
+async def admin_sniper_settle_manual():
+    """Manuell trigger for settlement (test)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import settle_picks
+        return {"status": "ok", "stats": await settle_picks(db_state.pool)}
+    except Exception as e:
+        logger.error(f"[SniperSettleManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/sniper-dashboard")
+async def admin_sniper_dashboard(window_days: int = 30):
+    """CLV + ROI dashboard for sniper_bets_v1."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import build_sniper_dashboard
+        return await build_sniper_dashboard(db_state.pool, window_days=window_days)
+    except Exception as e:
+        logger.error(f"[SniperDashboard] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
 @app.get("/admin/verify-pinnacle")
