@@ -11368,6 +11368,197 @@ async def admin_backfill_odds_from_dagens_kamp(
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.get("/admin/verify-pinnacle")
+async def admin_verify_pinnacle(days_ahead: int = 3):
+    """
+    Sniper STEG 0 — verify Pinnacle Over 2.5 tilgjengelig via API-Football.
+
+    Tre lag verifikasjon (anti-fake-fix):
+    1. /odds/bookmakers — liste alle bookmakers + identifiser ekte Pinnacle-ID
+    2. Big5 fixtures neste N dager — sjekk Pinnacle-blokkering per liga
+    3. Sample Over 2.5-respons + markets-liste
+
+    Returnerer:
+      bookmakers_available, pinnacle_id_detected, pinnacle_id_assumed,
+      ids_match, per_league, sample_pinnacle_response,
+      available_markets_for_pinnacle, verdict
+    """
+    api_key = os.environ.get("FOOTBALL_API_KEY", "")
+    if not api_key:
+        return JSONResponse(status_code=500,
+            content={"error": "FOOTBALL_API_KEY missing in env"})
+
+    headers = {
+        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Host": "v3.football.api-sports.io",
+    }
+    base_url = "https://v3.football.api-sports.io"
+    PINNACLE_ASSUMED_ID = 4
+
+    big5 = {
+        "Premier League": 39,
+        "La Liga": 140,
+        "Bundesliga": 78,
+        "Serie A": 135,
+        "Ligue 1": 61,
+    }
+
+    bookmakers_available = []
+    pinnacle_id_detected = None
+    per_league = {}
+    sample_pinnacle_response = None
+    sample_match_id = None
+    available_markets_for_pinnacle = set()
+
+    today = datetime.now(timezone.utc).date()
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # ── LAG 1: bookmakers list ──
+        try:
+            r = await client.get(f"{base_url}/odds/bookmakers", headers=headers)
+            bm_data = r.json().get("response") or []
+            bookmakers_available = [
+                {"id": b.get("id"), "name": b.get("name")} for b in bm_data
+            ]
+            for b in bm_data:
+                if (b.get("name") or "").lower() == "pinnacle":
+                    pinnacle_id_detected = b.get("id")
+                    break
+        except Exception as e:
+            return JSONResponse(status_code=500,
+                content={"error": f"bookmakers fetch failed: {str(e)[:200]}"})
+
+        ids_match = (pinnacle_id_detected == PINNACLE_ASSUMED_ID)
+        pinnacle_id_to_use = pinnacle_id_detected or PINNACLE_ASSUMED_ID
+
+        # ── LAG 2+3: per liga, fixtures + odds ──
+        for league_name, league_id in big5.items():
+            league_status = {
+                "league_id": league_id,
+                "fixtures_checked": 0,
+                "fixtures_with_pinnacle": 0,
+                "fixtures_with_over_25": 0,
+                "first_fixture_id": None,
+                "first_fixture_date": None,
+                "errors": [],
+            }
+            for offset in range(days_ahead + 1):
+                target = (today + timedelta(days=offset)).isoformat()
+                try:
+                    r = await client.get(
+                        f"{base_url}/fixtures",
+                        headers=headers,
+                        params={"date": target, "league": league_id,
+                                "season": today.year},
+                    )
+                    fix_data = r.json().get("response") or []
+                except Exception as e:
+                    league_status["errors"].append(
+                        f"fixtures {target}: {str(e)[:100]}")
+                    continue
+                if not fix_data:
+                    continue
+
+                fix_id = fix_data[0]["fixture"]["id"]
+                fix_date = fix_data[0]["fixture"]["date"]
+                league_status["fixtures_checked"] += 1
+                if league_status["first_fixture_id"] is None:
+                    league_status["first_fixture_id"] = fix_id
+                    league_status["first_fixture_date"] = fix_date
+
+                try:
+                    odds_r = await client.get(
+                        f"{base_url}/odds",
+                        headers=headers,
+                        params={"fixture": fix_id,
+                                "bookmaker": pinnacle_id_to_use},
+                    )
+                    odds_data = odds_r.json().get("response") or []
+                except Exception as e:
+                    league_status["errors"].append(
+                        f"odds fix {fix_id}: {str(e)[:100]}")
+                    continue
+
+                if not odds_data:
+                    continue
+
+                bookmakers = (odds_data[0].get("bookmakers") or [])
+                pinnacle_blocks = [
+                    b for b in bookmakers
+                    if b.get("id") == pinnacle_id_to_use
+                       or (b.get("name") or "").lower() == "pinnacle"
+                ]
+                if not pinnacle_blocks:
+                    continue
+                league_status["fixtures_with_pinnacle"] += 1
+
+                for pin in pinnacle_blocks:
+                    for bet in (pin.get("bets") or []):
+                        bet_name = bet.get("name") or ""
+                        available_markets_for_pinnacle.add(bet_name)
+                        name_low = bet_name.lower()
+                        if any(k in name_low for k in
+                               ("over/under", "goals over/under", "totals", "over under")):
+                            for v in (bet.get("values") or []):
+                                v_label = (v.get("value") or "").lower()
+                                if "2.5" in v_label or v_label in (
+                                        "over 2.5", "under 2.5"):
+                                    league_status["fixtures_with_over_25"] += 1
+                                    if sample_pinnacle_response is None:
+                                        teams = odds_data[0].get("teams") or {}
+                                        sample_pinnacle_response = {
+                                            "league": league_name,
+                                            "fixture_id": fix_id,
+                                            "fixture_date": fix_date,
+                                            "home": (teams.get("home") or {}).get("name"),
+                                            "away": (teams.get("away") or {}).get("name"),
+                                            "bet_name": bet_name,
+                                            "values": bet.get("values"),
+                                        }
+                                        sample_match_id = fix_id
+                                    break
+                            break
+            per_league[league_name] = league_status
+
+    overall_pinnacle = sum(s["fixtures_with_pinnacle"] for s in per_league.values())
+    overall_over25 = sum(s["fixtures_with_over_25"] for s in per_league.values())
+
+    if pinnacle_id_detected is None:
+        verdict = "NOT_AVAILABLE"
+        verdict_reason = "Pinnacle ikke i bookmakers-liste fra API-Football"
+    elif not ids_match:
+        verdict = "WRONG_ID"
+        verdict_reason = (f"Pinnacle har ID {pinnacle_id_detected}, "
+                          f"vi antok {PINNACLE_ASSUMED_ID}. Hardcoded ID må fikses.")
+    elif overall_over25 > 0:
+        verdict = "FULLY_AVAILABLE"
+        verdict_reason = f"Pinnacle Over 2.5 funnet i {overall_over25} fixtures"
+    elif overall_pinnacle > 0:
+        verdict = "PARTIAL"
+        verdict_reason = (f"Pinnacle aktiv på {overall_pinnacle} fixtures "
+                          "men Over 2.5 ikke funnet i samples")
+    else:
+        verdict = "NOT_AVAILABLE"
+        verdict_reason = "Pinnacle har korrekt ID men ingen fixtures returnerte data"
+
+    return {
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+        "days_ahead": days_ahead,
+        "pinnacle_id_detected": pinnacle_id_detected,
+        "pinnacle_id_assumed": PINNACLE_ASSUMED_ID,
+        "ids_match": ids_match,
+        "bookmakers_count": len(bookmakers_available),
+        "bookmakers_available": bookmakers_available,
+        "total_fixtures_with_pinnacle": overall_pinnacle,
+        "total_fixtures_with_over_25": overall_over25,
+        "available_markets_for_pinnacle": sorted(available_markets_for_pinnacle),
+        "per_league": per_league,
+        "sample_match_id": sample_match_id,
+        "sample_pinnacle_response": sample_pinnacle_response,
+    }
+
+
 @app.post("/admin/init-edge-events-schema")
 async def admin_init_edge_events_schema():
     """
