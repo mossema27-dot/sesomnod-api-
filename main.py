@@ -11368,6 +11368,62 @@ async def admin_backfill_odds_from_dagens_kamp(
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.get("/admin/api-football-scan-big5")
+async def admin_api_football_scan_big5(days_ahead: int = 14):
+    """Scan ALL fixtures over N days and find Big5 league occurrences."""
+    api_key = os.environ.get("FOOTBALL_API_KEY", "")
+    if not api_key:
+        return JSONResponse(status_code=500, content={"error": "FOOTBALL_API_KEY missing"})
+    headers = {"X-RapidAPI-Key": api_key, "X-RapidAPI-Host": "v3.football.api-sports.io"}
+    base = "https://v3.football.api-sports.io"
+
+    big5_ids = {39, 140, 78, 135, 61}
+    today = datetime.now(timezone.utc).date()
+    by_date = {}
+    big5_fixtures = []
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for offset in range(days_ahead + 1):
+            target = (today + timedelta(days=offset)).isoformat()
+            try:
+                r = await client.get(f"{base}/fixtures", headers=headers,
+                                     params={"date": target})
+                body = r.json() if r.status_code == 200 else {}
+            except Exception as e:
+                by_date[target] = {"error": str(e)[:100]}
+                continue
+            response = body.get("response") or []
+            big5_count = 0
+            league_seasons_seen = {}
+            for f in response:
+                lg = f.get("league") or {}
+                if lg.get("id") in big5_ids:
+                    big5_count += 1
+                    if len(big5_fixtures) < 5:
+                        teams = f.get("teams") or {}
+                        big5_fixtures.append({
+                            "fixture_id": (f.get("fixture") or {}).get("id"),
+                            "date": (f.get("fixture") or {}).get("date"),
+                            "league": lg.get("name"),
+                            "league_id": lg.get("id"),
+                            "season": lg.get("season"),
+                            "home": (teams.get("home") or {}).get("name"),
+                            "away": (teams.get("away") or {}).get("name"),
+                        })
+                    league_seasons_seen[lg.get("id")] = lg.get("season")
+            by_date[target] = {
+                "total_fixtures": len(response),
+                "big5_fixtures": big5_count,
+                "big5_seasons": league_seasons_seen,
+            }
+    return {
+        "days_scanned": days_ahead + 1,
+        "by_date": by_date,
+        "sample_big5_fixtures": big5_fixtures,
+        "total_big5_found": len(big5_fixtures),
+    }
+
+
 @app.get("/admin/api-football-raw")
 async def admin_api_football_raw(date: str = "", league: int = 39, season: int = 0):
     """
