@@ -11311,15 +11311,34 @@ async def admin_batch_recompute_edge_events(
         picks = [normalize_picks_row(r) for r in rows]
 
         if dry_run:
+            from services.probability_event_generator import _data_completeness, enrich_implied_inline
             preview = []
             total = 0
             for pick in picks[:5]:
                 payloads = compute_all_edge_events_for_pick(pick)
                 total += len(payloads)
+                completeness = _data_completeness(pick)
+                enriched = enrich_implied_inline(pick)
                 preview.append({
                     "pick_id": pick["id"],
                     "match": f"{pick.get('home_team', '')} vs {pick.get('away_team', '')}",
                     "events_count": len(payloads),
+                    "completeness": completeness,
+                    "diagnostic": {
+                        "dc_home_win_prob": pick.get("dc_home_win_prob"),
+                        "dc_draw_prob": pick.get("dc_draw_prob"),
+                        "dc_away_win_prob": pick.get("dc_away_win_prob"),
+                        "home_odds_raw": pick.get("home_odds_raw"),
+                        "draw_odds_raw": pick.get("draw_odds_raw"),
+                        "away_odds_raw": pick.get("away_odds_raw"),
+                        "dc_lambda_home": pick.get("dc_lambda_home"),
+                        "dc_over_25": pick.get("dc_over_25"),
+                        "atomic_score": pick.get("atomic_score"),
+                        "tier": pick.get("tier"),
+                        "implied_home_prob_post_enrich": enriched.get("implied_home_prob"),
+                        "implied_draw_prob_post_enrich": enriched.get("implied_draw_prob"),
+                        "implied_away_prob_post_enrich": enriched.get("implied_away_prob"),
+                    },
                 })
             return {
                 "dry_run": True,
