@@ -1085,6 +1085,8 @@ async def update_odds_close(pool) -> dict:
     BUG 2: retry via fetch_fixture_odds.
     KODE 3: lagrer market_open_at_close + pinnacle_markets_at_close (JSONB).
     KODE 5: kaller check_don_kill_switch hvis nye picks ble settled.
+    PROFIT MILESTONE: kaller post_close_milestone_check ved updates>0
+    (instant CLV evaluation når PRIMARY/SHADOW når terskel-counts).
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1106,13 +1108,19 @@ async def update_odds_close(pool) -> dict:
             else:
                 failures += 1
     kill_status = None
+    milestone_status = None
     if updates > 0:
         try:
             kill_status = await check_don_kill_switch(pool)
         except Exception as e:
             logger.warning("[Sniper] kill-switch check failed: %s", e)
+        try:
+            milestone_status = await post_close_milestone_check(pool)
+        except Exception as e:
+            logger.warning("[Sniper] milestone check failed: %s", e)
     return {"checked": len(rows), "updated": updates,
-            "failures": failures, "kill_switch": kill_status}
+            "failures": failures, "kill_switch": kill_status,
+            "milestone": milestone_status}
 
 
 # ── SETTLEMENT ──────────────────────────────────────────────────────────────
@@ -2126,6 +2134,96 @@ async def evaluate_clv_decision_layer(pool) -> dict:
         "metadata":                 metadata,
         "actionable_global":        actionable_global,
     }
+
+
+# PROFIT MILESTONE: terskler som auto-trigger CLV-decision-evaluation.
+# Settes som SETs så vi unngår false positives ved verdier som tilfeldig
+# ligner men ikke er en milepæl (eks: PRIMARY=15 → ingen trigger).
+PRIMARY_MILESTONES       = frozenset({5, 10, 20, 30, 50, 100, 200})
+SHADOW_BIG5_MILESTONES   = frozenset({10, 30, 50, 100, 200})
+SHADOW_GLOBAL_MILESTONES = frozenset({25, 50, 100, 200, 500})
+
+# Concurrency-guard for milestone-trigger. Forhindrer at parallelle
+# update_odds_close-runs (selv om scheduler max_instances=1 garanterer
+# det normalt ikke skjer) trigger evaluate_clv_decision_layer samtidig.
+_milestone_lock: asyncio.Lock | None = None
+
+
+def _get_milestone_lock() -> asyncio.Lock:
+    global _milestone_lock
+    if _milestone_lock is None:
+        _milestone_lock = asyncio.Lock()
+    return _milestone_lock
+
+
+async def post_close_milestone_check(pool) -> dict:
+    """
+    Auto-trigger evaluate_clv_decision_layer NÅR vi krysser en
+    milepæl-terskel på close-counts per tier. Forhindrer 6t latency
+    mellom datapunkt og decision.
+
+    Concurrency-guard via asyncio.Lock — kun én aktiv evaluation om gangen.
+    Ingen rekursjon: evaluate_clv_decision_layer rører ikke odds-feltene,
+    og post_close_milestone_check kalles KUN fra update_odds_close (ikke
+    fra evaluate_clv).
+    """
+    async with pool.acquire() as conn:
+        counts = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE market_tier='PRIMARY'
+                                  AND odds_close IS NOT NULL)       AS p_n,
+                COUNT(*) FILTER (WHERE market_tier='SHADOW_BIG5'
+                                  AND odds_close IS NOT NULL)       AS sb5_n,
+                COUNT(*) FILTER (WHERE market_tier='SHADOW_GLOBAL'
+                                  AND odds_close IS NOT NULL)       AS sg_n
+            FROM sniper_bets_v1;
+            """
+        )
+    p_n   = int(counts["p_n"] or 0)
+    sb5_n = int(counts["sb5_n"] or 0)
+    sg_n  = int(counts["sg_n"] or 0)
+
+    triggered: list[str] = []
+    if p_n in PRIMARY_MILESTONES:
+        triggered.append(f"PRIMARY={p_n}")
+    if sb5_n in SHADOW_BIG5_MILESTONES:
+        triggered.append(f"SHADOW_BIG5={sb5_n}")
+    if sg_n in SHADOW_GLOBAL_MILESTONES:
+        triggered.append(f"SHADOW_GLOBAL={sg_n}")
+
+    if not triggered:
+        return {
+            "triggered": False, "milestones": [],
+            "counts": {"primary": p_n, "shadow_big5": sb5_n, "shadow_global": sg_n},
+        }
+
+    logger.critical(
+        "[ClvMilestone] CLV_MILESTONE_TRIGGERED: %s — forcing "
+        "evaluate_clv_decision_layer()", ", ".join(triggered),
+    )
+    lock = _get_milestone_lock()
+    async with lock:
+        try:
+            decision_result = await evaluate_clv_decision_layer(pool)
+            return {
+                "triggered": True,
+                "milestones": triggered,
+                "counts": {"primary": p_n, "shadow_big5": sb5_n,
+                           "shadow_global": sg_n},
+                "decision_id": decision_result.get("decision_id"),
+                "primary_decision":     decision_result.get("primary_decision"),
+                "shadow_big5_decision": decision_result.get("shadow_big5_decision"),
+                "actionable_global":    len(decision_result.get("actionable_global") or []),
+            }
+        except Exception as e:
+            logger.error("[ClvMilestone] evaluate failed: %s", e, exc_info=True)
+            return {
+                "triggered": True, "milestones": triggered,
+                "counts": {"primary": p_n, "shadow_big5": sb5_n,
+                           "shadow_global": sg_n},
+                "error": str(e)[:300],
+            }
 
 
 async def fetch_clv_decisions(pool, limit: int = 10) -> list[dict]:
