@@ -126,6 +126,14 @@ ALTER TABLE sniper_bets_v1
     ADD COLUMN IF NOT EXISTS last_settle_attempt_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS fixture_status TEXT;
 
+-- CLV-armor: late-capture flags (KODE 2) + market availability (KODE 3)
+ALTER TABLE sniper_bets_v1
+    ADD COLUMN IF NOT EXISTS t60_late_capture BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS close_late_capture BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS market_open_at_t60 BOOLEAN,
+    ADD COLUMN IF NOT EXISTS market_open_at_close BOOLEAN,
+    ADD COLUMN IF NOT EXISTS pinnacle_markets_at_close JSONB;
+
 CREATE TABLE IF NOT EXISTS sniper_market_intelligence (
     id BIGSERIAL PRIMARY KEY,
     match_id TEXT NOT NULL,
@@ -138,6 +146,39 @@ CREATE TABLE IF NOT EXISTS sniper_market_intelligence (
 );
 CREATE INDEX IF NOT EXISTS idx_market_intel_match
     ON sniper_market_intelligence(match_id);
+
+-- KODE 5: system-wide flags (kill-switch pause, etc.)
+CREATE TABLE IF NOT EXISTS system_state (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- KODE 4: per-pick CLV view (Don-lesbar)
+CREATE OR REPLACE VIEW sniper_clv_per_pick AS
+SELECT
+    id, match_id, league,
+    home_team || ' vs ' || away_team AS match,
+    kickoff_time,
+    ROUND(odds_open::numeric, 2)      AS odds_open,
+    ROUND(odds_t60::numeric, 2)       AS odds_t60,
+    ROUND(odds_close::numeric, 2)     AS odds_close,
+    ROUND(clv_t60_pct::numeric, 2)    AS clv_t60_pct,
+    ROUND(clv_close_pct::numeric, 2)  AS clv_close_pct,
+    CASE
+        WHEN odds_close IS NULL              THEN 'Pending'
+        WHEN odds_close < odds_open          THEN 'Positive (sharp agrees)'
+        WHEN odds_close > odds_open          THEN 'Negative (sharp disagrees)'
+        ELSE                                       'Neutral'
+    END AS clv_verdict,
+    is_positive_clv_close,
+    market_open_at_t60, market_open_at_close,
+    t60_late_capture, close_late_capture,
+    snapshot_failed_count,
+    result,
+    ROUND(profit_units::numeric, 2)   AS profit_units,
+    fixture_status
+FROM sniper_bets_v1;
 """
 
 
@@ -249,6 +290,53 @@ def _parse_pinnacle_over_25(odds_response: list[dict]) -> tuple[float | None, di
                 except (TypeError, ValueError):
                     return None, None
     return None, None
+
+
+def _pinnacle_market_status(odds_response: list[dict]) -> dict:
+    """
+    KODE 3: rik Pinnacle-status for market-availability tracking.
+
+    Returnerer:
+      pinnacle_present:  bool       — Pinnacle bookmaker funnet i respons
+      over_25_open:      bool|None  — True om Over 2.5 åpen, False om Pinnacle
+                                       finnes men markedet er stengt, None om
+                                       Pinnacle ikke i responsen i det hele tatt.
+      over_25_odds:      float|None — odds for Over 2.5 hvis tilgjengelig
+      bets_summary:      list[dict] — alle Pinnacle-markeder med values_count
+                                       (lagres som JSONB ved closing-snapshot).
+    """
+    out = {
+        "pinnacle_present": False,
+        "over_25_open": None,
+        "over_25_odds": None,
+        "bets_summary": [],
+    }
+    if not odds_response:
+        return out
+    bookmakers = (odds_response[0].get("bookmakers") or [])
+    pinnacle = next(
+        (b for b in bookmakers if b.get("id") == PINNACLE_BOOKMAKER_ID),
+        None,
+    )
+    if not pinnacle:
+        return out
+    out["pinnacle_present"] = True
+    out["over_25_open"] = False
+    for bet in (pinnacle.get("bets") or []):
+        name = bet.get("name") or ""
+        values = bet.get("values") or []
+        out["bets_summary"].append({"name": name, "values_count": len(values)})
+        name_lower = name.lower()
+        if "over/under" in name_lower or "goals over" in name_lower:
+            for v in values:
+                if (v.get("value") or "").lower().strip() == "over 2.5":
+                    out["over_25_open"] = True
+                    try:
+                        out["over_25_odds"] = float(v.get("odd"))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+    return out
 
 
 def _parse_pinnacle_market_intel(odds_response: list[dict]) -> dict:
@@ -384,6 +472,18 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
     lagrer til sniper_bets_v1.
     """
     from services.dixon_coles_engine import get_dixon_coles_probs
+
+    # KODE 5: respekter Don's kill-switch FØR vi forbruker API-Football quota
+    try:
+        if await is_sniper_paused(pool):
+            logger.warning(
+                "[Sniper] generate_picks SKIPPED — system_state.%s = true",
+                SNIPER_PAUSE_KEY,
+            )
+            return {"status": "PAUSED", "reason": "kill_switch_active",
+                    "picks_created": 0}
+    except Exception as e:
+        logger.warning("[Sniper] pause-check failed (proceeding): %s", e)
 
     today = datetime.now(timezone.utc).date()
     season = _compute_season(today)
@@ -551,13 +651,96 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
 
 
 # ── ODDS-SNAPSHOTS ──────────────────────────────────────────────────────────
+async def _capture_t60(pool, row: dict, late: bool, client: httpx.AsyncClient) -> str:
+    """
+    Per-pick T-60 capture. Skriver odds_t60, clv_t60, market_open_at_t60.
+    Returnerer 'updated' | 'failed_no_odds' | 'failed_no_pinnacle'.
+    """
+    now = datetime.now(timezone.utc)
+    odds_response = await fetch_fixture_odds(int(row["match_id"]), client)
+    status = _pinnacle_market_status(odds_response)
+    new_odds = status["over_25_odds"]
+    market_open = status["over_25_open"]
+    if new_odds is None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE sniper_bets_v1 SET
+                    snapshot_failed_count = COALESCE(snapshot_failed_count, 0) + 1,
+                    market_open_at_t60 = $1,
+                    updated_at = NOW()
+                WHERE id = $2;
+                """,
+                market_open, row["id"],
+            )
+        return "failed_no_pinnacle" if not status["pinnacle_present"] else "failed_no_odds"
+    clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE sniper_bets_v1 SET
+                odds_t60 = $1, odds_t60_timestamp = $2,
+                clv_t60_pct = $3,
+                market_open_at_t60 = TRUE,
+                t60_late_capture = $4,
+                updated_at = NOW()
+            WHERE id = $5;
+            """,
+            new_odds, now, clv, late, row["id"],
+        )
+    return "updated"
+
+
+async def _capture_close(pool, row: dict, late: bool, client: httpx.AsyncClient) -> str:
+    """
+    Per-pick T-5 close capture. Skriver odds_close, clv_close, is_positive_clv_close,
+    market_open_at_close, pinnacle_markets_at_close (JSONB).
+    """
+    now = datetime.now(timezone.utc)
+    odds_response = await fetch_fixture_odds(int(row["match_id"]), client)
+    status = _pinnacle_market_status(odds_response)
+    new_odds = status["over_25_odds"]
+    market_open = status["over_25_open"]
+    bets_blob = json.dumps(status["bets_summary"]) if status["pinnacle_present"] else None
+    if new_odds is None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE sniper_bets_v1 SET
+                    snapshot_failed_count = COALESCE(snapshot_failed_count, 0) + 1,
+                    market_open_at_close = $1,
+                    pinnacle_markets_at_close = $2,
+                    updated_at = NOW()
+                WHERE id = $3;
+                """,
+                market_open, bets_blob, row["id"],
+            )
+        return "failed_no_pinnacle" if not status["pinnacle_present"] else "failed_no_odds"
+    clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
+    is_positive = new_odds < float(row["odds_open"])
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE sniper_bets_v1 SET
+                odds_close = $1, odds_close_timestamp = $2,
+                clv_close_pct = $3, is_positive_clv_close = $4,
+                market_open_at_close = TRUE,
+                pinnacle_markets_at_close = $5,
+                close_late_capture = $6,
+                updated_at = NOW()
+            WHERE id = $7;
+            """,
+            new_odds, now, clv, is_positive, bets_blob, late, row["id"],
+        )
+    return "updated"
+
+
 async def update_odds_t60(pool) -> dict:
     """
     BUG 1: utvidet vindu 50-70 min (var 55-65). Tåler scheduler-jitter.
     BUG 2: retry via fetch_fixture_odds.
-    Tracker snapshot_failed_count for observability.
+    KODE 3: lagrer market_open_at_t60 også når Over 2.5 ikke er åpen.
     """
-    now = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -572,30 +755,11 @@ async def update_odds_t60(pool) -> dict:
     failures = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         for row in rows:
-            odds_response = await fetch_fixture_odds(int(row["match_id"]), client)
-            new_odds, _ = _parse_pinnacle_over_25(odds_response)
-            if not new_odds:
+            outcome = await _capture_t60(pool, row, late=False, client=client)
+            if outcome == "updated":
+                updates += 1
+            else:
                 failures += 1
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE sniper_bets_v1 SET snapshot_failed_count = "
-                        "COALESCE(snapshot_failed_count, 0) + 1, updated_at = NOW() "
-                        "WHERE id = $1;",
-                        row["id"],
-                    )
-                continue
-            clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE sniper_bets_v1 SET
-                        odds_t60 = $1, odds_t60_timestamp = $2,
-                        clv_t60_pct = $3, updated_at = NOW()
-                    WHERE id = $4;
-                    """,
-                    new_odds, now, clv, row["id"],
-                )
-            updates += 1
     return {"checked": len(rows), "updated": updates, "failures": failures}
 
 
@@ -603,8 +767,9 @@ async def update_odds_close(pool) -> dict:
     """
     BUG 1: utvidet vindu 3-7 min (var 4-6). Bedre fangst av T-5-tidspunkt.
     BUG 2: retry via fetch_fixture_odds.
+    KODE 3: lagrer market_open_at_close + pinnacle_markets_at_close (JSONB).
+    KODE 5: kaller check_don_kill_switch hvis nye picks ble settled.
     """
-    now = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -619,33 +784,19 @@ async def update_odds_close(pool) -> dict:
     failures = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         for row in rows:
-            odds_response = await fetch_fixture_odds(int(row["match_id"]), client)
-            new_odds, _ = _parse_pinnacle_over_25(odds_response)
-            if not new_odds:
+            outcome = await _capture_close(pool, row, late=False, client=client)
+            if outcome == "updated":
+                updates += 1
+            else:
                 failures += 1
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE sniper_bets_v1 SET snapshot_failed_count = "
-                        "COALESCE(snapshot_failed_count, 0) + 1, updated_at = NOW() "
-                        "WHERE id = $1;",
-                        row["id"],
-                    )
-                continue
-            clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
-            is_positive = new_odds < float(row["odds_open"])
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE sniper_bets_v1 SET
-                        odds_close = $1, odds_close_timestamp = $2,
-                        clv_close_pct = $3, is_positive_clv_close = $4,
-                        updated_at = NOW()
-                    WHERE id = $5;
-                    """,
-                    new_odds, now, clv, is_positive, row["id"],
-                )
-            updates += 1
-    return {"checked": len(rows), "updated": updates, "failures": failures}
+    kill_status = None
+    if updates > 0:
+        try:
+            kill_status = await check_don_kill_switch(pool)
+        except Exception as e:
+            logger.warning("[Sniper] kill-switch check failed: %s", e)
+    return {"checked": len(rows), "updated": updates,
+            "failures": failures, "kill_switch": kill_status}
 
 
 # ── SETTLEMENT ──────────────────────────────────────────────────────────────
@@ -732,11 +883,386 @@ async def settle_picks(pool) -> dict:
 
             # Ikke ferdig (NS, 1H, HT, 2H, LIVE, PST, etc.) → forbli PENDING
             pending_kept += 1
+    kill_status = None
+    if settled > 0 or voided > 0:
+        try:
+            kill_status = await check_don_kill_switch(pool)
+        except Exception as e:
+            logger.warning("[Sniper] kill-switch check failed: %s", e)
     return {
         "checked": len(rows),
         "settled": settled,
         "voided": voided,
         "kept_pending": pending_kept,
+        "kill_switch": kill_status,
+    }
+
+
+# ── MISSED-SNAPSHOT DETECTOR (KODE 2) ───────────────────────────────────────
+async def catch_missed_snapshots(pool) -> dict:
+    """
+    Backup-cron: hvis primary T-60 eller T-5-cron crasher, late-capture odds
+    så lenge marked fortsatt er åpent (= før kickoff).
+
+    T-60 sen-vindu: kickoff in [NOW()+10min, NOW()+50min] AND odds_t60 IS NULL
+    T-5  sen-vindu: kickoff in [NOW()+0.5min, NOW()+3min] AND odds_close IS NULL
+
+    Markerer t60_late_capture / close_late_capture = TRUE ved suksess.
+    """
+    async with pool.acquire() as conn:
+        t60_rows = await conn.fetch(
+            """
+            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count
+            FROM sniper_bets_v1
+            WHERE odds_t60 IS NULL
+              AND kickoff_time > NOW() + INTERVAL '10 minutes'
+              AND kickoff_time < NOW() + INTERVAL '50 minutes';
+            """
+        )
+        close_rows = await conn.fetch(
+            """
+            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count
+            FROM sniper_bets_v1
+            WHERE odds_close IS NULL
+              AND kickoff_time > NOW() + INTERVAL '30 seconds'
+              AND kickoff_time < NOW() + INTERVAL '3 minutes';
+            """
+        )
+    t60_recovered, t60_failed = 0, 0
+    close_recovered, close_failed = 0, 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for row in t60_rows:
+            outcome = await _capture_t60(pool, row, late=True, client=client)
+            if outcome == "updated":
+                t60_recovered += 1
+                logger.warning(
+                    "[Sniper] late T-60 capture pick_id=%s match_id=%s",
+                    row["id"], row["match_id"],
+                )
+            else:
+                t60_failed += 1
+        for row in close_rows:
+            outcome = await _capture_close(pool, row, late=True, client=client)
+            if outcome == "updated":
+                close_recovered += 1
+                logger.warning(
+                    "[Sniper] late close capture pick_id=%s match_id=%s",
+                    row["id"], row["match_id"],
+                )
+            else:
+                close_failed += 1
+    return {
+        "t60_checked": len(t60_rows),
+        "t60_recovered": t60_recovered,
+        "t60_failed": t60_failed,
+        "close_checked": len(close_rows),
+        "close_recovered": close_recovered,
+        "close_failed": close_failed,
+    }
+
+
+# ── DON'S 5-PICKS KILL-SWITCH (KODE 5) ──────────────────────────────────────
+SNIPER_PAUSE_KEY = "sniper_pick_gen_paused"
+
+
+async def is_sniper_paused(pool) -> bool:
+    """Sjekk om generate_picks er pauset av kill-switch."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT value FROM system_state WHERE key = $1;",
+            SNIPER_PAUSE_KEY,
+        )
+    return bool(row) and (row["value"] or "").lower() == "true"
+
+
+async def check_don_kill_switch(pool) -> dict:
+    """
+    Don's regel: etter 5 settled picks med odds_close, hvis ≤2 har
+    is_positive_clv_close = TRUE, AUTO_STOP pick generation.
+
+    Skriver system_state.sniper_pick_gen_paused = 'true' og logger CRITICAL.
+    """
+    async with pool.acquire() as conn:
+        last_5 = await conn.fetch(
+            """
+            SELECT id, match_id, is_positive_clv_close
+            FROM sniper_bets_v1
+            WHERE odds_close IS NOT NULL
+              AND is_positive_clv_close IS NOT NULL
+            ORDER BY kickoff_time DESC
+            LIMIT 5;
+            """
+        )
+    if len(last_5) < 5:
+        return {"status": "INSUFFICIENT_DATA", "n": len(last_5)}
+    positive_count = sum(1 for p in last_5 if p["is_positive_clv_close"])
+    pick_ids = [p["id"] for p in last_5]
+    if positive_count <= 2:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO system_state (key, value, updated_at)
+                VALUES ($1, 'true', NOW())
+                ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = NOW();
+                """,
+                SNIPER_PAUSE_KEY,
+            )
+        logger.critical(
+            "[Sniper] DON_KILL_SWITCH_TRIGGERED: %d/5 positive CLV (picks=%s). "
+            "Pick generation PAUSED via system_state. Manuell restart kreves.",
+            positive_count, pick_ids,
+        )
+        return {
+            "status": "AUTO_STOP",
+            "positive_count": positive_count,
+            "checked_picks": pick_ids,
+            "paused": True,
+        }
+    return {
+        "status": "PASS",
+        "positive_count": positive_count,
+        "checked_picks": pick_ids,
+        "paused": False,
+    }
+
+
+# ── PRE-FLIGHT TEST (KODE 1) ────────────────────────────────────────────────
+async def run_pre_flight_test(pool, pick_id_override: int | None = None) -> dict:
+    """
+    Mutate én pick midlertidig, kjør update_odds_t60 + update_odds_close mot
+    den, verify at odds + CLV beregnes korrekt. ALWAYS restore original state
+    via try/finally.
+
+    KRITISK: kjør FØR lørdagens picks. Avdekker bug før det er for sent.
+    """
+    started_at = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        if pick_id_override is not None:
+            test_pick = await conn.fetchrow(
+                "SELECT * FROM sniper_bets_v1 WHERE id = $1;",
+                pick_id_override,
+            )
+        else:
+            test_pick = await conn.fetchrow(
+                """
+                SELECT * FROM sniper_bets_v1
+                WHERE result = 'PENDING'
+                ORDER BY kickoff_time ASC
+                LIMIT 1;
+                """
+            )
+    if not test_pick:
+        return {"status": "NO_TEST_PICK",
+                "msg": "No PENDING pick available for test"}
+
+    original = dict(test_pick)
+    pick_id = original["id"]
+
+    diagnostic = {
+        "pick_id": pick_id,
+        "match_id": original["match_id"],
+        "match": f"{original['home_team']} vs {original['away_team']}",
+        "league": original["league"],
+        "odds_open": float(original["odds_open"]),
+        "kickoff_original_iso": (
+            original["kickoff_time"].isoformat()
+            if original.get("kickoff_time") else None
+        ),
+        "started_at": started_at.isoformat(),
+        "t60": {},
+        "close": {},
+        "restored": False,
+        "overall": "PENDING",
+    }
+
+    try:
+        # ── T-60 SIM ──
+        t60_kickoff = datetime.now(timezone.utc) + timedelta(minutes=60)
+        t60_start = datetime.now(timezone.utc)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE sniper_bets_v1 SET
+                    kickoff_time = $1,
+                    odds_t60 = NULL, odds_t60_timestamp = NULL,
+                    clv_t60_pct = NULL,
+                    market_open_at_t60 = NULL,
+                    t60_late_capture = FALSE
+                WHERE id = $2;
+                """,
+                t60_kickoff, pick_id,
+            )
+        await update_odds_t60(pool)
+        async with pool.acquire() as conn:
+            t60_row = await conn.fetchrow(
+                """
+                SELECT odds_t60, odds_t60_timestamp, clv_t60_pct,
+                       market_open_at_t60, snapshot_failed_count
+                FROM sniper_bets_v1 WHERE id = $1;
+                """,
+                pick_id,
+            )
+        captured_odds = (
+            float(t60_row["odds_t60"]) if t60_row["odds_t60"] is not None else None
+        )
+        captured_clv = (
+            float(t60_row["clv_t60_pct"])
+            if t60_row["clv_t60_pct"] is not None else None
+        )
+        diagnostic["t60"] = {
+            "elapsed_sec": round(
+                (datetime.now(timezone.utc) - t60_start).total_seconds(), 2,
+            ),
+            "odds_t60_captured": captured_odds,
+            "clv_t60_pct": captured_clv,
+            "market_open_at_t60": t60_row["market_open_at_t60"],
+            "verdict": "PASS" if (captured_odds is not None
+                                  and captured_clv is not None) else "FAIL",
+        }
+
+        # ── T-5 SIM ──
+        close_kickoff = datetime.now(timezone.utc) + timedelta(minutes=5)
+        close_start = datetime.now(timezone.utc)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE sniper_bets_v1 SET
+                    kickoff_time = $1,
+                    odds_close = NULL, odds_close_timestamp = NULL,
+                    clv_close_pct = NULL, is_positive_clv_close = NULL,
+                    market_open_at_close = NULL,
+                    pinnacle_markets_at_close = NULL,
+                    close_late_capture = FALSE
+                WHERE id = $2;
+                """,
+                close_kickoff, pick_id,
+            )
+        await update_odds_close(pool)
+        async with pool.acquire() as conn:
+            close_row = await conn.fetchrow(
+                """
+                SELECT odds_close, odds_close_timestamp, clv_close_pct,
+                       is_positive_clv_close, market_open_at_close
+                FROM sniper_bets_v1 WHERE id = $1;
+                """,
+                pick_id,
+            )
+        captured_close = (
+            float(close_row["odds_close"])
+            if close_row["odds_close"] is not None else None
+        )
+        captured_clv_close = (
+            float(close_row["clv_close_pct"])
+            if close_row["clv_close_pct"] is not None else None
+        )
+        diagnostic["close"] = {
+            "elapsed_sec": round(
+                (datetime.now(timezone.utc) - close_start).total_seconds(), 2,
+            ),
+            "odds_close_captured": captured_close,
+            "clv_close_pct": captured_clv_close,
+            "is_positive_clv_close": close_row["is_positive_clv_close"],
+            "market_open_at_close": close_row["market_open_at_close"],
+            "verdict": "PASS" if (captured_close is not None
+                                  and captured_clv_close is not None) else "FAIL",
+        }
+    finally:
+        # ── ALWAYS RESTORE ──
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE sniper_bets_v1 SET
+                    kickoff_time              = $1,
+                    odds_t60                  = $2,
+                    odds_t60_timestamp        = $3,
+                    clv_t60_pct               = $4,
+                    odds_close                = $5,
+                    odds_close_timestamp      = $6,
+                    clv_close_pct             = $7,
+                    is_positive_clv_close     = $8,
+                    snapshot_failed_count     = $9,
+                    market_open_at_t60        = $10,
+                    market_open_at_close      = $11,
+                    pinnacle_markets_at_close = $12,
+                    t60_late_capture          = COALESCE($13, FALSE),
+                    close_late_capture        = COALESCE($14, FALSE),
+                    updated_at                = NOW()
+                WHERE id = $15;
+                """,
+                original.get("kickoff_time"),
+                original.get("odds_t60"),
+                original.get("odds_t60_timestamp"),
+                original.get("clv_t60_pct"),
+                original.get("odds_close"),
+                original.get("odds_close_timestamp"),
+                original.get("clv_close_pct"),
+                original.get("is_positive_clv_close"),
+                original.get("snapshot_failed_count"),
+                original.get("market_open_at_t60"),
+                original.get("market_open_at_close"),
+                original.get("pinnacle_markets_at_close"),
+                original.get("t60_late_capture"),
+                original.get("close_late_capture"),
+                pick_id,
+            )
+        diagnostic["restored"] = True
+
+    diagnostic["overall"] = (
+        "PASS" if diagnostic["t60"].get("verdict") == "PASS"
+        and diagnostic["close"].get("verdict") == "PASS" else "FAIL"
+    )
+    return diagnostic
+
+
+# ── PER-PICK CLV (KODE 4) ───────────────────────────────────────────────────
+async def build_clv_per_pick(pool) -> dict:
+    """Returner sniper_clv_per_pick view + markdown-tabell for Don."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM sniper_clv_per_pick ORDER BY kickoff_time DESC;"
+        )
+    picks = []
+    for r in rows:
+        d = dict(r)
+        if d.get("kickoff_time"):
+            d["kickoff_time"] = d["kickoff_time"].isoformat()
+        for k in ("odds_open", "odds_t60", "odds_close",
+                  "clv_t60_pct", "clv_close_pct", "profit_units"):
+            if d.get(k) is not None:
+                d[k] = float(d[k])
+        picks.append(d)
+
+    header = ("| ID | Match | Kickoff | Open | T60 | Close | CLV T60% | "
+              "CLV Close% | Verdict | Result | Profit | Status |")
+    sep = "|" + "|".join(["---"] * 12) + "|"
+    body_lines = []
+    for p in picks:
+        body_lines.append(
+            "| {id} | {match} | {kickoff} | {open} | {t60} | {close} | "
+            "{clv_t60} | {clv_close} | {verdict} | {result} | {profit} | "
+            "{status} |".format(
+                id=p["id"],
+                match=(p.get("match") or "")[:30],
+                kickoff=(p.get("kickoff_time") or "")[:16],
+                open=p.get("odds_open") if p.get("odds_open") is not None else "-",
+                t60=p.get("odds_t60") if p.get("odds_t60") is not None else "-",
+                close=p.get("odds_close") if p.get("odds_close") is not None else "-",
+                clv_t60=(f"{p['clv_t60_pct']:+.2f}"
+                         if p.get("clv_t60_pct") is not None else "-"),
+                clv_close=(f"{p['clv_close_pct']:+.2f}"
+                           if p.get("clv_close_pct") is not None else "-"),
+                verdict=p.get("clv_verdict") or "-",
+                result=p.get("result") or "PENDING",
+                profit=(f"{p['profit_units']:+.2f}"
+                        if p.get("profit_units") is not None else "-"),
+                status=p.get("fixture_status") or "-",
+            )
+        )
+    return {
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+        "n_picks": len(picks),
+        "picks": picks,
+        "markdown_table": "\n".join([header, sep] + body_lines),
     }
 
 

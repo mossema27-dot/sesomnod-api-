@@ -4997,6 +4997,18 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error("[Sniper] settle failed: %s", e, exc_info=True)
 
+    async def _sniper_missed_snapshots_job():
+        """KODE 2: backup-cron som late-fanger missed T-60 + T-5 snapshots."""
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import catch_missed_snapshots
+            stats = await catch_missed_snapshots(db_state.pool)
+            if (stats["t60_checked"] + stats["close_checked"]) > 0:
+                logger.info("[Sniper] missed-snapshots stats: %s", stats)
+        except Exception as e:
+            logger.error("[Sniper] missed-snapshots failed: %s", e, exc_info=True)
+
     if not scheduler.get_job("sniper_pick_generation"):
         scheduler.add_job(
             _sniper_pick_gen_job,
@@ -5041,6 +5053,17 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             name="Sniper Result Settlement",
             misfire_grace_time=600, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("sniper_missed_snapshots"):
+        # KODE 2: backup-cron mellom 12-22 UTC, hvert 10. min.
+        # Catcher T-60 + T-5 snapshots hvis primary cron crasher.
+        scheduler.add_job(
+            _sniper_missed_snapshots_job,
+            trigger=CronTrigger(minute="*/10", hour="12-22", timezone="UTC"),
+            id="sniper_missed_snapshots",
+            replace_existing=True,
+            name="Sniper Missed-Snapshot Detector (KODE 2)",
+            misfire_grace_time=120, max_instances=1, coalesce=True,
         )
 
     # Daglig morgen-brief 06:45 UTC (08:45 Oslo)
@@ -11728,6 +11751,131 @@ async def admin_sniper_dashboard(window_days: int = 30):
         return await build_sniper_dashboard(db_state.pool, window_days=window_days)
     except Exception as e:
         logger.error(f"[SniperDashboard] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-test-snapshots-now")
+async def admin_sniper_test_snapshots_now(pick_id: int | None = None):
+    """
+    KODE 1: T-60 + T-5 pre-flight test.
+
+    Mutate én pick midlertidig (kickoff_time → NOW()+60min, så NOW()+5min),
+    kjør update_odds_t60 + update_odds_close mot live Pinnacle, verify at
+    odds + CLV beregnes korrekt. ALLTID restore originalt state via finally.
+
+    KRITISK å kjøre FØR lørdag 2026-05-02. Avdekker bug før det er for sent.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import run_pre_flight_test
+        result = await run_pre_flight_test(db_state.pool, pick_id_override=pick_id)
+        return {"status": "ok", "pre_flight": result}
+    except Exception as e:
+        logger.error(f"[SniperPreFlight] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-missed-snapshots-manual")
+async def admin_sniper_missed_snapshots_manual():
+    """KODE 2: manuell trigger for missed-snapshot detector."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import catch_missed_snapshots
+        return {"status": "ok", "stats": await catch_missed_snapshots(db_state.pool)}
+    except Exception as e:
+        logger.error(f"[SniperMissedManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/sniper-clv-per-pick")
+async def admin_sniper_clv_per_pick():
+    """KODE 4: Don-lesbar CLV-tabell per pick (markdown + JSON)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import build_clv_per_pick
+        return await build_clv_per_pick(db_state.pool)
+    except Exception as e:
+        logger.error(f"[SniperCLVPerPick] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/sniper-kill-switch-resume")
+async def admin_sniper_kill_switch_resume():
+    """
+    KODE 5: manuelt resume etter kill-switch trigger. Setter
+    system_state.sniper_pick_gen_paused = 'false'. Bruker har ansvar for
+    å kun kjøre dette etter manuell verifisering av CLV-trend.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO system_state (key, value, updated_at)
+                VALUES ('sniper_pick_gen_paused', 'false', NOW())
+                ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = NOW();
+                """
+            )
+        logger.warning("[Sniper] kill-switch RESUMED via admin endpoint")
+        return {"status": "ok", "paused": False}
+    except Exception as e:
+        logger.error(f"[SniperResume] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/sniper-kill-switch-status")
+async def admin_sniper_kill_switch_status():
+    """KODE 5: read-only kill-switch state + siste 5-pick CLV-historikk."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import is_sniper_paused
+        paused = await is_sniper_paused(db_state.pool)
+        async with db_state.pool.acquire() as conn:
+            last_5 = await conn.fetch(
+                """
+                SELECT id, match_id,
+                       home_team || ' vs ' || away_team AS match,
+                       odds_open, odds_close, clv_close_pct,
+                       is_positive_clv_close, kickoff_time
+                FROM sniper_bets_v1
+                WHERE odds_close IS NOT NULL
+                  AND is_positive_clv_close IS NOT NULL
+                ORDER BY kickoff_time DESC
+                LIMIT 5;
+                """
+            )
+        rows = []
+        positive_count = 0
+        for r in last_5:
+            d = dict(r)
+            if d.get("kickoff_time"):
+                d["kickoff_time"] = d["kickoff_time"].isoformat()
+            for k in ("odds_open", "odds_close", "clv_close_pct"):
+                if d.get(k) is not None:
+                    d[k] = float(d[k])
+            if d.get("is_positive_clv_close"):
+                positive_count += 1
+            rows.append(d)
+        if len(rows) < 5:
+            verdict = "INSUFFICIENT_DATA"
+        elif positive_count <= 2:
+            verdict = "AUTO_STOP_TRIGGERED"
+        else:
+            verdict = "PASS"
+        return {
+            "paused": paused,
+            "last_5": rows,
+            "n_with_close": len(rows),
+            "positive_count": positive_count,
+            "verdict": verdict,
+        }
+    except Exception as e:
+        logger.error(f"[SniperKillSwitchStatus] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
