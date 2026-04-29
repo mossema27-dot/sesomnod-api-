@@ -11802,6 +11802,45 @@ async def admin_sniper_clv_per_pick():
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+@app.get("/admin/sniper-shadow-mismatches")
+async def admin_sniper_shadow_mismatches(window_days: int = 7, limit: int = 50):
+    """SHADOW MODE: read-only liste over loggede team-mismatches for research."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, detected_at, league, home_team_raw, away_team_raw,
+                       home_team_normalized, away_team_normalized,
+                       teams_in_model, fixture_id
+                FROM shadow_team_mismatches
+                WHERE detected_at > NOW() - ($1 || ' days')::interval
+                ORDER BY detected_at DESC
+                LIMIT $2;
+                """,
+                str(window_days), limit,
+            )
+        items = []
+        for r in rows:
+            d = dict(r)
+            if d.get("detected_at"):
+                d["detected_at"] = d["detected_at"].isoformat()
+            items.append(d)
+        by_league: dict[str, int] = {}
+        for it in items:
+            by_league[it.get("league") or "?"] = by_league.get(it.get("league") or "?", 0) + 1
+        return {
+            "n_mismatches": len(items),
+            "window_days": window_days,
+            "by_league_count": by_league,
+            "mismatches": items,
+        }
+    except Exception as e:
+        logger.error(f"[SniperShadowMismatches] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.post("/admin/sniper-kill-switch-resume")
 async def admin_sniper_kill_switch_resume():
     """
@@ -11841,9 +11880,10 @@ async def admin_sniper_kill_switch_status():
                 SELECT id, match_id,
                        home_team || ' vs ' || away_team AS match,
                        odds_open, odds_close, clv_close_pct,
-                       is_positive_clv_close, kickoff_time
+                       is_positive_clv_close, kickoff_time, market_tier
                 FROM sniper_bets_v1
-                WHERE odds_close IS NOT NULL
+                WHERE market_tier = 'PRIMARY'
+                  AND odds_close IS NOT NULL
                   AND is_positive_clv_close IS NOT NULL
                 ORDER BY kickoff_time DESC
                 LIMIT 5;

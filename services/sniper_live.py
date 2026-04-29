@@ -59,6 +59,33 @@ BIG5_LEAGUE_IDS = {
     61:  "Ligue 1",
 }
 
+# ── SHADOW MODE ─────────────────────────────────────────────────────────────
+# PRIMARY = BIG5_LEAGUE_IDS, edge ≥ EDGE_THRESHOLD (9%) — locked + calibrated.
+# SHADOW_BIG5 = Big5 men 5%-9% edge — calibrated, lower threshold, observer.
+# SHADOW_GLOBAL = Top-15 ligaer utenfor Big5, edge ≥9% — UNCALIBRATED, research.
+PRIMARY_LEAGUES = BIG5_LEAGUE_IDS
+EDGE_THRESHOLD_SHADOW_BIG5 = 0.05  # 5%
+
+# Liga-IDer hentet fra API-Football. Overlapp med PRIMARY filtreres bort.
+SHADOW_GLOBAL_LEAGUES = {
+    2:   "Champions League",
+    3:   "Europa League",
+    88:  "Eredivisie",
+    94:  "Primeira Liga",
+    79:  "Bundesliga 2",
+    136: "Serie B",
+    253: "MLS",
+    71:  "Brasiliansk Serie A",
+    128: "Argentinsk Primera",
+    262: "Liga MX",
+    40:  "Championship",
+    113: "Allsvenskan",
+    103: "Eliteserien",
+}
+
+SHADOW_DAILY_CAP = 50
+SHADOW_TIERS = ("SHADOW_BIG5", "SHADOW_GLOBAL")
+
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 
 
@@ -139,6 +166,29 @@ ALTER TABLE sniper_bets_v1
     ADD COLUMN IF NOT EXISTS t60_capture_minutes_before INT,
     ADD COLUMN IF NOT EXISTS close_capture_minutes_before INT;
 
+-- SHADOW MODE: tier-isolering (PRIMARY urørt, SHADOW for research)
+ALTER TABLE sniper_bets_v1
+    ADD COLUMN IF NOT EXISTS market_tier   TEXT DEFAULT 'PRIMARY',
+    ADD COLUMN IF NOT EXISTS is_calibrated BOOLEAN DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS shadow_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_sniper_market_tier
+    ON sniper_bets_v1(market_tier);
+
+CREATE TABLE IF NOT EXISTS shadow_team_mismatches (
+    id BIGSERIAL PRIMARY KEY,
+    detected_at TIMESTAMPTZ DEFAULT NOW(),
+    league TEXT,
+    home_team_raw TEXT,
+    away_team_raw TEXT,
+    home_team_normalized TEXT,
+    away_team_normalized TEXT,
+    teams_in_model BOOLEAN,
+    fixture_id TEXT,
+    UNIQUE(fixture_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_mismatch_detected
+    ON shadow_team_mismatches(detected_at);
+
 CREATE TABLE IF NOT EXISTS sniper_market_intelligence (
     id BIGSERIAL PRIMARY KEY,
     match_id TEXT NOT NULL,
@@ -182,6 +232,7 @@ SELECT
     t60_capture_minutes_before,
     close_capture_minutes_before,
     snapshot_failed_count,
+    market_tier, is_calibrated, shadow_reason,
     result,
     ROUND(profit_units::numeric, 2)   AS profit_units,
     fixture_status
@@ -432,8 +483,15 @@ async def _maybe_alert_first_picks(pool, payload: dict) -> bool:
     token = os.environ.get("TELEGRAM_TOKEN", "")
     intern_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
 
+    # SHADOW MODE: Don-alert KUN for PRIMARY-tier (calibrated edge ≥9% Big5).
+    # SHADOW_BIG5 + SHADOW_GLOBAL skal aldri sendes til Telegram.
+    if (payload.get("market_tier") or "PRIMARY") != "PRIMARY":
+        return False
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT COUNT(*) AS n FROM sniper_bets_v1")
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS n FROM sniper_bets_v1 "
+            "WHERE market_tier = 'PRIMARY';"
+        )
     n_total = int(row["n"]) if row else 0
 
     if n_total > ALERT_FIRST_N_PICKS:
@@ -471,12 +529,98 @@ async def _maybe_alert_first_picks(pool, payload: dict) -> bool:
         return False
 
 
+# ── SHADOW MODE HELPERS ─────────────────────────────────────────────────────
+def _classify_pick(league_id: int, edge: float) -> tuple[str, bool, str | None] | None:
+    """
+    Tier-klassifisering basert på liga + edge.
+
+    Returns (market_tier, is_calibrated, shadow_reason) eller None om pick
+    ikke kvalifiserer noen tier.
+    """
+    if league_id in PRIMARY_LEAGUES:
+        if edge >= EDGE_THRESHOLD:        # ≥9% — PRIMARY (urørt logikk)
+            return ("PRIMARY", True, None)
+        if edge >= EDGE_THRESHOLD_SHADOW_BIG5:  # 5% ≤ edge < 9% — SHADOW_BIG5
+            return ("SHADOW_BIG5", True, "BIG5_LOWER_EDGE")
+        return None
+    if league_id in SHADOW_GLOBAL_LEAGUES and league_id not in PRIMARY_LEAGUES:
+        if edge >= EDGE_THRESHOLD:  # ≥9% — SHADOW_GLOBAL (uncalibrated)
+            return ("SHADOW_GLOBAL", False, "GLOBAL_UNCALIBRATED")
+        return None
+    return None
+
+
+async def _shadow_picks_today_count(pool) -> int:
+    """Telle SHADOW-picks (begge tier) generert i dag UTC. Brukes for cap-check."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS n
+            FROM sniper_bets_v1
+            WHERE market_tier = ANY($1::TEXT[])
+              AND DATE(pick_timestamp AT TIME ZONE 'UTC')
+                  = DATE(NOW() AT TIME ZONE 'UTC');
+            """,
+            list(SHADOW_TIERS),
+        )
+    return int(row["n"]) if row else 0
+
+
+async def _log_team_mismatch(pool, *, fixture_id: str, league: str,
+                              home_raw: str, away_raw: str,
+                              home_norm: str, away_norm: str,
+                              teams_in_model: bool) -> None:
+    """Log SHADOW_GLOBAL team-mismatch. Idempotent via UNIQUE(fixture_id)."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO shadow_team_mismatches
+                    (fixture_id, league, home_team_raw, away_team_raw,
+                     home_team_normalized, away_team_normalized, teams_in_model)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (fixture_id) DO NOTHING;
+                """,
+                fixture_id, league, home_raw, away_raw,
+                home_norm, away_norm, teams_in_model,
+            )
+    except Exception as e:
+        logger.warning("[Sniper] mismatch log fail %s: %s", fixture_id, e)
+
+
+async def fetch_fixtures_for_leagues(date_str: str, season: int,
+                                      leagues_map: dict[int, str],
+                                      client: httpx.AsyncClient) -> list[dict]:
+    """Hent fixtures for arbitrary liga-map. Inkluderer _league_name + _league_id."""
+    fixtures: list[dict] = []
+    for league_id, league_name in leagues_map.items():
+        try:
+            r = await client.get(
+                f"{API_FOOTBALL_BASE}/fixtures",
+                headers=_api_headers(),
+                params={"date": date_str, "league": league_id, "season": season},
+            )
+            data = r.json().get("response") or []
+            for f in data:
+                f["_league_name"] = league_name
+                f["_league_id"] = league_id
+                fixtures.append(f)
+        except Exception as e:
+            logger.warning("[Sniper] fixtures fetch %s %s: %s",
+                           league_name, date_str, e)
+    return fixtures
+
+
 # ── PICK GENERATION ─────────────────────────────────────────────────────────
 async def generate_picks(pool, days_ahead: int = 2) -> dict:
     """
-    Hovedjobb. Itererer Big5-fixtures, predicter, henter Pinnacle-odds,
-    filtrerer på edge ≥9% + odds-range, kvarantenerer edge >30%,
-    lagrer til sniper_bets_v1.
+    Hovedjobb. Tre-tier pick generation:
+      PRIMARY      — Big5 + edge ≥9% (urørt original logikk, calibrated)
+      SHADOW_BIG5  — Big5 + 5% ≤ edge < 9% (calibrated, observer)
+      SHADOW_GLOBAL — Top-15 ligaer utenfor Big5 + edge ≥9% (UNCALIBRATED)
+
+    SHADOW har dagligs cap 50 picks. PRIMARY er aldri cappet.
+    Telegram-alerts kun for PRIMARY. Kill-switch leser kun PRIMARY.
     """
     from services.dixon_coles_engine import get_dixon_coles_probs
 
@@ -495,6 +639,14 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
     today = datetime.now(timezone.utc).date()
     season = _compute_season(today)
 
+    # SHADOW daily cap-check (PRIMARY har egen MAX_PICKS_PER_DAY = 5)
+    try:
+        shadow_today_initial = await _shadow_picks_today_count(pool)
+    except Exception as e:
+        logger.warning("[Sniper] shadow-cap query failed: %s", e)
+        shadow_today_initial = 0
+    shadow_today = shadow_today_initial
+
     stats = {
         "fixtures_scanned": 0,
         "no_pinnacle_odds": 0,
@@ -503,19 +655,34 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
         "low_edge": 0,
         "quarantined_high_edge": 0,
         "picks_created": 0,
+        "primary_created": 0,
+        "shadow_big5_created": 0,
+        "shadow_global_created": 0,
+        "shadow_team_mismatches_logged": 0,
+        "shadow_cap_skipped": 0,
+        "shadow_today_initial": shadow_today_initial,
         "ah_intel_logged": 0,
         "alerts_sent": 0,
     }
 
+    # Kombinert liga-map: PRIMARY + SHADOW_GLOBAL (PRIMARY-IDer overskriver
+    # SHADOW-IDer om de skulle overlappe, så PRIMARY-klassifisering vinner).
+    combined_leagues = {**SHADOW_GLOBAL_LEAGUES, **PRIMARY_LEAGUES}
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         for offset in range(days_ahead + 1):
             date_str = (today + timedelta(days=offset)).isoformat()
-            fixtures = await fetch_big5_fixtures(date_str, season, client)
+            fixtures = await fetch_fixtures_for_leagues(
+                date_str, season, combined_leagues, client,
+            )
 
             for fix in fixtures:
                 stats["fixtures_scanned"] += 1
                 fix_id = (fix.get("fixture") or {}).get("id")
                 if not fix_id:
+                    continue
+                league_id = fix.get("_league_id")
+                if league_id is None:
                     continue
 
                 kickoff_iso = (fix.get("fixture") or {}).get("date")
@@ -525,6 +692,12 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                 home_norm = _norm_team(home_raw)
                 away_norm = _norm_team(away_raw)
                 league_name = fix.get("_league_name") or ""
+                is_primary_league = league_id in PRIMARY_LEAGUES
+
+                # SHADOW cap-check FØR vi forbruker odds-quota (kun for shadow leagues)
+                if not is_primary_league and shadow_today >= SHADOW_DAILY_CAP:
+                    stats["shadow_cap_skipped"] += 1
+                    continue
 
                 odds_response = await fetch_fixture_odds(fix_id, client)
                 odds_open, market_payload = _parse_pinnacle_over_25(odds_response)
@@ -561,12 +734,26 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                     stats["outside_odds_range"] += 1
                     continue
 
+                # ── DC PREDICT ──
+                fallback_used = False
                 try:
                     market_implied_home = 0.5  # placeholder for fallback-arg
                     dc_result = await get_dixon_coles_probs(
                         home_norm, away_norm, market_implied_home,
                     )
-                    if dc_result.fallback_used:
+                    fallback_used = bool(dc_result.fallback_used)
+                    if fallback_used:
+                        # SHADOW_GLOBAL: log mismatch (uncalibrated team).
+                        # PRIMARY/SHADOW_BIG5 (Big5): bare counter.
+                        if not is_primary_league:
+                            await _log_team_mismatch(
+                                pool,
+                                fixture_id=str(fix_id), league=league_name,
+                                home_raw=home_raw, away_raw=away_raw,
+                                home_norm=home_norm, away_norm=away_norm,
+                                teams_in_model=False,
+                            )
+                            stats["shadow_team_mismatches_logged"] += 1
                         stats["model_predict_failed"] += 1
                         continue
                     prob_over_25 = float(dc_result.over_25)
@@ -577,21 +764,40 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                 except Exception as e:
                     logger.warning("[Sniper] DC predict %s vs %s: %s",
                                    home_norm, away_norm, e)
+                    if not is_primary_league:
+                        await _log_team_mismatch(
+                            pool,
+                            fixture_id=str(fix_id), league=league_name,
+                            home_raw=home_raw, away_raw=away_raw,
+                            home_norm=home_norm, away_norm=away_norm,
+                            teams_in_model=False,
+                        )
+                        stats["shadow_team_mismatches_logged"] += 1
                     stats["model_predict_failed"] += 1
                     continue
 
                 implied = 1.0 / odds_open
                 edge = prob_over_25 - implied
 
-                if edge < EDGE_THRESHOLD:
+                # ── TIER-KLASSIFISERING ──
+                classification = _classify_pick(league_id, edge)
+                if classification is None:
                     stats["low_edge"] += 1
                     continue
+                market_tier, is_calibrated, shadow_reason = classification
+
+                # Quarantine gjelder ALLE tiers (>30% edge = bug-signal)
                 if edge > EDGE_QUARANTINE:
                     logger.warning(
-                        "[Sniper] QUARANTINE edge=%.1f%% on %s vs %s — verifiser model + odds",
-                        edge * 100, home_norm, away_norm,
+                        "[Sniper] QUARANTINE edge=%.1f%% on %s vs %s tier=%s — verifiser",
+                        edge * 100, home_norm, away_norm, market_tier,
                     )
                     stats["quarantined_high_edge"] += 1
+                    continue
+
+                # SHADOW cap re-check (kan ha blitt nådd mid-loop fra parallelle inserts)
+                if market_tier in SHADOW_TIERS and shadow_today >= SHADOW_DAILY_CAP:
+                    stats["shadow_cap_skipped"] += 1
                     continue
 
                 # asyncpg krever datetime-objekt for TIMESTAMPTZ, ikke ISO-string
@@ -617,12 +823,13 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                     "lambda_total": lambda_total,
                     "odds_open": odds_open,
                     "odds_open_timestamp": now_dt,
+                    "market_tier": market_tier,
+                    "is_calibrated": is_calibrated,
+                    "shadow_reason": shadow_reason,
                 }
 
                 async with pool.acquire() as conn:
-                    # BUG 4 fix: ON CONFLICT DO NOTHING (ikke DO UPDATE) garanterer
-                    # at catchup-jobs IKKE overskriver odds_open når picken allerede
-                    # er logget av primary 06:30-jobben. Original-pris bevares.
+                    # ON CONFLICT DO NOTHING bevarer odds_open ved catchup-runs.
                     inserted = await conn.fetchrow(
                         """
                         INSERT INTO sniper_bets_v1
@@ -630,12 +837,12 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                              market, model_prob, market_implied_prob, edge_pct,
                              lambda_total,
                              odds_open, odds_open_timestamp, odds_open_source,
-                             result)
+                             result, market_tier, is_calibrated, shadow_reason)
                         VALUES ($1, $2, $3, $4, $5,
                                 'OVER_2_5', $6, $7, $8,
                                 $9,
                                 $10, $11, 'pinnacle',
-                                'PENDING')
+                                'PENDING', $12, $13, $14)
                         ON CONFLICT (match_id, market) DO NOTHING
                         RETURNING id;
                         """,
@@ -645,14 +852,27 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                         payload["model_prob"], payload["market_implied_prob"],
                         payload["edge_pct"], payload["lambda_total"],
                         payload["odds_open"], payload["odds_open_timestamp"],
+                        payload["market_tier"], payload["is_calibrated"],
+                        payload["shadow_reason"],
                     )
                 if inserted:
                     stats["picks_created"] += 1
-                    if await _maybe_alert_first_picks(pool, payload):
-                        stats["alerts_sent"] += 1
-                    if stats["picks_created"] >= MAX_PICKS_PER_DAY:
-                        logger.info("[Sniper] MAX_PICKS_PER_DAY reached")
-                        return stats
+                    if market_tier == "PRIMARY":
+                        stats["primary_created"] += 1
+                        if await _maybe_alert_first_picks(pool, payload):
+                            stats["alerts_sent"] += 1
+                        if stats["primary_created"] >= MAX_PICKS_PER_DAY:
+                            logger.info(
+                                "[Sniper] PRIMARY MAX_PICKS_PER_DAY (%d) reached",
+                                MAX_PICKS_PER_DAY,
+                            )
+                            return stats
+                    elif market_tier == "SHADOW_BIG5":
+                        stats["shadow_big5_created"] += 1
+                        shadow_today += 1
+                    elif market_tier == "SHADOW_GLOBAL":
+                        stats["shadow_global_created"] += 1
+                        shadow_today += 1
 
     return stats
 
@@ -1004,12 +1224,15 @@ async def check_don_kill_switch(pool) -> dict:
 
     Skriver system_state.sniper_pick_gen_paused = 'true' og logger CRITICAL.
     """
+    # SHADOW MODE: kill-switch leser KUN PRIMARY-tier. SHADOW skal aldri
+    # påvirke pause-flagget — det er research, ikke styringssignal.
     async with pool.acquire() as conn:
         last_5 = await conn.fetch(
             """
             SELECT id, match_id, is_positive_clv_close
             FROM sniper_bets_v1
-            WHERE odds_close IS NOT NULL
+            WHERE market_tier = 'PRIMARY'
+              AND odds_close IS NOT NULL
               AND is_positive_clv_close IS NOT NULL
             ORDER BY kickoff_time DESC
             LIMIT 5;
@@ -1273,11 +1496,13 @@ async def run_pre_flight_test(pool, pick_id_override: int | None = None) -> dict
                 INSERT INTO sniper_bets_v1
                     (match_id, league, home_team, away_team, kickoff_time, market,
                      model_prob, market_implied_prob, edge_pct, lambda_total,
-                     odds_open, odds_open_timestamp, odds_open_source, result)
+                     odds_open, odds_open_timestamp, odds_open_source, result,
+                     market_tier, is_calibrated, shadow_reason)
                 VALUES
                     ($1, 'TEST', 'TEST_HOME', 'TEST_AWAY', $2, 'OVER_2_5',
                      0.6, 0.5405, 5.95, 2.5,
-                     $3, $4, 'pre_flight_mock', 'PENDING')
+                     $3, $4, 'pre_flight_mock', 'PENDING',
+                     'TEST', FALSE, 'PRE_FLIGHT_TEST_ROW')
                 RETURNING id;
                 """,
                 test_match_id, t60_kickoff,
@@ -1498,7 +1723,10 @@ async def build_clv_per_pick(pool) -> dict:
 
 # ── KILL-SWITCHES (3-trinns CLV-validation) ─────────────────────────────────
 async def check_kill_switches(pool) -> dict:
-    """Etter 5+ settled close-picks: vurder kill-switch-status."""
+    """
+    Etter 5+ settled close-picks: vurder kill-switch-status.
+    SHADOW MODE: leser KUN PRIMARY-tier — SHADOW er research, ikke trigger.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -1508,7 +1736,8 @@ async def check_kill_switches(pool) -> dict:
                 COUNT(*) FILTER (WHERE result IN ('WIN', 'LOSS')) AS n_settled,
                 SUM(profit_units) FILTER (WHERE result IN ('WIN', 'LOSS')) AS total_profit,
                 AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv
-            FROM sniper_bets_v1;
+            FROM sniper_bets_v1
+            WHERE market_tier = 'PRIMARY';
             """
         )
     n_close = int(row["n_with_close"] or 0)
@@ -1548,10 +1777,10 @@ async def check_kill_switches(pool) -> dict:
 
 
 # ── DASHBOARD ───────────────────────────────────────────────────────────────
-async def build_sniper_dashboard(pool, window_days: int = 30) -> dict:
-    """Aggregat over sniper_bets_v1 for dashboard."""
+async def _summarize_tier(pool, tier: str, window_days: int) -> dict:
+    """Aggregat per tier. Brukes 3 ganger fra build_sniper_dashboard."""
     async with pool.acquire() as conn:
-        summary = await conn.fetchrow(
+        s = await conn.fetchrow(
             """
             SELECT
                 COUNT(*) AS picks_total,
@@ -1564,20 +1793,62 @@ async def build_sniper_dashboard(pool, window_days: int = 30) -> dict:
                 SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS')) AS total_profit,
                 AVG(edge_pct) AS avg_edge_pct
             FROM sniper_bets_v1
-            WHERE pick_timestamp > NOW() - ($1 || ' days')::interval;
+            WHERE market_tier = $1
+              AND pick_timestamp > NOW() - ($2 || ' days')::interval;
             """,
-            str(window_days),
+            tier, str(window_days),
         )
+    s = dict(s) if s else {}
+    settled = int(s.get("picks_settled") or 0)
+    wins = int(s.get("wins") or 0)
+    pclose = int(s.get("picks_with_close") or 0)
+    pos = int(s.get("positive_clv") or 0)
+    profit = float(s.get("total_profit") or 0)
+    return {
+        "picks_total":         int(s.get("picks_total") or 0),
+        "picks_settled":       settled,
+        "picks_with_close":    pclose,
+        "wins":                wins,
+        "losses":              int(s.get("losses") or 0),
+        "win_rate_pct":        round(wins / settled * 100, 1) if settled > 0 else 0,
+        "roi_pct":             round(profit / settled * 100, 2) if settled > 0 else 0,
+        "total_profit_units":  round(profit, 2),
+        "positive_clv_close":  pos,
+        "positive_clv_pct":    round(pos / pclose * 100, 1) if pclose > 0 else 0,
+        "avg_clv_close_pct":   round(float(s["avg_clv"]), 2)
+                                if s.get("avg_clv") is not None else None,
+        "avg_edge_pct":        round(float(s["avg_edge_pct"]), 2)
+                                if s.get("avg_edge_pct") is not None else None,
+    }
+
+
+async def build_sniper_dashboard(pool, window_days: int = 30) -> dict:
+    """
+    SHADOW MODE: 3-veis tier-split + team-mismatch-counter.
+
+    PRIMARY      = locked, calibrated, kunde-leveranse-grunnlag.
+    SHADOW_BIG5  = calibrated observer (Big5 5%-9% edge).
+    SHADOW_GLOBAL = UNCALIBRATED research (Top-15 utenfor Big5).
+
+    Eksisterende "summary"/"by_league"/"recent_picks" beholdes som
+    PRIMARY-only for backward kompatibilitet med curl-clients.
+    """
+    primary = await _summarize_tier(pool, "PRIMARY",       window_days)
+    sh_big5 = await _summarize_tier(pool, "SHADOW_BIG5",   window_days)
+    sh_glob = await _summarize_tier(pool, "SHADOW_GLOBAL", window_days)
+
+    async with pool.acquire() as conn:
         by_league = await conn.fetch(
             """
-            SELECT league, COUNT(*) AS n,
+            SELECT market_tier, league, COUNT(*) AS n,
                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
                    AVG(edge_pct) AS avg_edge,
                    AVG(clv_close_pct) AS avg_clv
             FROM sniper_bets_v1
             WHERE pick_timestamp > NOW() - ($1 || ' days')::interval
-            GROUP BY league
-            ORDER BY n DESC;
+              AND market_tier IN ('PRIMARY', 'SHADOW_BIG5', 'SHADOW_GLOBAL')
+            GROUP BY market_tier, league
+            ORDER BY market_tier, n DESC;
             """,
             str(window_days),
         )
@@ -1587,41 +1858,64 @@ async def build_sniper_dashboard(pool, window_days: int = 30) -> dict:
                    model_prob, market_implied_prob, edge_pct,
                    odds_open, odds_t60, odds_close,
                    clv_close_pct, is_positive_clv_close,
-                   result, profit_units
+                   result, profit_units, market_tier
             FROM sniper_bets_v1
+            WHERE market_tier = 'PRIMARY'
             ORDER BY pick_timestamp DESC
             LIMIT 10;
             """
         )
-
-    s = dict(summary) if summary else {}
-    settled = int(s.get("picks_settled") or 0)
-    wins = int(s.get("wins") or 0)
-    pclose = int(s.get("picks_with_close") or 0)
-    pos = int(s.get("positive_clv") or 0)
-    profit = float(s.get("total_profit") or 0)
-
-    summary_out = {
-        "picks_total": int(s.get("picks_total") or 0),
-        "picks_settled": settled,
-        "picks_with_close": pclose,
-        "wins": wins,
-        "losses": int(s.get("losses") or 0),
-        "win_rate_pct": round(wins / settled * 100, 1) if settled > 0 else 0,
-        "roi_pct": round(profit / settled * 100, 2) if settled > 0 else 0,
-        "total_profit_units": round(profit, 2),
-        "positive_clv_close": pos,
-        "positive_clv_pct": round(pos / pclose * 100, 1) if pclose > 0 else 0,
-        "avg_clv_close_pct": round(float(s["avg_clv"]), 2) if s.get("avg_clv") is not None else None,
-        "avg_edge_pct": round(float(s["avg_edge_pct"]), 2) if s.get("avg_edge_pct") is not None else None,
-    }
+        mismatch_today = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM shadow_team_mismatches
+            WHERE DATE(detected_at AT TIME ZONE 'UTC')
+                  = DATE(NOW() AT TIME ZONE 'UTC');
+            """
+        )
+        mismatch_window = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM shadow_team_mismatches
+            WHERE detected_at > NOW() - ($1 || ' days')::interval;
+            """,
+            str(window_days),
+        )
+        shadow_today = await _shadow_picks_today_count(pool)
 
     kill = await check_kill_switches(pool)
 
     return {
         "computed_at": datetime.now(timezone.utc).isoformat(),
         "window_days": window_days,
-        "summary": summary_out,
+        # ── 3-veis split ────────────────────────────────────────
+        "primary": {
+            **primary,
+            "calibrated": True,
+            "is_strategic": True,
+            "kill_switch_status": kill,
+        },
+        "shadow_big5": {
+            **sh_big5,
+            "calibrated": True,
+            "is_strategic": False,
+            "note": "Observer-tier — Big5 med 5%-9% edge",
+        },
+        "shadow_global": {
+            **sh_glob,
+            "calibrated": False,
+            "is_strategic": False,
+            "warning": "UNCALIBRATED — bruker ikke for strategisk beslutning",
+        },
+        "shadow_cap": {
+            "limit_per_day":  SHADOW_DAILY_CAP,
+            "shadow_today":   shadow_today,
+            "remaining":      max(0, SHADOW_DAILY_CAP - shadow_today),
+        },
+        "team_mismatches": {
+            "today":         int(mismatch_today or 0),
+            "window_days":   int(mismatch_window or 0),
+        },
+        # ── Backward-kompat (PRIMARY-only) ───────────────────────
+        "summary": primary,
         "by_league": [dict(r) for r in by_league],
         "recent_picks": [dict(r) for r in recent],
         "kill_switch_status": kill,
