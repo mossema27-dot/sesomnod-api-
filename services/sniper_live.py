@@ -1147,13 +1147,18 @@ async def _verify_timezone(pool) -> dict:
                 NOW()::TEXT                      AS now_raw;
             """
         )
-    server_tz = (row["server_tz"] or "").upper()
-    verdict = "PASS" if server_tz == "UTC" else "FAIL"
+    server_tz_raw = row["server_tz"] or ""
+    server_tz = server_tz_raw.upper()
+    # Etc/UTC og UTC er IANA-aliaser med identisk offset (+00:00, ingen DST).
+    # Postgres returnerer ofte 'Etc/UTC' som canonical via tzdata.
+    is_utc = server_tz in ("UTC", "ETC/UTC")
+    verdict = "PASS" if is_utc else "FAIL"
     return {
         "verdict": verdict,
-        "server_tz": row["server_tz"],
+        "server_tz": server_tz_raw,
         "server_now_utc": row["server_now_utc"],
         "now_raw": row["now_raw"],
+        "accepted_aliases": ["UTC", "Etc/UTC"],
     }
 
 
