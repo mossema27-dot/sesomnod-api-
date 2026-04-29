@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS don_morning_reports (
 );
 
 -- PROFIT-MASKIN: KODE 2 — CLV breakdown by tier × edge_bucket × odds_bucket
+DROP VIEW IF EXISTS sniper_clv_breakdown;
 CREATE OR REPLACE VIEW sniper_clv_breakdown AS
 SELECT
     market_tier, league,
@@ -278,6 +279,10 @@ CREATE TABLE IF NOT EXISTS system_state (
 );
 
 -- KODE 4: per-pick CLV view (Don-lesbar)
+-- DROP-then-CREATE for å håndtere column-order-endringer (CREATE OR REPLACE
+-- VIEW i Postgres tillater kun append av nye kolonner på slutten, ikke
+-- reordering eller insertion mellom eksisterende).
+DROP VIEW IF EXISTS sniper_clv_per_pick;
 CREATE OR REPLACE VIEW sniper_clv_per_pick AS
 SELECT
     id, match_id, league,
