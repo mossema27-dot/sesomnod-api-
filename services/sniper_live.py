@@ -189,6 +189,74 @@ CREATE TABLE IF NOT EXISTS shadow_team_mismatches (
 CREATE INDEX IF NOT EXISTS idx_shadow_mismatch_detected
     ON shadow_team_mismatches(detected_at);
 
+-- PROFIT-MASKIN: KODE 1 — CLV-decisions (PROPOSALS, ikke auto-execute)
+CREATE TABLE IF NOT EXISTS clv_decisions (
+    id BIGSERIAL PRIMARY KEY,
+    decision_timestamp TIMESTAMPTZ DEFAULT NOW(),
+    primary_decision TEXT,
+    shadow_big5_decision TEXT,
+    shadow_global_decisions JSONB,
+    metadata JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_clv_decisions_ts
+    ON clv_decisions(decision_timestamp DESC);
+
+-- PROFIT-MASKIN: KODE 3 — expected ROI (CLV-proxy for ROI)
+ALTER TABLE sniper_bets_v1
+    ADD COLUMN IF NOT EXISTS expected_roi_pct FLOAT;
+
+-- PROFIT-MASKIN: KODE 5 (deferred) — Grok-context flagg
+ALTER TABLE sniper_bets_v1
+    ADD COLUMN IF NOT EXISTS grok_context_pending BOOLEAN DEFAULT TRUE;
+
+-- PROFIT-MASKIN: KODE 6 — morgen-rapport (Don-lesbar)
+CREATE TABLE IF NOT EXISTS don_morning_reports (
+    id BIGSERIAL PRIMARY KEY,
+    report_date DATE UNIQUE,
+    generated_at TIMESTAMPTZ DEFAULT NOW(),
+    report_markdown TEXT,
+    summary_json JSONB
+);
+
+-- PROFIT-MASKIN: KODE 2 — CLV breakdown by tier × edge_bucket × odds_bucket
+CREATE OR REPLACE VIEW sniper_clv_breakdown AS
+SELECT
+    market_tier, league,
+    CASE
+        WHEN edge_pct < 7  THEN '5-7%'
+        WHEN edge_pct < 9  THEN '7-9%'
+        WHEN edge_pct < 12 THEN '9-12%'
+        ELSE                    '12%+'
+    END AS edge_bucket,
+    CASE
+        WHEN odds_open < 1.6 THEN '1.40-1.60'
+        WHEN odds_open < 1.9 THEN '1.60-1.90'
+        WHEN odds_open < 2.2 THEN '1.90-2.20'
+        ELSE                      '2.20-2.50'
+    END AS odds_bucket,
+    COUNT(*) FILTER (WHERE odds_close IS NOT NULL) AS n_with_close,
+    ROUND(
+        AVG(clv_close_pct) FILTER (WHERE odds_close IS NOT NULL)::numeric,
+        2
+    ) AS avg_clv,
+    ROUND(
+        COUNT(*) FILTER (WHERE is_positive_clv_close = TRUE) * 100.0
+        / NULLIF(COUNT(*) FILTER (WHERE odds_close IS NOT NULL), 0)::numeric,
+        1
+    ) AS pct_positive_clv,
+    ROUND(
+        AVG(expected_roi_pct) FILTER (WHERE expected_roi_pct IS NOT NULL)::numeric,
+        2
+    ) AS avg_expected_roi_pct,
+    COUNT(*) FILTER (WHERE result = 'WIN')                  AS wins,
+    COUNT(*) FILTER (WHERE result IN ('WIN', 'LOSS'))       AS settled,
+    ROUND(SUM(profit_units)::numeric, 2)                     AS total_profit
+FROM sniper_bets_v1
+WHERE market_tier IN ('PRIMARY', 'SHADOW_BIG5', 'SHADOW_GLOBAL')
+GROUP BY market_tier, league, edge_bucket, odds_bucket
+HAVING COUNT(*) FILTER (WHERE odds_close IS NOT NULL) > 0
+ORDER BY market_tier, avg_clv DESC NULLS LAST;
+
 CREATE TABLE IF NOT EXISTS sniper_market_intelligence (
     id BIGSERIAL PRIMARY KEY,
     match_id TEXT NOT NULL,
@@ -959,6 +1027,10 @@ async def _capture_close(pool, row: dict, late: bool, client: httpx.AsyncClient)
         return "failed_no_pinnacle" if not status["pinnacle_present"] else "failed_no_odds"
     clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
     is_positive = new_odds < float(row["odds_open"])
+    # KODE 3: expected_roi_pct = (odds_open / odds_close - 1) * 100
+    # Tolkning: "hva ville vi tjent hvis vi solgte tilbake til close-odds?"
+    # Positiv = vi var tidlig på riktig side av sharp money.
+    expected_roi = (float(row["odds_open"]) / new_odds - 1.0) * 100.0
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -969,10 +1041,12 @@ async def _capture_close(pool, row: dict, late: bool, client: httpx.AsyncClient)
                 pinnacle_markets_at_close = $5,
                 close_late_capture = $6,
                 close_capture_minutes_before = $7,
+                expected_roi_pct = $8,
                 updated_at = NOW()
-            WHERE id = $8;
+            WHERE id = $9;
             """,
-            new_odds, now, clv, is_positive, bets_blob, late, minutes_before, row["id"],
+            new_odds, now, clv, is_positive, bets_blob, late, minutes_before,
+            expected_roi, row["id"],
         )
     return "updated"
 
@@ -1422,6 +1496,7 @@ async def _capture_close_mock(pool, pick_id: int, kickoff_time: datetime,
     minutes_before = _minutes_before_kickoff(now, kickoff_time)
     clv = _expected_clv_pct(odds_open, mock_new_odds)
     is_positive = mock_new_odds < odds_open
+    expected_roi = (odds_open / mock_new_odds - 1.0) * 100.0
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -1432,18 +1507,20 @@ async def _capture_close_mock(pool, pick_id: int, kickoff_time: datetime,
                 pinnacle_markets_at_close = $5,
                 close_late_capture = FALSE,
                 close_capture_minutes_before = $6,
+                expected_roi_pct = $7,
                 updated_at = NOW()
-            WHERE id = $7;
+            WHERE id = $8;
             """,
             mock_new_odds, now, clv, is_positive,
             json.dumps([{"name": "Goals Over/Under", "values_count": 1}]),
-            minutes_before, pick_id,
+            minutes_before, expected_roi, pick_id,
         )
     return {
         "now_utc": now.isoformat(),
         "minutes_before": minutes_before,
         "expected_clv_pct": round(clv, 4),
         "expected_is_positive": is_positive,
+        "expected_roi_pct": round(expected_roi, 4),
     }
 
 
@@ -1820,6 +1897,488 @@ async def _summarize_tier(pool, tier: str, window_days: int) -> dict:
         "avg_edge_pct":        round(float(s["avg_edge_pct"]), 2)
                                 if s.get("avg_edge_pct") is not None else None,
     }
+
+
+# ── PROFIT-MASKIN: KODE 4 — Wilson lower bound (statistisk signifikans) ─────
+import math
+
+
+def compute_wilson_lower_bound(
+    positive_count: int, total: int, confidence: float = 0.95,
+) -> float:
+    """
+    Wilson score interval — robust lower bound for proportions med liten n.
+    Forhindrer false positive ved multiple comparisons (13 ligaer × random).
+
+    Returnerer 0.0 hvis total <= 0.
+    Confidence 0.95 → z=1.96. 0.99 → z=2.576.
+    """
+    if total <= 0:
+        return 0.0
+    if confidence >= 0.99:
+        z = 2.576
+    elif confidence >= 0.975:
+        z = 2.241
+    elif confidence >= 0.95:
+        z = 1.96
+    else:
+        z = 1.645  # 0.90
+    p = positive_count / total
+    denom = 1.0 + (z * z) / total
+    centre = p + (z * z) / (2.0 * total)
+    margin = z * math.sqrt(
+        (p * (1.0 - p) + (z * z) / (4.0 * total)) / total
+    )
+    return max(0.0, (centre - margin) / denom)
+
+
+# ── PROFIT-MASKIN: KODE 1 — CLV beslutningsmotor (PROPOSALS) ────────────────
+DECISION_PRIMARY_MIN_N         = 20
+DECISION_SHADOW_BIG5_MIN_N     = 30
+DECISION_SHADOW_GLOBAL_MIN_N   = 50
+DECISION_NEGATIVE_LEAGUE_MIN_N = 100
+DECISION_AUTO_STOP_MIN_N       = 20
+DECISION_SUSPEND_BIG5_MIN_N    = 50
+
+
+async def _tier_clv_aggregate(pool, tier: str) -> dict:
+    """Aggregat for decision-engine. Returnerer n_with_close, avg_clv, pct_positive."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE odds_close IS NOT NULL) AS n_with_close,
+                COUNT(*) FILTER (WHERE is_positive_clv_close = TRUE) AS n_positive,
+                AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv,
+                AVG(expected_roi_pct) FILTER (WHERE expected_roi_pct IS NOT NULL)
+                    AS avg_expected_roi
+            FROM sniper_bets_v1
+            WHERE market_tier = $1;
+            """,
+            tier,
+        )
+    n = int(row["n_with_close"] or 0)
+    pos = int(row["n_positive"] or 0)
+    return {
+        "n_with_close": n,
+        "n_positive": pos,
+        "avg_clv": float(row["avg_clv"]) if row["avg_clv"] is not None else None,
+        "avg_expected_roi": float(row["avg_expected_roi"])
+                            if row["avg_expected_roi"] is not None else None,
+        "pct_positive_clv": round(pos / n * 100, 1) if n > 0 else None,
+        "wilson_lb_95": round(
+            compute_wilson_lower_bound(pos, n, 0.95) * 100, 1
+        ) if n > 0 else None,
+    }
+
+
+async def _shadow_global_per_league(pool) -> list[dict]:
+    """Per-liga aggregat for SHADOW_GLOBAL — input til Wilson + decision."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                league,
+                COUNT(*) FILTER (WHERE odds_close IS NOT NULL) AS n_with_close,
+                COUNT(*) FILTER (WHERE is_positive_clv_close = TRUE) AS n_positive,
+                AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv,
+                AVG(expected_roi_pct) FILTER (WHERE expected_roi_pct IS NOT NULL)
+                    AS avg_expected_roi
+            FROM sniper_bets_v1
+            WHERE market_tier = 'SHADOW_GLOBAL'
+            GROUP BY league
+            ORDER BY n_with_close DESC;
+            """
+        )
+    out = []
+    for r in rows:
+        n = int(r["n_with_close"] or 0)
+        pos = int(r["n_positive"] or 0)
+        out.append({
+            "league": r["league"],
+            "n_with_close": n,
+            "n_positive": pos,
+            "avg_clv": float(r["avg_clv"]) if r["avg_clv"] is not None else None,
+            "avg_expected_roi": float(r["avg_expected_roi"])
+                                if r["avg_expected_roi"] is not None else None,
+            "pct_positive_clv": round(pos / n * 100, 1) if n > 0 else None,
+            "wilson_lb_95": round(
+                compute_wilson_lower_bound(pos, n, 0.95) * 100, 1
+            ) if n > 0 else None,
+        })
+    return out
+
+
+def _classify_primary_decision(agg: dict) -> str:
+    """PRIMARY decision-rules. Returnerer decision-streng."""
+    n = agg.get("n_with_close") or 0
+    if n < DECISION_PRIMARY_MIN_N:
+        return "INSUFFICIENT_DATA"
+    avg_clv = agg.get("avg_clv")
+    pos_pct = agg.get("pct_positive_clv")
+    if avg_clv is not None and avg_clv > 0 and pos_pct is not None and pos_pct >= 55.0:
+        return "SCALE_VOLUME_PROPOSAL"
+    if avg_clv is not None and avg_clv < 0 and n >= DECISION_AUTO_STOP_MIN_N:
+        return "CONSIDER_AUTO_STOP"
+    return "CONTINUE_OBSERVE"
+
+
+def _classify_shadow_big5_decision(agg: dict) -> str:
+    """SHADOW_BIG5 decision-rules."""
+    n = agg.get("n_with_close") or 0
+    if n < DECISION_SHADOW_BIG5_MIN_N:
+        return "INSUFFICIENT_DATA"
+    avg_clv = agg.get("avg_clv")
+    pos_pct = agg.get("pct_positive_clv")
+    if avg_clv is not None and avg_clv > 0 and pos_pct is not None and pos_pct >= 55.0:
+        return "PROMOTE_TO_PRIMARY_LOWER_THRESHOLD"
+    if avg_clv is not None and avg_clv < -1.0 and n >= DECISION_SUSPEND_BIG5_MIN_N:
+        return "SUSPEND_BIG5_LOW_EDGE"
+    return "CONTINUE_OBSERVE"
+
+
+def _classify_shadow_global_decisions(per_league: list[dict]) -> list[dict]:
+    """Per-liga decisions for SHADOW_GLOBAL. Wilson lower bound > 50% kreves
+    for promotion (forhindrer multiple-comparisons false positive)."""
+    out = []
+    for league_agg in per_league:
+        n = league_agg.get("n_with_close") or 0
+        decision = "INSUFFICIENT_DATA"
+        if n >= DECISION_SHADOW_GLOBAL_MIN_N:
+            wilson = league_agg.get("wilson_lb_95")
+            avg_clv = league_agg.get("avg_clv")
+            if wilson is not None and wilson > 50.0:
+                decision = "TRIGGER_FORCE_EDGE_DISCOVERY_2"
+            elif (n >= DECISION_NEGATIVE_LEAGUE_MIN_N
+                  and avg_clv is not None and avg_clv < -1.0):
+                decision = "NEGATIVE_LEAGUE_FLAGGED"
+            else:
+                decision = "CONTINUE_OBSERVE"
+        out.append({**league_agg, "decision": decision})
+    return out
+
+
+async def evaluate_clv_decision_layer(pool) -> dict:
+    """
+    KODE 1: Beslutningsmotor — genererer PROPOSALS (ikke auto-execute).
+
+    Don evaluerer via /admin/clv-decisions før noen action tas.
+    Lagrer hver kjøring i clv_decisions for historikk.
+    """
+    primary_agg = await _tier_clv_aggregate(pool, "PRIMARY")
+    sh_big5_agg = await _tier_clv_aggregate(pool, "SHADOW_BIG5")
+    sh_global_per_league = await _shadow_global_per_league(pool)
+
+    primary_decision     = _classify_primary_decision(primary_agg)
+    shadow_big5_decision = _classify_shadow_big5_decision(sh_big5_agg)
+    shadow_global_list   = _classify_shadow_global_decisions(sh_global_per_league)
+
+    actionable_global = [
+        d for d in shadow_global_list
+        if d["decision"] not in ("INSUFFICIENT_DATA", "CONTINUE_OBSERVE")
+    ]
+
+    metadata = {
+        "primary_aggregate":        primary_agg,
+        "shadow_big5_aggregate":    sh_big5_agg,
+        "shadow_global_n_leagues":  len(sh_global_per_league),
+        "actionable_global_count":  len(actionable_global),
+        "thresholds": {
+            "primary_min_n":         DECISION_PRIMARY_MIN_N,
+            "shadow_big5_min_n":     DECISION_SHADOW_BIG5_MIN_N,
+            "shadow_global_min_n":   DECISION_SHADOW_GLOBAL_MIN_N,
+            "wilson_confidence":     0.95,
+            "wilson_promote_pct":    50.0,
+        },
+    }
+
+    async with pool.acquire() as conn:
+        decision_id = await conn.fetchval(
+            """
+            INSERT INTO clv_decisions
+                (primary_decision, shadow_big5_decision,
+                 shadow_global_decisions, metadata)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id;
+            """,
+            primary_decision, shadow_big5_decision,
+            json.dumps(shadow_global_list),
+            json.dumps(metadata),
+        )
+
+    actionable_primary  = primary_decision not in ("INSUFFICIENT_DATA",
+                                                    "CONTINUE_OBSERVE")
+    actionable_big5     = shadow_big5_decision not in ("INSUFFICIENT_DATA",
+                                                        "CONTINUE_OBSERVE")
+    if actionable_primary or actionable_big5 or actionable_global:
+        logger.critical(
+            "[ClvDecisions] PROPOSAL: primary=%s, shadow_big5=%s, "
+            "actionable_global=%d (decision_id=%s)",
+            primary_decision, shadow_big5_decision,
+            len(actionable_global), decision_id,
+        )
+
+    return {
+        "decision_id":              decision_id,
+        "primary_decision":         primary_decision,
+        "shadow_big5_decision":     shadow_big5_decision,
+        "shadow_global_decisions":  shadow_global_list,
+        "metadata":                 metadata,
+        "actionable_global":        actionable_global,
+    }
+
+
+async def fetch_clv_decisions(pool, limit: int = 10) -> list[dict]:
+    """Read-only: hent siste N decisions for /admin/clv-decisions."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, decision_timestamp, primary_decision,
+                   shadow_big5_decision, shadow_global_decisions, metadata
+            FROM clv_decisions
+            ORDER BY decision_timestamp DESC
+            LIMIT $1;
+            """,
+            limit,
+        )
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("decision_timestamp"):
+            d["decision_timestamp"] = d["decision_timestamp"].isoformat()
+        # asyncpg deserialiserer JSONB → str (dict via codec). Pass through.
+        for k in ("shadow_global_decisions", "metadata"):
+            v = d.get(k)
+            if isinstance(v, str):
+                try:
+                    d[k] = json.loads(v)
+                except Exception:
+                    pass
+        out.append(d)
+    return out
+
+
+# ── PROFIT-MASKIN: KODE 2 — CLV breakdown (markdown + JSON) ─────────────────
+async def build_clv_breakdown(pool) -> dict:
+    """Returnerer sniper_clv_breakdown + markdown-tabell."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM sniper_clv_breakdown;"
+        )
+    items = []
+    for r in rows:
+        d = dict(r)
+        for k in ("avg_clv", "pct_positive_clv", "avg_expected_roi_pct",
+                  "total_profit"):
+            if d.get(k) is not None:
+                d[k] = float(d[k])
+        items.append(d)
+
+    header = ("| Tier | Liga | Edge | Odds | n_close | avg_clv% | "
+              "pos_clv% | exp_roi% | wins | settled | profit |")
+    sep = "|" + "|".join(["---"] * 11) + "|"
+    body = []
+    for it in items:
+        body.append(
+            "| {tier} | {lg} | {eb} | {ob} | {n} | {clv} | "
+            "{pos} | {roi} | {w} | {s} | {p} |".format(
+                tier=it.get("market_tier") or "-",
+                lg=(it.get("league") or "-")[:24],
+                eb=it.get("edge_bucket") or "-",
+                ob=it.get("odds_bucket") or "-",
+                n=it.get("n_with_close") or 0,
+                clv=(f"{it['avg_clv']:+.2f}"
+                     if it.get("avg_clv") is not None else "-"),
+                pos=(f"{it['pct_positive_clv']:.1f}"
+                     if it.get("pct_positive_clv") is not None else "-"),
+                roi=(f"{it['avg_expected_roi_pct']:+.2f}"
+                     if it.get("avg_expected_roi_pct") is not None else "-"),
+                w=it.get("wins") or 0,
+                s=it.get("settled") or 0,
+                p=(f"{it['total_profit']:+.2f}"
+                   if it.get("total_profit") is not None else "-"),
+            )
+        )
+    return {
+        "computed_at":     datetime.now(timezone.utc).isoformat(),
+        "n_buckets":       len(items),
+        "buckets":         items,
+        "markdown_table":  "\n".join([header, sep] + body),
+    }
+
+
+# ── PROFIT-MASKIN: KODE 6 — morgen-rapport (Don-lesbar) ─────────────────────
+async def generate_morning_report(pool, target_date: datetime | None = None) -> dict:
+    """
+    Daglig markdown-rapport. Idempotent via UNIQUE(report_date) — ON CONFLICT
+    UPDATE bevarer sist genererte versjon for dagen.
+    """
+    now = datetime.now(timezone.utc)
+    report_date = (target_date or now).date()
+
+    async with pool.acquire() as conn:
+        last_24h = await conn.fetch(
+            """
+            SELECT market_tier,
+                   COUNT(*) AS picks_total,
+                   COUNT(*) FILTER (WHERE odds_close IS NOT NULL) AS n_close,
+                   COUNT(*) FILTER (WHERE is_positive_clv_close) AS n_positive,
+                   AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv,
+                   AVG(expected_roi_pct) FILTER (WHERE expected_roi_pct IS NOT NULL)
+                       AS avg_exp_roi,
+                   COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
+                   COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS settled
+            FROM sniper_bets_v1
+            WHERE pick_timestamp > NOW() - INTERVAL '24 hours'
+              AND market_tier IN ('PRIMARY', 'SHADOW_BIG5', 'SHADOW_GLOBAL')
+            GROUP BY market_tier;
+            """
+        )
+        top_global = await conn.fetch(
+            """
+            SELECT league,
+                   COUNT(*) FILTER (WHERE odds_close IS NOT NULL) AS n_close,
+                   COUNT(*) FILTER (WHERE is_positive_clv_close) AS n_pos,
+                   AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv
+            FROM sniper_bets_v1
+            WHERE market_tier = 'SHADOW_GLOBAL'
+            GROUP BY league
+            HAVING COUNT(*) FILTER (WHERE odds_close IS NOT NULL) >= 5
+            ORDER BY avg_clv DESC NULLS LAST
+            LIMIT 3;
+            """
+        )
+        latest_decision = await conn.fetchrow(
+            """
+            SELECT id, decision_timestamp, primary_decision,
+                   shadow_big5_decision
+            FROM clv_decisions
+            ORDER BY decision_timestamp DESC
+            LIMIT 1;
+            """
+        )
+        mismatch_24h = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM shadow_team_mismatches
+            WHERE detected_at > NOW() - INTERVAL '24 hours';
+            """
+        )
+        cap_today = await _shadow_picks_today_count(pool)
+        kill = await check_kill_switches(pool)
+
+    by_tier = {r["market_tier"]: dict(r) for r in last_24h}
+
+    def _fmt_tier(tier_key: str, label: str) -> str:
+        d = by_tier.get(tier_key, {})
+        n_close = int(d.get("n_close") or 0)
+        n_pos = int(d.get("n_positive") or 0)
+        avg_clv = d.get("avg_clv")
+        avg_exp = d.get("avg_exp_roi")
+        return (
+            f"- **{label}**: picks={d.get('picks_total') or 0}, "
+            f"close={n_close}, pos_clv={n_pos}, "
+            f"avg_clv={f'{float(avg_clv):+.2f}%' if avg_clv is not None else '-'}, "
+            f"avg_exp_roi={f'{float(avg_exp):+.2f}%' if avg_exp is not None else '-'}, "
+            f"wins={d.get('wins') or 0}/{d.get('settled') or 0}"
+        )
+
+    top_lines = []
+    for r in top_global:
+        avg_clv = r.get("avg_clv")
+        top_lines.append(
+            f"  - {r['league']}: n_close={r['n_close']}, "
+            f"pos={r['n_pos']}, avg_clv="
+            f"{f'{float(avg_clv):+.2f}%' if avg_clv is not None else '-'}"
+        )
+    top_block = "\n".join(top_lines) if top_lines else "  - (ingen liga med >=5 close-snapshots ennå)"
+
+    decision_block = "  - (ingen decisions kjørt ennå)"
+    if latest_decision:
+        decision_block = (
+            f"  - id={latest_decision['id']}, "
+            f"ts={latest_decision['decision_timestamp'].isoformat()}\n"
+            f"  - PRIMARY: **{latest_decision['primary_decision']}**\n"
+            f"  - SHADOW_BIG5: **{latest_decision['shadow_big5_decision']}**"
+        )
+
+    md = (
+        f"# Don's Morgen-Rapport — {report_date.isoformat()}\n"
+        f"_Generert {now.isoformat()}_\n\n"
+        f"## 24t pick-stats per tier\n"
+        f"{_fmt_tier('PRIMARY', 'PRIMARY (kunde-grunnlag)')}\n"
+        f"{_fmt_tier('SHADOW_BIG5', 'SHADOW_BIG5 (calibrated observer)')}\n"
+        f"{_fmt_tier('SHADOW_GLOBAL', 'SHADOW_GLOBAL (UNCALIBRATED research)')}\n\n"
+        f"## Kill-switch (PRIMARY)\n"
+        f"  - n_with_close={kill.get('n_with_close')}, "
+        f"positive_clv_pct={kill.get('positive_clv_pct')}%, "
+        f"flags={kill.get('flags')}\n"
+        f"  - auto_stop_required={kill.get('auto_stop_required')}\n\n"
+        f"## CLV-decisions (siste)\n{decision_block}\n\n"
+        f"## Top 3 SHADOW_GLOBAL ligaer (avg_clv)\n{top_block}\n\n"
+        f"## Pipeline-status\n"
+        f"  - SHADOW cap: {cap_today}/{SHADOW_DAILY_CAP} brukt i dag\n"
+        f"  - Team-mismatches siste 24t: {int(mismatch_24h or 0)}\n"
+    )
+
+    summary = {
+        "report_date":    report_date.isoformat(),
+        "by_tier":        {k: dict(v) for k, v in by_tier.items()},
+        "kill_switch":    kill,
+        "shadow_cap":     {"used_today": cap_today, "limit": SHADOW_DAILY_CAP},
+        "team_mismatches_24h": int(mismatch_24h or 0),
+        "latest_decision_id": (latest_decision["id"] if latest_decision else None),
+    }
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO don_morning_reports
+                (report_date, generated_at, report_markdown, summary_json)
+            VALUES ($1, NOW(), $2, $3)
+            ON CONFLICT (report_date) DO UPDATE SET
+                generated_at = EXCLUDED.generated_at,
+                report_markdown = EXCLUDED.report_markdown,
+                summary_json = EXCLUDED.summary_json;
+            """,
+            report_date, md, json.dumps(summary, default=str),
+        )
+
+    return {
+        "report_date":     report_date.isoformat(),
+        "generated_at":    now.isoformat(),
+        "report_markdown": md,
+        "summary":         summary,
+    }
+
+
+async def fetch_morning_report(pool, target_date: str | None = None) -> dict:
+    """Read-only: hent en spesifikk dagsrapport (default i dag)."""
+    if target_date:
+        date_obj = datetime.fromisoformat(target_date).date()
+    else:
+        date_obj = datetime.now(timezone.utc).date()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, report_date, generated_at, report_markdown, summary_json
+            FROM don_morning_reports
+            WHERE report_date = $1;
+            """,
+            date_obj,
+        )
+    if not row:
+        return {"status": "NOT_FOUND", "report_date": date_obj.isoformat()}
+    d = dict(row)
+    if d.get("report_date"):
+        d["report_date"] = d["report_date"].isoformat()
+    if d.get("generated_at"):
+        d["generated_at"] = d["generated_at"].isoformat()
+    if isinstance(d.get("summary_json"), str):
+        try:
+            d["summary_json"] = json.loads(d["summary_json"])
+        except Exception:
+            pass
+    return {"status": "ok", **d}
 
 
 async def build_sniper_dashboard(pool, window_days: int = 30) -> dict:

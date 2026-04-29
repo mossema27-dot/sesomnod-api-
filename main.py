@@ -5009,6 +5009,38 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error("[Sniper] missed-snapshots failed: %s", e, exc_info=True)
 
+    async def _clv_decision_engine_job():
+        """PROFIT-MASKIN KODE 1: CLV decision-engine (PROPOSALS, ikke auto)."""
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import evaluate_clv_decision_layer
+            result = await evaluate_clv_decision_layer(db_state.pool)
+            logger.info(
+                "[ClvDecisions] decision_id=%s primary=%s shadow_big5=%s "
+                "actionable_global=%d",
+                result.get("decision_id"),
+                result.get("primary_decision"),
+                result.get("shadow_big5_decision"),
+                len(result.get("actionable_global") or []),
+            )
+        except Exception as e:
+            logger.error("[ClvDecisions] failed: %s", e, exc_info=True)
+
+    async def _don_morning_report_job():
+        """PROFIT-MASKIN KODE 6: daglig morgen-rapport (05:00 UTC = 07:00 Oslo)."""
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import generate_morning_report
+            r = await generate_morning_report(db_state.pool)
+            logger.info(
+                "[MorningReport] generated for %s (len=%d)",
+                r.get("report_date"), len(r.get("report_markdown") or ""),
+            )
+        except Exception as e:
+            logger.error("[MorningReport] failed: %s", e, exc_info=True)
+
     if not scheduler.get_job("sniper_pick_generation"):
         scheduler.add_job(
             _sniper_pick_gen_job,
@@ -5064,6 +5096,27 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             name="Sniper Missed-Snapshot Detector (KODE 2)",
             misfire_grace_time=120, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("clv_decision_engine"):
+        # PROFIT-MASKIN KODE 1: hver 6. time (00, 06, 12, 18 UTC).
+        # Genererer PROPOSALS — Don evaluerer før noen action.
+        scheduler.add_job(
+            _clv_decision_engine_job,
+            trigger=CronTrigger(hour="0,6,12,18", minute=0, timezone="UTC"),
+            id="clv_decision_engine",
+            replace_existing=True,
+            name="CLV Decision Engine (PROFIT KODE 1)",
+            misfire_grace_time=600, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("don_morning_report"):
+        # PROFIT-MASKIN KODE 6: daglig 05:00 UTC = 07:00 Oslo.
+        scheduler.add_job(
+            _don_morning_report_job,
+            trigger=CronTrigger(hour=5, minute=0, timezone="UTC"),
+            id="don_morning_report",
+            replace_existing=True,
+            name="Don Morning Report (PROFIT KODE 6)",
+            misfire_grace_time=900, max_instances=1, coalesce=True,
         )
 
     # Daglig morgen-brief 06:45 UTC (08:45 Oslo)
@@ -11799,6 +11852,73 @@ async def admin_sniper_clv_per_pick():
         return await build_clv_per_pick(db_state.pool)
     except Exception as e:
         logger.error(f"[SniperCLVPerPick] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/clv-decisions")
+async def admin_clv_decisions(limit: int = 10):
+    """PROFIT KODE 1: read-only — siste N CLV-decisions (PROPOSALS)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import fetch_clv_decisions
+        decisions = await fetch_clv_decisions(db_state.pool, limit=limit)
+        return {"n_decisions": len(decisions), "decisions": decisions}
+    except Exception as e:
+        logger.error(f"[ClvDecisions] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/clv-decisions-evaluate-now")
+async def admin_clv_decisions_evaluate_now():
+    """PROFIT KODE 1: manuell trigger for decision-engine (test)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import evaluate_clv_decision_layer
+        return {"status": "ok",
+                "result": await evaluate_clv_decision_layer(db_state.pool)}
+    except Exception as e:
+        logger.error(f"[ClvDecisionsManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/sniper-clv-breakdown")
+async def admin_sniper_clv_breakdown():
+    """PROFIT KODE 2: tier × edge_bucket × odds_bucket breakdown."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import build_clv_breakdown
+        return await build_clv_breakdown(db_state.pool)
+    except Exception as e:
+        logger.error(f"[ClvBreakdown] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/don-morning-report")
+async def admin_don_morning_report(date: str | None = None):
+    """PROFIT KODE 6: hent en spesifikk dagsrapport (default i dag UTC)."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import fetch_morning_report
+        return await fetch_morning_report(db_state.pool, target_date=date)
+    except Exception as e:
+        logger.error(f"[MorningReport] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/don-morning-report-generate-now")
+async def admin_don_morning_report_generate_now():
+    """PROFIT KODE 6: manuell trigger for morgen-rapport."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.sniper_live import generate_morning_report
+        return await generate_morning_report(db_state.pool)
+    except Exception as e:
+        logger.error(f"[MorningReportManual] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
