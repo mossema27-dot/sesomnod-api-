@@ -4909,6 +4909,52 @@ async def lifespan(app: FastAPI):
             name="Daily scan_results_cache refresh (06:00 UTC)",
         )
 
+    # ─── TIER 2 monitoring (operational, every 15 min) ───────────────
+    # Two consecutive bad checks before Telegram fires. See
+    # scripts/monitoring/alerts.py for false-positive armor.
+    async def _tier2_monitor():
+        try:
+            from scripts.monitoring.tier2_operational import run_tier2_check
+            await run_tier2_check(
+                scheduler, db_state, db_state.pool, run_history=_scheduler_run_history
+            )
+        except Exception as e:
+            logger.error(f"[tier2_monitor] error: {e}")
+
+    if not scheduler.get_job("tier2_monitor"):
+        scheduler.add_job(
+            _tier2_monitor,
+            "interval",
+            minutes=15,
+            id="tier2_monitor",
+            replace_existing=True,
+            name="TIER 2 operational monitoring",
+            misfire_grace_time=300,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # ─── TIER 3 monitoring (strategic, every 60 min) ─────────────────
+    # CLV rolling-avg + consecutive-negative streak detection.
+    async def _tier3_monitor():
+        try:
+            from scripts.monitoring.tier3_strategic import run_tier3_check
+            await run_tier3_check(db_state, db_state.pool)
+        except Exception as e:
+            logger.error(f"[tier3_monitor] error: {e}")
+
+    if not scheduler.get_job("tier3_monitor"):
+        scheduler.add_job(
+            _tier3_monitor,
+            trigger=CronTrigger(minute=0, timezone="UTC"),
+            id="tier3_monitor",
+            replace_existing=True,
+            name="TIER 3 strategic monitoring",
+            misfire_grace_time=300,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # Live results hvert 15. minutt 24/7
     scheduler.add_job(
         _check_live_results,
@@ -10436,6 +10482,39 @@ async def admin_phase0_stats(window: int = 30):
     except Exception as e:
         logger.error(f"/admin/phase0-stats error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/monitoring-state")
+async def admin_monitoring_state():
+    """Inspect TIER 2 + TIER 3 alert state (consecutive-bad counters, recent alerts)."""
+    try:
+        from scripts.monitoring.alerts import state_snapshot
+        return {
+            "status": "ok",
+            "snapshot": state_snapshot(),
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/monitoring-run-now")
+async def admin_monitoring_run_now(tier: str = "tier2"):
+    """Manually trigger a tier2 or tier3 check. For pre-deploy verification."""
+    sch = getattr(app.state, "scheduler", None)
+    if sch is None:
+        return JSONResponse(status_code=503, content={"error": "scheduler not attached"})
+    if tier == "tier2":
+        from scripts.monitoring.tier2_operational import run_tier2_check
+        result = await run_tier2_check(
+            sch, db_state, db_state.pool, run_history=_scheduler_run_history
+        )
+    elif tier == "tier3":
+        from scripts.monitoring.tier3_strategic import run_tier3_check
+        result = await run_tier3_check(db_state, db_state.pool)
+    else:
+        return JSONResponse(status_code=400, content={"error": f"unknown tier: {tier}"})
+    return {"status": "ok", "tier": tier, "result": result}
 
 
 @app.get("/admin/scheduler-health")
