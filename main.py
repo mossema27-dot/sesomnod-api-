@@ -4875,6 +4875,40 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Daily scan_results_cache refresh — 06:00 UTC.
+    # Wraps /run-full-scan endpoint so the cache is always fresh before
+    # api_football_refresh, sniper_pick_generation, and morning_brief run.
+    # Without this job the cache is only updated by manual endpoint hits.
+    async def _daily_scan_cache_refresh():
+        if not db_state.connected or not db_state.pool:
+            logger.info("[scan_cache_refresh] SKIP: DB offline")
+            return
+        try:
+            result = await run_full_scan(force_refresh=True)
+            if isinstance(result, dict):
+                total_found = result.get("total_found", 0)
+                source = result.get("source", "fresh")
+                logger.info(
+                    f"[scan_cache_refresh] OK: {total_found} fixtures cached "
+                    f"(source={source})"
+                )
+            else:
+                logger.warning(
+                    f"[scan_cache_refresh] non-dict response: {type(result).__name__}"
+                )
+        except Exception as e:
+            logger.error(f"[scan_cache_refresh] error: {e}")
+
+    if not scheduler.get_job("daily_scan_cache_refresh"):
+        scheduler.add_job(
+            _daily_scan_cache_refresh,
+            trigger=CronTrigger(hour=6, minute=0, timezone="UTC"),
+            id="daily_scan_cache_refresh",
+            misfire_grace_time=600,
+            replace_existing=True,
+            name="Daily scan_results_cache refresh (06:00 UTC)",
+        )
+
     # Live results hvert 15. minutt 24/7
     scheduler.add_job(
         _check_live_results,
