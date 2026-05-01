@@ -7115,6 +7115,64 @@ async def run_full_scan(force_refresh: bool = False):
     return result
 
 
+_UPCOMING_EDGE_CACHE: dict = {"ts": 0.0, "data": None}
+_UPCOMING_EDGE_TTL_SEC = 300  # 5 min
+
+
+@app.get("/public/upcoming-edge")
+async def get_public_upcoming_edge():
+    """
+    Public endpoint for LiveEdgeTracker — returns up to 5 pending PRIMARY-tier
+    sniper signals with kickoff_time and edge_pct vs Pinnacle close.
+
+    Cached 5 min to limit DB pressure. Each pick has a UNIQUE edge_pct
+    (no placeholder duplication).
+    """
+    now_ts = time.time()
+    cached = _UPCOMING_EDGE_CACHE
+    if cached["data"] is not None and (now_ts - cached["ts"]) < _UPCOMING_EDGE_TTL_SEC:
+        return cached["data"]
+
+    if not db_state.connected or not db_state.pool:
+        fallback = {"status": "offline", "rows": [], "cached_at": None}
+        return fallback
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, home_team, away_team, league, kickoff_time,
+                       ROUND(edge_pct::numeric, 2) AS edge_pct
+                FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                  AND result = 'PENDING'
+                  AND kickoff_time > NOW()
+                ORDER BY kickoff_time ASC
+                LIMIT 5
+            """)
+        payload = {
+            "status": "ok",
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "ttl_sec": _UPCOMING_EDGE_TTL_SEC,
+            "rows": [
+                {
+                    "id": r["id"],
+                    "home_team": r["home_team"],
+                    "away_team": r["away_team"],
+                    "league": r["league"],
+                    "kickoff_iso": r["kickoff_time"].isoformat() if r["kickoff_time"] else None,
+                    "edge_pct": float(r["edge_pct"]) if r["edge_pct"] is not None else None,
+                }
+                for r in rows
+            ],
+        }
+        _UPCOMING_EDGE_CACHE["ts"] = now_ts
+        _UPCOMING_EDGE_CACHE["data"] = payload
+        return payload
+    except Exception as e:
+        logger.error(f"[UpcomingEdge] {e}")
+        return {"status": "error", "rows": [], "error": str(e)[:200]}
+
+
 @app.get("/clv")
 async def get_clv():
     """Henter siste CLV-records med statistikk."""
