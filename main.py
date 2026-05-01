@@ -1051,6 +1051,13 @@ async def ensure_tables(pool: asyncpg.Pool):
                     "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
                     "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(128)",
                     "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(128)",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(32)",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS name VARCHAR(128)",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS telegram_username VARCHAR(64)",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS telegram_link_token VARCHAR(64) UNIQUE",
+                    "ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ",
                 ]:
                     try:
                         await conn.execute(col_sql)
@@ -1059,6 +1066,42 @@ async def ensure_tables(pool: asyncpg.Pool):
             logger.info("[DB] waitlist Stripe columns OK")
         except Exception as e:
             logger.warning(f"[DB] waitlist Stripe columns feil (non-fatal): {e}")
+
+        # ── Subscriber Telegram mapping (DM dispatch) ─────────────
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS subscriber_telegram (
+                        id SERIAL PRIMARY KEY,
+                        email VARCHAR(255) NOT NULL,
+                        telegram_user_id BIGINT UNIQUE,
+                        telegram_username VARCHAR(64),
+                        telegram_chat_id BIGINT,
+                        link_token VARCHAR(64) UNIQUE,
+                        linked_at TIMESTAMPTZ,
+                        active BOOLEAN DEFAULT TRUE,
+                        deactivated_at TIMESTAMPTZ,
+                        picks_received INTEGER DEFAULT 0,
+                        last_pick_at TIMESTAMPTZ,
+                        last_message_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sub_tg_email
+                    ON subscriber_telegram(email)
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sub_tg_active
+                    ON subscriber_telegram(active) WHERE active = TRUE
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sub_tg_user
+                    ON subscriber_telegram(telegram_user_id) WHERE telegram_user_id IS NOT NULL
+                """)
+            logger.info("[DB] subscriber_telegram table OK")
+        except Exception as e:
+            logger.warning(f"[DB] subscriber_telegram table feil (non-fatal): {e}")
 
         # ── No-Bet Log table ──────────────────────────────────────
         try:
@@ -4823,6 +4866,33 @@ async def lifespan(app: FastAPI):
         trigger=CronTrigger(hour=20, minute=0, timezone="UTC"),
         id="run_analysis_prekickoff",
         misfire_grace_time=300,
+        replace_existing=True,
+    )
+
+    # ── No-pick disiplin: 10:00 UTC = 12:00 CET (sommer) ──────────
+    # Hvis Phase 0 returnerer 0 picks denne dagen, sender vi én DM til alle
+    # aktive subscribers. Settings-key sikrer maks én melding per dag.
+    async def _no_pick_check_and_dispatch():
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            async with db_state.pool.acquire() as conn:
+                today_picks = await conn.fetchval(
+                    "SELECT COUNT(*) FROM picks_v2 WHERE DATE(kickoff_oslo) = CURRENT_DATE AND post_telegram = TRUE"
+                ) or 0
+            if today_picks == 0:
+                logger.info("[NoPickCron] 0 picks today → dispatching no-pick discipline DM")
+                await dispatch_no_pick_message()
+            else:
+                logger.info(f"[NoPickCron] {today_picks} picks today → no discipline DM needed")
+        except Exception as e:
+            logger.error(f"[NoPickCron] {e}", exc_info=True)
+
+    scheduler.add_job(
+        _no_pick_check_and_dispatch,
+        trigger=CronTrigger(hour=10, minute=0, timezone="UTC"),
+        id="no_pick_discipline_dm",
+        misfire_grace_time=600,
         replace_existing=True,
     )
     # ──────────────────────────────────────────────────────────────
@@ -13112,6 +13182,8 @@ async def waitlist_join(request: Request, body: WaitlistJoin):
                 "INSERT INTO waitlist (email, source) VALUES ($1, $2)",
                 email, "waitlist_page"
             )
+            # Fire-and-forget admin notification (Don's private Telegram)
+            asyncio.create_task(_notify_admin_new_waitlist(email))
             return {"status": "registered", "email": email}
     except Exception as e:
         logger.error(f"[Waitlist] Join error for {email}: {e}")
@@ -13177,12 +13249,456 @@ async def waitlist_stats():
 
 
 # ─────────────────────────────────────────────────────────
+# SUBSCRIBER LIFECYCLE — DM, admin alerts, bulk onboarding
+# ─────────────────────────────────────────────────────────
+
+async def _telegram_send_dm(chat_id: int | str, text: str, parse_mode: str | None = "MarkdownV2") -> bool:
+    """Send a Telegram DM. Returns True on success, False otherwise. Never raises."""
+    if not cfg.TELEGRAM_TOKEN or not chat_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            payload: dict = {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            r = await client.post(
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                json=payload,
+            )
+            if r.status_code != 200:
+                logger.warning(f"[TelegramDM] {chat_id} → HTTP {r.status_code}: {r.text[:200]}")
+                return False
+            return True
+    except Exception as e:
+        logger.warning(f"[TelegramDM] {chat_id} → exception: {e}")
+        return False
+
+
+async def _notify_admin_new_waitlist(email: str) -> None:
+    """Fire-and-forget: tell Don in his private Telegram that someone joined the waitlist."""
+    admin_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
+    if not admin_chat:
+        return
+    safe_email = _mdv2_escape(email)
+    text = (
+        "🔔 *Ny waitlist\\-søker*\n\n"
+        f"`{safe_email}`\n\n"
+        "Klikk for å godkjenne i admin\\-panel\\."
+    )
+    await _telegram_send_dm(admin_chat, text, parse_mode="MarkdownV2")
+
+
+async def _notify_admin_text(text: str) -> None:
+    """Plain admin notification (no MarkdownV2 escaping needed)."""
+    admin_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
+    if not admin_chat:
+        return
+    await _telegram_send_dm(admin_chat, text, parse_mode=None)
+
+
+class BulkOnboardRow(BaseModel):
+    email: str
+    name: Optional[str] = None
+    telegram_username: Optional[str] = None
+
+
+class BulkOnboardRequest(BaseModel):
+    customers: list[BulkOnboardRow]
+    admin_secret: str
+
+
+@app.post("/admin/bulk-onboard")
+async def admin_bulk_onboard(body: BulkOnboardRequest):
+    """
+    Don's bulk-onboarding for the first 40 customers.
+
+    For each row:
+      1. Insert into waitlist (or update if exists)
+      2. Auto-approve and generate checkout_token
+      3. Generate telegram_link_token (used in /start <token>)
+      4. Return per-row result with checkout_url + telegram_link
+
+    Don sends each customer:
+      - checkout_url (for $149/mo subscription with 30 day trial)
+      - https://t.me/SesomNodBot?start=<telegram_link_token>
+    """
+    admin_secret = os.environ.get("ADMIN_SECRET", "")
+    if not admin_secret or body.admin_secret != admin_secret:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    results = []
+    try:
+        async with db_state.pool.acquire() as conn:
+            for row in body.customers:
+                email = (row.email or "").strip().lower()
+                if not _EMAIL_RE.match(email):
+                    results.append({"email": row.email, "status": "invalid_email"})
+                    continue
+
+                checkout_token = _secrets.token_urlsafe(32)
+                telegram_link_token = _secrets.token_urlsafe(16)
+                trial_ends = datetime.now(timezone.utc) + timedelta(days=30)
+
+                try:
+                    await conn.execute("""
+                        INSERT INTO waitlist (
+                            email, name, telegram_username, source,
+                            approved, approved_at,
+                            checkout_token, checkout_sent_at,
+                            telegram_link_token, trial_ends_at
+                        )
+                        VALUES ($1, $2, $3, 'bulk_onboard', TRUE, NOW(), $4, NOW(), $5, $6)
+                        ON CONFLICT (email) DO UPDATE SET
+                            name = COALESCE(EXCLUDED.name, waitlist.name),
+                            telegram_username = COALESCE(EXCLUDED.telegram_username, waitlist.telegram_username),
+                            approved = TRUE,
+                            approved_at = COALESCE(waitlist.approved_at, NOW()),
+                            checkout_token = COALESCE(waitlist.checkout_token, EXCLUDED.checkout_token),
+                            telegram_link_token = COALESCE(waitlist.telegram_link_token, EXCLUDED.telegram_link_token),
+                            trial_ends_at = COALESCE(waitlist.trial_ends_at, EXCLUDED.trial_ends_at)
+                    """, email, row.name, row.telegram_username,
+                         checkout_token, telegram_link_token, trial_ends)
+
+                    final = await conn.fetchrow("""
+                        SELECT checkout_token, telegram_link_token
+                        FROM waitlist WHERE email = $1
+                    """, email)
+
+                    bot_username = os.environ.get("TELEGRAM_BOT_USERNAME", "SesomNodBot")
+                    results.append({
+                        "email": email,
+                        "status": "onboarded",
+                        "checkout_url": f"https://sesomnod.com/checkout?token={final['checkout_token']}",
+                        "telegram_link": f"https://t.me/{bot_username}?start={final['telegram_link_token']}",
+                    })
+                except Exception as row_err:
+                    logger.warning(f"[BulkOnboard] {email} failed: {row_err}")
+                    results.append({"email": email, "status": "error", "error": str(row_err)[:200]})
+
+        await _notify_admin_text(
+            f"✅ Bulk-onboard ferdig: {sum(1 for r in results if r['status']=='onboarded')}/{len(results)} kunder klargjort."
+        )
+        return {"status": "done", "results": results, "count": len(results)}
+    except Exception as e:
+        logger.error(f"[BulkOnboard] Fatal: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── Telegram bot webhook: /start <link_token> binds telegram_user_id to email
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """
+    Receives Telegram bot updates. Handles /start <token> to link a Telegram user
+    to a waitlist row for DM-dispatch.
+
+    To activate: in Telegram Bot API, set webhook to
+        https://sesomnod-api-production.up.railway.app/telegram/webhook?secret=<TELEGRAM_WEBHOOK_SECRET>
+    """
+    expected_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    if expected_secret:
+        provided = request.query_params.get("secret", "")
+        if provided != expected_secret:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    try:
+        update = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    msg = update.get("message") or update.get("edited_message") or {}
+    text = (msg.get("text") or "").strip()
+    chat = msg.get("chat") or {}
+    sender = msg.get("from") or {}
+
+    chat_id = chat.get("id")
+    user_id = sender.get("id")
+    username = sender.get("username")
+    first_name = sender.get("first_name", "")
+
+    if not chat_id or not user_id:
+        return {"status": "ignored"}
+
+    # Handle /start <token>
+    if text.startswith("/start"):
+        parts = text.split(maxsplit=1)
+        token = parts[1].strip() if len(parts) > 1 else ""
+
+        if not token:
+            await _telegram_send_dm(
+                chat_id,
+                "Velkommen til SesomNod\\. Du trenger en personlig invitasjons\\-lenke for å aktivere DM\\-tilgang\\. "
+                "Gå tilbake til e\\-posten din for lenken\\.",
+                parse_mode="MarkdownV2",
+            )
+            return {"status": "no_token"}
+
+        if not db_state.connected or not db_state.pool:
+            return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+        try:
+            async with db_state.pool.acquire() as conn:
+                wl = await conn.fetchrow(
+                    "SELECT id, email, name FROM waitlist WHERE telegram_link_token = $1",
+                    token,
+                )
+                if not wl:
+                    await _telegram_send_dm(
+                        chat_id,
+                        "Lenken er ugyldig eller utløpt\\. Kontakt support\\.",
+                        parse_mode="MarkdownV2",
+                    )
+                    return {"status": "invalid_token"}
+
+                # Upsert subscriber_telegram
+                await conn.execute("""
+                    INSERT INTO subscriber_telegram (
+                        email, telegram_user_id, telegram_username, telegram_chat_id,
+                        link_token, linked_at, active
+                    )
+                    VALUES ($1, $2, $3, $4, $5, NOW(), TRUE)
+                    ON CONFLICT (telegram_user_id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        telegram_username = EXCLUDED.telegram_username,
+                        telegram_chat_id = EXCLUDED.telegram_chat_id,
+                        active = TRUE,
+                        deactivated_at = NULL,
+                        linked_at = COALESCE(subscriber_telegram.linked_at, NOW())
+                """, wl["email"], int(user_id), username, int(chat_id), token)
+
+            display_name = _mdv2_escape(wl["name"] or first_name or "")
+            email_safe = _mdv2_escape(wl["email"])
+            welcome = (
+                f"✅ *Velkommen{(' ' + display_name) if display_name else ''}*\n\n"
+                f"Din SesomNod\\-tilgang er aktivert for `{email_safe}`\\.\n\n"
+                "Første pick kommer kl 12:00 CET hver dag det er edge\\.\n"
+                "På dager uten edge sender vi melding om det\\. Disiplin \\> volum\\.\n\n"
+                "Du kan når som helst skrive /stop for å pause meldinger\\."
+            )
+            await _telegram_send_dm(chat_id, welcome, parse_mode="MarkdownV2")
+            await _notify_admin_text(
+                f"🟢 Telegram-link: {wl['email']} → @{username or user_id} aktivert"
+            )
+            return {"status": "linked", "email": wl["email"]}
+        except Exception as e:
+            logger.error(f"[Telegram /start] {e}", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+    # Handle /stop
+    if text.startswith("/stop"):
+        if db_state.connected and db_state.pool:
+            try:
+                async with db_state.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE subscriber_telegram SET active = FALSE, deactivated_at = NOW() WHERE telegram_user_id = $1",
+                        int(user_id),
+                    )
+            except Exception as e:
+                logger.warning(f"[Telegram /stop] {e}")
+        await _telegram_send_dm(
+            chat_id,
+            "Meldinger pauset\\. Skriv /start for å aktivere igjen\\.",
+            parse_mode="MarkdownV2",
+        )
+        return {"status": "stopped"}
+
+    # Default: silent acknowledgment
+    return {"status": "ok"}
+
+
+async def dispatch_pick_to_subscribers(text: str, image_bytes: bytes | None = None, parse_mode: str = "MarkdownV2") -> dict:
+    """
+    Send a pick (text + optional image) to ALL active Telegram subscribers via DM.
+
+    Replaces single-channel posting. Logs per-recipient success/failure.
+    Never blocks on a single failure — continues to next subscriber.
+    """
+    if not db_state.connected or not db_state.pool:
+        return {"sent": 0, "failed": 0, "skipped": "db_offline"}
+    if not cfg.TELEGRAM_TOKEN:
+        return {"sent": 0, "failed": 0, "skipped": "no_token"}
+
+    sent = 0
+    failed = 0
+    failures: list[dict] = []
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, email, telegram_chat_id
+                FROM subscriber_telegram
+                WHERE active = TRUE AND telegram_chat_id IS NOT NULL
+            """)
+    except Exception as e:
+        logger.error(f"[Dispatch] Fetch subscribers failed: {e}")
+        return {"sent": 0, "failed": 0, "skipped": "db_query_failed"}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for row in rows:
+            chat_id = row["telegram_chat_id"]
+            email = row["email"]
+            try:
+                if image_bytes:
+                    files = {"photo": ("smartpick.png", image_bytes, "image/png")}
+                    data = {
+                        "chat_id": str(chat_id),
+                        "caption": text[:1024],
+                        "parse_mode": parse_mode,
+                    }
+                    r = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendPhoto",
+                        data=data,
+                        files=files,
+                    )
+                else:
+                    r = await client.post(
+                        f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": text,
+                            "parse_mode": parse_mode,
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                if r.status_code == 200:
+                    sent += 1
+                    try:
+                        async with db_state.pool.acquire() as conn2:
+                            await conn2.execute("""
+                                UPDATE subscriber_telegram
+                                SET picks_received = picks_received + 1,
+                                    last_pick_at = NOW(),
+                                    last_message_at = NOW()
+                                WHERE id = $1
+                            """, row["id"])
+                    except Exception:
+                        pass
+                else:
+                    failed += 1
+                    failures.append({"email": email, "code": r.status_code, "body": r.text[:200]})
+                    # 403 Forbidden = user blocked the bot → deactivate
+                    if r.status_code == 403:
+                        try:
+                            async with db_state.pool.acquire() as conn2:
+                                await conn2.execute(
+                                    "UPDATE subscriber_telegram SET active = FALSE, deactivated_at = NOW() WHERE id = $1",
+                                    row["id"],
+                                )
+                        except Exception:
+                            pass
+            except Exception as send_err:
+                failed += 1
+                failures.append({"email": email, "error": str(send_err)[:200]})
+
+    logger.info(f"[Dispatch] sent={sent} failed={failed} total={len(rows)}")
+    if failures:
+        logger.warning(f"[Dispatch] First failure sample: {failures[0]}")
+    return {"sent": sent, "failed": failed, "total": len(rows)}
+
+
+async def dispatch_no_pick_message() -> dict:
+    """When Phase 0 returns 0 picks, send the no-pick discipline DM to all subscribers (once per day)."""
+    today_key = f"no_pick_msg_{datetime.now(timezone.utc).date().isoformat()}"
+    if not db_state.connected or not db_state.pool:
+        return {"skipped": "db_offline"}
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            already = await conn.fetchval(
+                "SELECT value FROM settings WHERE key = $1",
+                today_key,
+            )
+            if already:
+                return {"skipped": "already_sent_today"}
+    except Exception:
+        pass
+
+    text = (
+        "📊 *Ingen edge i dag*\n\n"
+        "Modellen fant ingen kamper som passerer Phase 0\\-gate \\(edge ≥8%, HIGH confidence\\)\\.\n\n"
+        "Disiplin \\> volum\\. Vi venter til markedet gir oss noe ekte\\.\n\n"
+        "Ses i morgen\\."
+    )
+    result = await dispatch_pick_to_subscribers(text, image_bytes=None, parse_mode="MarkdownV2")
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO settings (key, value, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            """, today_key, "1")
+    except Exception:
+        pass
+
+    return result
+
+
+@app.post("/admin/dispatch-no-pick")
+async def admin_dispatch_no_pick(admin_secret: str = ""):
+    """Manual trigger for the no-pick DM (testing or backup if cron failed)."""
+    expected = os.environ.get("ADMIN_SECRET", "")
+    if not expected or admin_secret != expected:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    return await dispatch_no_pick_message()
+
+
+@app.get("/admin/subscribers")
+async def admin_subscribers(admin_secret: str = ""):
+    """List active subscribers with pick-delivery stats."""
+    expected = os.environ.get("ADMIN_SECRET", "")
+    if not expected or admin_secret != expected:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.id, s.email, s.telegram_username, s.telegram_user_id,
+                       s.active, s.picks_received, s.last_pick_at, s.linked_at,
+                       w.paid, w.subscription_status, w.trial_ends_at
+                FROM subscriber_telegram s
+                LEFT JOIN waitlist w ON w.email = s.email
+                ORDER BY s.linked_at DESC NULLS LAST
+                LIMIT 200
+            """)
+        return {
+            "total": len(rows),
+            "active": sum(1 for r in rows if r["active"]),
+            "subscribers": [
+                {
+                    "id": r["id"],
+                    "email": r["email"],
+                    "telegram_username": r["telegram_username"],
+                    "active": r["active"],
+                    "picks_received": r["picks_received"],
+                    "last_pick_at": r["last_pick_at"].isoformat() if r["last_pick_at"] else None,
+                    "linked_at": r["linked_at"].isoformat() if r["linked_at"] else None,
+                    "paid": r["paid"],
+                    "subscription_status": r["subscription_status"],
+                    "trial_ends_at": r["trial_ends_at"].isoformat() if r["trial_ends_at"] else None,
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        logger.error(f"[Admin Subscribers] {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ─────────────────────────────────────────────────────────
 # STRIPE PAYMENT INFRASTRUCTURE
 # ─────────────────────────────────────────────────────────
 
 @app.post("/admin/migrate-stripe")
 async def admin_migrate_stripe():
-    """One-shot: add Stripe columns to waitlist table (idempotent)."""
+    """One-shot: add Stripe columns + subscriber_telegram table (idempotent)."""
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
     try:
@@ -13194,8 +13710,43 @@ async def admin_migrate_stripe():
                 ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
                 ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(128);
                 ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(128);
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(32);
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS name VARCHAR(128);
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS telegram_username VARCHAR(64);
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS telegram_link_token VARCHAR(64) UNIQUE;
+                ALTER TABLE waitlist ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ;
+
+                CREATE TABLE IF NOT EXISTS subscriber_telegram (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255) NOT NULL,
+                    telegram_user_id BIGINT UNIQUE,
+                    telegram_username VARCHAR(64),
+                    telegram_chat_id BIGINT,
+                    link_token VARCHAR(64) UNIQUE,
+                    linked_at TIMESTAMPTZ,
+                    active BOOLEAN DEFAULT TRUE,
+                    deactivated_at TIMESTAMPTZ,
+                    picks_received INTEGER DEFAULT 0,
+                    last_pick_at TIMESTAMPTZ,
+                    last_message_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_sub_tg_email ON subscriber_telegram(email);
+                CREATE INDEX IF NOT EXISTS idx_sub_tg_active ON subscriber_telegram(active) WHERE active = TRUE;
+                CREATE INDEX IF NOT EXISTS idx_sub_tg_user ON subscriber_telegram(telegram_user_id) WHERE telegram_user_id IS NOT NULL;
             """)
-        return {"status": "migrated", "columns": ["checkout_token", "checkout_sent_at", "paid", "paid_at", "stripe_customer_id", "stripe_subscription_id"]}
+        return {
+            "status": "migrated",
+            "waitlist_columns": [
+                "checkout_token", "checkout_sent_at", "paid", "paid_at",
+                "stripe_customer_id", "stripe_subscription_id",
+                "cancelled_at", "subscription_status", "status_updated_at",
+                "name", "telegram_username", "telegram_link_token", "trial_ends_at",
+            ],
+            "tables_ensured": ["subscriber_telegram"],
+        }
     except Exception as e:
         logger.error(f"[Stripe Migration] Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
@@ -13346,10 +13897,18 @@ async def checkout_create_session(request: Request, body: CheckoutRequest):
             success_url=success_url,
             cancel_url=cancel_url,
             customer_email=row["email"],
+            subscription_data={
+                "trial_period_days": 30,
+                "metadata": {
+                    "waitlist_id": str(row["id"]),
+                    "checkout_token": token,
+                },
+            },
             metadata={
                 "waitlist_id": str(row["id"]),
                 "checkout_token": token,
             },
+            allow_promotion_codes=True,
         )
 
         return {
@@ -13439,6 +13998,70 @@ async def stripe_webhook(request: Request):
                     logger.warning("[Stripe Webhook] No waitlist_id or token in metadata")
         except Exception as e:
             logger.error(f"[Stripe Webhook] DB update error: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+    # Handle customer.subscription.deleted (cancellation)
+    elif event_type == "customer.subscription.deleted":
+        sub_data = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data.object
+        subscription_id = sub_data.get("id", "") if isinstance(sub_data, dict) else getattr(sub_data, "id", "")
+
+        if not db_state.connected or not db_state.pool:
+            logger.error("[Stripe Webhook] DB offline — cannot mark cancelled")
+            return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+        try:
+            async with db_state.pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE waitlist
+                    SET paid = FALSE,
+                        cancelled_at = NOW()
+                    WHERE stripe_subscription_id = $1
+                """, str(subscription_id))
+                # Mark Telegram subscriber inactive
+                await conn.execute("""
+                    UPDATE subscriber_telegram
+                    SET active = FALSE,
+                        deactivated_at = NOW()
+                    WHERE email IN (
+                        SELECT email FROM waitlist WHERE stripe_subscription_id = $1
+                    )
+                """, str(subscription_id))
+                logger.info(f"[Stripe Webhook] Subscription {subscription_id} cancelled — DM disabled")
+        except Exception as e:
+            logger.error(f"[Stripe Webhook] Cancel update error: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)[:200]})
+
+    # Handle customer.subscription.updated (status changes — past_due, unpaid, etc.)
+    elif event_type == "customer.subscription.updated":
+        sub_data = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data.object
+        subscription_id = sub_data.get("id", "") if isinstance(sub_data, dict) else getattr(sub_data, "id", "")
+        status = sub_data.get("status", "") if isinstance(sub_data, dict) else getattr(sub_data, "status", "")
+
+        if not db_state.connected or not db_state.pool:
+            return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+        active_states = {"active", "trialing"}
+        is_active = status in active_states
+
+        try:
+            async with db_state.pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE waitlist
+                    SET paid = $1,
+                        subscription_status = $2,
+                        status_updated_at = NOW()
+                    WHERE stripe_subscription_id = $3
+                """, is_active, str(status), str(subscription_id))
+                await conn.execute("""
+                    UPDATE subscriber_telegram
+                    SET active = $1
+                    WHERE email IN (
+                        SELECT email FROM waitlist WHERE stripe_subscription_id = $2
+                    )
+                """, is_active, str(subscription_id))
+                logger.info(f"[Stripe Webhook] Subscription {subscription_id} → status={status} active={is_active}")
+        except Exception as e:
+            logger.error(f"[Stripe Webhook] Status update error: {e}")
             return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
     return {"status": "ok"}

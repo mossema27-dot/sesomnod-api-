@@ -31,7 +31,7 @@
 
 ## DATABASE
 - Primærtabell: picks_v2 (ALDRI tabellen "picks")
-- MiroFish-tabell: mirofish_clv (57 tracked picks, +3.28% avg CLV)
+- MiroFish-tabell: mirofish_clv (101 tracked picks, 59 closed, +3.77% avg CLV · per 2026-04-29)
 - CLV-data er Phase 1-beviset — integritet er ufravikelig
 - Omega-tiers: BRUTAL ≥72, STRONG ≥55, MONITORED ≥40, SKIP <40
 - Phase 1-gate: CLV >+2% ✅, hit rate >55% (pending), picks ≥30 (pending)
