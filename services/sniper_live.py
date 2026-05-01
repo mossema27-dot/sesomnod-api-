@@ -1000,6 +1000,7 @@ async def _emit_capture_fail_alert(
     client: httpx.AsyncClient,
     detail: str,
     extra: dict | None = None,
+    bypass_kickoff_guard: bool = False,
 ) -> bool:
     """
     Send intern ops-alert til DON_INTERNAL_TELEGRAM_CHAT_ID for capture-fail.
@@ -1020,8 +1021,10 @@ async def _emit_capture_fail_alert(
     now_utc = datetime.now(timezone.utc)
     # UTC-mot-UTC delta — TZ-uavhengig, deterministisk på Railway og lokalt.
     minutes_to_kickoff = int((kickoff_utc - now_utc).total_seconds() // 60)
-    if trigger_type != "C_T60_TIMEOUT":
+    if trigger_type != "C_T60_TIMEOUT" and not bypass_kickoff_guard:
         # A og B: kun PRIMARY <2t. C kjøres alltid (vinduet er passert).
+        # bypass_kickoff_guard=True brukes kun av test-endpoint for end-to-end
+        # send-verifikasjon mot fremtidige picks.
         if (kickoff_utc - now_utc) > timedelta(hours=2):
             return False
 

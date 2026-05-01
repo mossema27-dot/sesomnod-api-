@@ -12262,6 +12262,7 @@ async def admin_test_t60_alert(
                 db_state.pool, dict(row), trigger_full, client,
                 detail=detail,
                 extra={"test_endpoint": True},
+                bypass_kickoff_guard=True,
             )
         result["sent"] = sent
         return result
