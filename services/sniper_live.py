@@ -37,6 +37,9 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+OSLO_TZ = ZoneInfo("Europe/Oslo")
 
 import httpx
 
@@ -277,6 +280,20 @@ CREATE TABLE IF NOT EXISTS system_state (
     value TEXT,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- T-60 CAPTURE-FAIL ALERTS: rate-limit log per (pick_id, trigger_type).
+-- A_FAILED_COUNT  → max 3 (Pinnacle ikke responderer)
+-- B_MARKET_CLOSED → max 3 (Pinnacle åpen, Over 2.5 stengt)
+-- C_T60_TIMEOUT   → max 1 via NOT EXISTS (vinduet passert uten capture)
+CREATE TABLE IF NOT EXISTS sniper_alert_log (
+    id BIGSERIAL PRIMARY KEY,
+    pick_id BIGINT NOT NULL REFERENCES sniper_bets_v1(id) ON DELETE CASCADE,
+    trigger_type TEXT NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    payload JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_sniper_alert_log_pick_trigger
+    ON sniper_alert_log(pick_id, trigger_type);
 
 -- KODE 4: per-pick CLV view (Don-lesbar)
 -- DROP-then-CREATE for å håndtere column-order-endringer (CREATE OR REPLACE
@@ -960,11 +977,201 @@ def _minutes_before_kickoff(now: datetime, kickoff: datetime | None) -> int | No
     return int((kickoff - now).total_seconds() // 60)
 
 
+# ── T-60 CAPTURE-FAIL ALERTS (intern ops-Telegram) ──────────────────────────
+CAPTURE_FAIL_ALERT_RATE_LIMIT = {
+    "A_FAILED_COUNT":  3,
+    "B_MARKET_CLOSED": 3,
+    "C_T60_TIMEOUT":   1,
+}
+
+
+def _trigger_label(trigger_type: str) -> str:
+    return {
+        "A_FAILED_COUNT":  "TRIGGER A — PINNACLE NO RESPONSE",
+        "B_MARKET_CLOSED": "TRIGGER B — MARKET CLOSED",
+        "C_T60_TIMEOUT":   "TRIGGER C — T-60 WINDOW PASSED",
+    }.get(trigger_type, trigger_type)
+
+
+async def _emit_capture_fail_alert(
+    pool,
+    row: dict,
+    trigger_type: str,
+    client: httpx.AsyncClient,
+    detail: str,
+    extra: dict | None = None,
+) -> bool:
+    """
+    Send intern ops-alert til DON_INTERNAL_TELEGRAM_CHAT_ID for capture-fail.
+
+    Rate-limit: max N per (pick_id, trigger_type) der N følger
+    CAPTURE_FAIL_ALERT_RATE_LIMIT. C bruker NOT EXISTS i scanneren = max 1.
+
+    Filter: kun PRIMARY tier, kun kickoff <2 timer unna.
+    Returnerer True hvis sendt, False hvis skipped.
+    """
+    if (row.get("market_tier") or "PRIMARY") != "PRIMARY":
+        return False
+    kickoff_utc = row.get("kickoff_time")
+    if kickoff_utc is None:
+        return False
+    if kickoff_utc.tzinfo is None:
+        kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    # UTC-mot-UTC delta — TZ-uavhengig, deterministisk på Railway og lokalt.
+    minutes_to_kickoff = int((kickoff_utc - now_utc).total_seconds() // 60)
+    if trigger_type != "C_T60_TIMEOUT":
+        # A og B: kun PRIMARY <2t. C kjøres alltid (vinduet er passert).
+        if (kickoff_utc - now_utc) > timedelta(hours=2):
+            return False
+
+    max_per_trigger = CAPTURE_FAIL_ALERT_RATE_LIMIT.get(trigger_type, 3)
+    async with pool.acquire() as conn:
+        sent_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM sniper_alert_log "
+            "WHERE pick_id = $1 AND trigger_type = $2;",
+            row["id"], trigger_type,
+        )
+    sent_count = int(sent_count or 0)
+    if sent_count >= max_per_trigger:
+        logger.warning(
+            "[Sniper] capture-fail alert rate-limited pick_id=%s trigger=%s sent=%d/%d",
+            row["id"], trigger_type, sent_count, max_per_trigger,
+        )
+        return False
+
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    intern_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
+    if not token or not intern_chat:
+        logger.warning(
+            "[Sniper] capture-fail alert skipped — DON_INTERNAL_TELEGRAM_CHAT_ID/"
+            "TELEGRAM_TOKEN ikke satt. pick_id=%s trigger=%s",
+            row["id"], trigger_type,
+        )
+        # Ikke logg til sniper_alert_log — ingen alert sendt.
+        return False
+
+    home = row.get("home_team") or "?"
+    away = row.get("away_team") or "?"
+    league = row.get("league") or "?"
+    market = row.get("market") or "OVER_2_5"
+    market_label = "Over 2.5" if market == "OVER_2_5" else market
+    # Display alltid Europe/Oslo eksplisitt — astimezone() uten arg på UTC-server
+    # ville returnert UTC. ZoneInfo gjør det deterministisk.
+    kickoff_oslo_str = kickoff_utc.astimezone(OSLO_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    attempt_n = sent_count + 1
+    attempt_max = max_per_trigger
+    attempt_label = (
+        f"Attempt: {attempt_n}/{attempt_max}"
+        if max_per_trigger > 1 else "Single-shot"
+    )
+
+    msg = (
+        f"🚨 T-60 CAPTURE FAIL: {home} vs {away} | {market_label} | "
+        f"{_trigger_label(trigger_type)}\n"
+        f"Pick #{row['id']} · {league}\n"
+        f"Kickoff: {kickoff_oslo_str} ({minutes_to_kickoff}m igjen)\n"
+        f"Detalj: {detail}\n"
+        f"{attempt_label}"
+    )
+
+    try:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": intern_chat, "text": msg},
+            timeout=10.0,
+        )
+        ok = (resp.status_code == 200)
+    except Exception as e:
+        logger.error("[Sniper] capture-fail alert send failed pick_id=%s: %s",
+                     row["id"], e)
+        return False
+
+    if not ok:
+        logger.warning(
+            "[Sniper] capture-fail alert non-200 pick_id=%s status=%s body=%s",
+            row["id"], resp.status_code, resp.text[:200],
+        )
+        return False
+
+    payload = {
+        "trigger_type": trigger_type,
+        "detail": detail,
+        "attempt": attempt_n,
+        "max_per_trigger": max_per_trigger,
+        "minutes_to_kickoff": minutes_to_kickoff,
+        "match": f"{home} vs {away}",
+        "league": league,
+        "market": market,
+    }
+    if extra:
+        payload.update(extra)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO sniper_alert_log (pick_id, trigger_type, payload) "
+            "VALUES ($1, $2, $3::jsonb);",
+            row["id"], trigger_type, json.dumps(payload),
+        )
+    logger.info(
+        "[Sniper] capture-fail alert sent pick_id=%s trigger=%s attempt=%d/%d",
+        row["id"], trigger_type, attempt_n, max_per_trigger,
+    )
+    return True
+
+
+async def t60_timeout_alert_scan(pool) -> dict:
+    """
+    Trigger C: PRIMARY picks der T-60-vinduet er passert uten capture.
+
+    Vindu: kickoff in (NOW()-5min, NOW()+30min] AND odds_t60 IS NULL.
+    NOT EXISTS-clause sikrer max 1 alert per pick (separat fra A/B).
+    Suppress er bevisst AV — C er separat operatør-signal selv om A/B
+    har spammed for samme pick.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT b.id, b.match_id, b.odds_open, b.kickoff_time,
+                   b.snapshot_failed_count, b.market_tier,
+                   b.home_team, b.away_team, b.league, b.market
+            FROM sniper_bets_v1 b
+            WHERE b.market_tier = 'PRIMARY'
+              AND b.odds_t60 IS NULL
+              AND b.kickoff_time < NOW() + INTERVAL '30 minutes'
+              AND b.kickoff_time > NOW() - INTERVAL '5 minutes'
+              AND NOT EXISTS (
+                SELECT 1 FROM sniper_alert_log a
+                WHERE a.pick_id = b.id AND a.trigger_type = 'C_T60_TIMEOUT'
+              );
+            """
+        )
+    sent = 0
+    skipped = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for row in rows:
+            ok = await _emit_capture_fail_alert(
+                pool, dict(row), "C_T60_TIMEOUT", client,
+                detail="T-60 vindu passert uten capture",
+                extra={"snapshot_failed_count": int(row["snapshot_failed_count"] or 0)},
+            )
+            if ok:
+                sent += 1
+            else:
+                skipped += 1
+    return {"checked": len(rows), "sent": sent, "skipped": skipped}
+
+
 async def _capture_t60(pool, row: dict, late: bool, client: httpx.AsyncClient) -> str:
     """
     Per-pick T-60 capture. Skriver odds_t60, clv_t60, market_open_at_t60,
     t60_capture_minutes_before (drift-tracking).
     Returnerer 'updated' | 'failed_no_odds' | 'failed_no_pinnacle'.
+
+    OPS-ALERT: hvis pick.market_tier='PRIMARY' og kickoff <2t, fyrer
+    intern Telegram-alert via _emit_capture_fail_alert. Sjekkrekkefølge:
+      1. pinnacle_present=True + over_25_open=False → Trigger B
+      2. else if new_odds is None                   → Trigger A
+    Mutually exclusive per attempt. Rate-limit max 3 per (pick, trigger).
     """
     now = datetime.now(timezone.utc)
     minutes_before = _minutes_before_kickoff(now, row.get("kickoff_time"))
@@ -974,15 +1181,28 @@ async def _capture_t60(pool, row: dict, late: bool, client: httpx.AsyncClient) -
     market_open = status["over_25_open"]
     if new_odds is None:
         async with pool.acquire() as conn:
-            await conn.execute(
+            new_failed_count = await conn.fetchval(
                 """
                 UPDATE sniper_bets_v1 SET
                     snapshot_failed_count = COALESCE(snapshot_failed_count, 0) + 1,
                     market_open_at_t60 = $1,
                     updated_at = NOW()
-                WHERE id = $2;
+                WHERE id = $2
+                RETURNING snapshot_failed_count;
                 """,
                 market_open, row["id"],
+            )
+        if status["pinnacle_present"] and not market_open:
+            await _emit_capture_fail_alert(
+                pool, row, "B_MARKET_CLOSED", client,
+                detail="Pinnacle åpen, Over 2.5 marked stengt",
+                extra={"failed_count": int(new_failed_count or 0)},
+            )
+        else:
+            await _emit_capture_fail_alert(
+                pool, row, "A_FAILED_COUNT", client,
+                detail=f"Pinnacle responderte ikke (failed_count={int(new_failed_count or 0)})",
+                extra={"failed_count": int(new_failed_count or 0)},
             )
         return "failed_no_pinnacle" if not status["pinnacle_present"] else "failed_no_odds"
     clv = ((float(row["odds_open"]) - new_odds) / float(row["odds_open"])) * 100
@@ -1065,7 +1285,8 @@ async def update_odds_t60(pool) -> dict:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count
+            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count,
+                   market_tier, home_team, away_team, league, market
             FROM sniper_bets_v1
             WHERE odds_t60 IS NULL
               AND kickoff_time > NOW() + INTERVAL '50 minutes'
@@ -1241,7 +1462,8 @@ async def catch_missed_snapshots(pool) -> dict:
     async with pool.acquire() as conn:
         t60_rows = await conn.fetch(
             """
-            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count
+            SELECT id, match_id, odds_open, kickoff_time, snapshot_failed_count,
+                   market_tier, home_team, away_team, league, market
             FROM sniper_bets_v1
             WHERE odds_t60 IS NULL
               AND kickoff_time > NOW() + INTERVAL '10 minutes'

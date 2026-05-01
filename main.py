@@ -5089,6 +5089,18 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error("[Sniper] missed-snapshots failed: %s", e, exc_info=True)
 
+    async def _sniper_t60_timeout_alert_job():
+        """Trigger C: PRIMARY picks med T-60 vindu passert uten capture."""
+        if not db_state.connected or not db_state.pool:
+            return
+        try:
+            from services.sniper_live import t60_timeout_alert_scan
+            stats = await t60_timeout_alert_scan(db_state.pool)
+            if stats["checked"] > 0:
+                logger.warning("[Sniper] t60-timeout alert stats: %s", stats)
+        except Exception as e:
+            logger.error("[Sniper] t60-timeout alert failed: %s", e, exc_info=True)
+
     async def _clv_decision_engine_job():
         """PROFIT-MASKIN KODE 1: CLV decision-engine (PROPOSALS, ikke auto)."""
         if not db_state.connected or not db_state.pool:
@@ -5175,6 +5187,18 @@ async def lifespan(app: FastAPI):
             id="sniper_missed_snapshots",
             replace_existing=True,
             name="Sniper Missed-Snapshot Detector (KODE 2)",
+            misfire_grace_time=120, max_instances=1, coalesce=True,
+        )
+    if not scheduler.get_job("sniper_t60_timeout_alert"):
+        # Trigger C: PRIMARY picks der T-60-vinduet er forbi uten capture.
+        # Kjøres hvert 5. min, 12-22 UTC. NOT EXISTS-clause i scanneren
+        # garanterer max 1 alert per pick (uavhengig av A/B).
+        scheduler.add_job(
+            _sniper_t60_timeout_alert_job,
+            trigger=CronTrigger(minute="*/5", hour="12-22", timezone="UTC"),
+            id="sniper_t60_timeout_alert",
+            replace_existing=True,
+            name="Sniper T-60 Timeout Alert (Trigger C)",
             misfire_grace_time=120, max_instances=1, coalesce=True,
         )
     if not scheduler.get_job("clv_decision_engine"):
@@ -11952,6 +11976,144 @@ async def admin_sniper_missed_snapshots_manual():
         return {"status": "ok", "stats": await catch_missed_snapshots(db_state.pool)}
     except Exception as e:
         logger.error(f"[SniperMissedManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/test-t60-alert")
+async def admin_test_t60_alert(
+    pick_id: int,
+    trigger_type: str = "A",
+    dry_run: bool = True,
+):
+    """
+    Test-endpoint for T-60 capture-fail alerts (Trigger A/B/C).
+
+    Body params:
+      pick_id      — sniper_bets_v1.id
+      trigger_type — 'A' | 'B' | 'C' (eller full label
+                     'A_FAILED_COUNT' / 'B_MARKET_CLOSED' / 'C_T60_TIMEOUT')
+      dry_run      — true (default): bygg payload + sjekk rate-limit, ikke send
+                     false: send via samme path som produksjon
+
+    Returns rate_limit_status, message_preview, og (hvis dry_run=false)
+    Telegram API-respons.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    label_map = {
+        "A": "A_FAILED_COUNT",
+        "B": "B_MARKET_CLOSED",
+        "C": "C_T60_TIMEOUT",
+    }
+    trigger_full = label_map.get(trigger_type.upper(), trigger_type.upper())
+    if trigger_full not in ("A_FAILED_COUNT", "B_MARKET_CLOSED", "C_T60_TIMEOUT"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"invalid trigger_type: {trigger_type}"},
+        )
+    try:
+        from services.sniper_live import (
+            CAPTURE_FAIL_ALERT_RATE_LIMIT,
+            _emit_capture_fail_alert,
+            _trigger_label,
+        )
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, match_id, odds_open, kickoff_time,
+                       snapshot_failed_count, market_tier,
+                       home_team, away_team, league, market
+                FROM sniper_bets_v1
+                WHERE id = $1;
+                """,
+                pick_id,
+            )
+            if row is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"pick_id {pick_id} not found"},
+                )
+            sent_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM sniper_alert_log "
+                "WHERE pick_id = $1 AND trigger_type = $2;",
+                pick_id, trigger_full,
+            )
+
+        max_per_trigger = CAPTURE_FAIL_ALERT_RATE_LIMIT.get(trigger_full, 3)
+        sent_count = int(sent_count or 0)
+        rate_limit_blocked = sent_count >= max_per_trigger
+
+        token = os.environ.get("TELEGRAM_TOKEN", "")
+        intern_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
+        env_ok = bool(token and intern_chat)
+
+        from services.sniper_live import OSLO_TZ
+        kickoff_utc = row["kickoff_time"]
+        if kickoff_utc.tzinfo is None:
+            kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
+        minutes_to_kickoff = int(
+            (kickoff_utc - datetime.now(timezone.utc)).total_seconds() // 60
+        )
+        kickoff_oslo_str = kickoff_utc.astimezone(OSLO_TZ).strftime("%Y-%m-%d %H:%M %Z")
+        market = row["market"] or "OVER_2_5"
+        market_label = "Over 2.5" if market == "OVER_2_5" else market
+        attempt_n = sent_count + 1
+        attempt_label = (
+            f"Attempt: {attempt_n}/{max_per_trigger}"
+            if max_per_trigger > 1 else "Single-shot"
+        )
+        detail_map = {
+            "A_FAILED_COUNT":  f"Pinnacle responderte ikke (failed_count={row['snapshot_failed_count'] or 0})",
+            "B_MARKET_CLOSED": "Pinnacle åpen, Over 2.5 marked stengt",
+            "C_T60_TIMEOUT":   "T-60 vindu passert uten capture",
+        }
+        detail = detail_map[trigger_full]
+        message_preview = (
+            f"🚨 T-60 CAPTURE FAIL: {row['home_team']} vs {row['away_team']} | "
+            f"{market_label} | {_trigger_label(trigger_full)}\n"
+            f"Pick #{row['id']} · {row['league']}\n"
+            f"Kickoff: {kickoff_oslo_str} ({minutes_to_kickoff}m igjen)\n"
+            f"Detalj: {detail}\n"
+            f"{attempt_label}"
+        )
+
+        result = {
+            "status": "preview" if dry_run else "send_attempted",
+            "pick_id": pick_id,
+            "trigger_type": trigger_full,
+            "rate_limit_status": {
+                "sent_count": sent_count,
+                "max_per_trigger": max_per_trigger,
+                "blocked": rate_limit_blocked,
+            },
+            "env_check": {
+                "TELEGRAM_TOKEN_set": bool(token),
+                "DON_INTERNAL_TELEGRAM_CHAT_ID_set": bool(intern_chat),
+                "would_send": env_ok and not rate_limit_blocked,
+            },
+            "would_send_to": (
+                "DON_INTERNAL_TELEGRAM_CHAT_ID (intern ops-kanal)"
+                if env_ok else "STOPPED — env-var mangler"
+            ),
+            "minutes_to_kickoff": minutes_to_kickoff,
+            "market_tier": row["market_tier"],
+            "tier_filter_pass": (row["market_tier"] or "PRIMARY") == "PRIMARY",
+            "message_preview": message_preview,
+        }
+
+        if dry_run:
+            return result
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            sent = await _emit_capture_fail_alert(
+                db_state.pool, dict(row), trigger_full, client,
+                detail=detail,
+                extra={"test_endpoint": True},
+            )
+        result["sent"] = sent
+        return result
+    except Exception as e:
+        logger.error(f"[TestT60Alert] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
