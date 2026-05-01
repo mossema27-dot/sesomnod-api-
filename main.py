@@ -7141,7 +7141,7 @@ async def get_public_upcoming_edge():
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT id, home_team, away_team, league, kickoff_time,
-                       ROUND(edge_pct::numeric, 2) AS edge_pct
+                       ROUND(edge_pct::numeric, 4) AS edge_pct
                 FROM sniper_bets_v1
                 WHERE market_tier = 'PRIMARY'
                   AND result = 'PENDING'
