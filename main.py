@@ -5196,18 +5196,91 @@ async def lifespan(app: FastAPI):
             logger.error("[ClvDecisions] failed: %s", e, exc_info=True)
 
     async def _don_morning_report_job():
-        """PROFIT-MASKIN KODE 6: daglig morgen-rapport (05:00 UTC = 07:00 Oslo)."""
+        """PROFIT-MASKIN KODE 6: daglig morgen-rapport (06:00 UTC = 08:00 Oslo).
+
+        Lifecycle:
+          1. generate_morning_report → DB-arkiv (markdown for /admin/don-morning-report)
+          2. build_morning_intel_summary → live metrics (overnight + phase 0 + pipeline + alerts)
+          3. format_morning_intel_dump_telegram → MarkdownV2 DM
+          4. _telegram_send_dm til DON_INTERNAL_TELEGRAM_CHAT_ID (split hvis >4096)
+        """
         if not db_state.connected or not db_state.pool:
             return
+        admin_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
+        if not admin_chat:
+            logger.warning("[MorningIntel] DON_INTERNAL_TELEGRAM_CHAT_ID not set — skipping DM")
+            try:
+                from services.sniper_live import generate_morning_report
+                await generate_morning_report(db_state.pool)
+            except Exception as e:
+                logger.error("[MorningReport] DB archive failed: %s", e, exc_info=True)
+            return
+
         try:
-            from services.sniper_live import generate_morning_report
-            r = await generate_morning_report(db_state.pool)
+            from services.sniper_live import (
+                generate_morning_report,
+                build_morning_intel_summary,
+                format_morning_intel_dump_telegram,
+            )
+            try:
+                r = await generate_morning_report(db_state.pool)
+                logger.info(
+                    "[MorningReport] DB archive OK for %s (len=%d)",
+                    r.get("report_date"), len(r.get("report_markdown") or ""),
+                )
+            except Exception as e:
+                logger.warning("[MorningReport] DB archive failed (non-fatal): %s", e)
+
+            try:
+                summary = await build_morning_intel_summary(db_state.pool)
+            except Exception as e:
+                logger.error("[MorningIntel] build_summary failed: %s", e, exc_info=True)
+                await _telegram_send_dm(
+                    admin_chat,
+                    "🚨 Morning intel feilet — sjekk Railway logs",
+                    parse_mode=None,
+                )
+                return
+
+            try:
+                msg = format_morning_intel_dump_telegram(summary)
+            except Exception as e:
+                logger.error("[MorningIntel] format failed: %s", e, exc_info=True)
+                await _telegram_send_dm(
+                    admin_chat,
+                    "🚨 Morning intel format feilet — sjekk Railway logs",
+                    parse_mode=None,
+                )
+                return
+
+            chars = len(msg)
+            split_into = 1
+            if chars <= 4000:
+                ok = await _telegram_send_dm(admin_chat, msg, parse_mode="MarkdownV2")
+            else:
+                split_into = 2
+                lines = msg.split("\n")
+                half = len(lines) // 2
+                part1 = "\n".join(lines[:half]) + "\n\n\\(1/2\\)"
+                part2 = "\\(2/2\\)\n\n" + "\n".join(lines[half:])
+                ok1 = await _telegram_send_dm(admin_chat, part1, parse_mode="MarkdownV2")
+                ok2 = await _telegram_send_dm(admin_chat, part2, parse_mode="MarkdownV2")
+                ok = ok1 and ok2
+
             logger.info(
-                "[MorningReport] generated for %s (len=%d)",
-                r.get("report_date"), len(r.get("report_markdown") or ""),
+                "[MorningIntel] sent %d chars, split=%d, chat_id=%s, ok=%s",
+                chars, split_into, admin_chat, ok,
             )
         except Exception as e:
-            logger.error("[MorningReport] failed: %s", e, exc_info=True)
+            logger.error("[MorningIntel] fatal: %s", e, exc_info=True)
+            try:
+                await _telegram_send_dm(
+                    admin_chat,
+                    "🚨 Morning intel feilet — sjekk Railway logs",
+                    parse_mode=None,
+                )
+            except Exception:
+                pass
 
     if not scheduler.get_job("sniper_pick_generation"):
         scheduler.add_job(
@@ -5288,16 +5361,17 @@ async def lifespan(app: FastAPI):
             name="CLV Decision Engine (PROFIT KODE 1)",
             misfire_grace_time=600, max_instances=1, coalesce=True,
         )
-    if not scheduler.get_job("don_morning_report"):
-        # PROFIT-MASKIN KODE 6: daglig 05:00 UTC = 07:00 Oslo.
-        scheduler.add_job(
-            _don_morning_report_job,
-            trigger=CronTrigger(hour=5, minute=0, timezone="UTC"),
-            id="don_morning_report",
-            replace_existing=True,
-            name="Don Morning Report (PROFIT KODE 6)",
-            misfire_grace_time=900, max_instances=1, coalesce=True,
-        )
+    # PROFIT-MASKIN KODE 6: daglig 06:00 UTC = 08:00 Oslo CEST.
+    # replace_existing=True sikrer at eksisterende job med id "don_morning_report"
+    # oppdateres til ny cron-tid og ny callable ved deploy.
+    scheduler.add_job(
+        _don_morning_report_job,
+        trigger=CronTrigger(hour=6, minute=0, timezone="UTC"),
+        id="don_morning_report",
+        replace_existing=True,
+        name="Don Morning Intel V1 (PROFIT KODE 6)",
+        misfire_grace_time=900, max_instances=1, coalesce=True,
+    )
 
     # Daglig morgen-brief 06:45 UTC (08:45 Oslo)
     if not scheduler.get_job("morning_brief"):
@@ -12388,6 +12462,66 @@ async def admin_don_morning_report_generate_now():
         return await generate_morning_report(db_state.pool)
     except Exception as e:
         logger.error(f"[MorningReportManual] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/trigger-morning-intel")
+async def admin_trigger_morning_intel(admin_secret: str = ""):
+    """
+    PROFIT KODE 6: manuell smoke-test av Don's Morning Intel V1.
+    Bygger summary, formaterer DM, sender til DON_INTERNAL_TELEGRAM_CHAT_ID.
+    Returns full diagnostics (metrics, char-count, split-info, telegram-status).
+    """
+    expected = os.environ.get("ADMIN_SECRET", "")
+    if not expected or admin_secret != expected:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    admin_chat = os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")
+    if not admin_chat:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "DON_INTERNAL_TELEGRAM_CHAT_ID not set"},
+        )
+
+    try:
+        from services.sniper_live import (
+            build_morning_intel_summary,
+            format_morning_intel_dump_telegram,
+        )
+        summary = await build_morning_intel_summary(db_state.pool)
+        msg = format_morning_intel_dump_telegram(summary)
+        chars = len(msg)
+        split_into = 1
+        telegram_status: dict = {}
+
+        if chars <= 4000:
+            ok = await _telegram_send_dm(admin_chat, msg, parse_mode="MarkdownV2")
+            telegram_status = {"part1_ok": ok}
+        else:
+            split_into = 2
+            lines = msg.split("\n")
+            half = len(lines) // 2
+            part1 = "\n".join(lines[:half]) + "\n\n\\(1/2\\)"
+            part2 = "\\(2/2\\)\n\n" + "\n".join(lines[half:])
+            ok1 = await _telegram_send_dm(admin_chat, part1, parse_mode="MarkdownV2")
+            ok2 = await _telegram_send_dm(admin_chat, part2, parse_mode="MarkdownV2")
+            ok = ok1 and ok2
+            telegram_status = {"part1_ok": ok1, "part2_ok": ok2}
+
+        logger.info(
+            "[MorningIntel] manual trigger: %d chars, split=%d, ok=%s",
+            chars, split_into, ok,
+        )
+        return {
+            "status":             "sent" if ok else "failed",
+            "message_chars":      chars,
+            "split_into":         split_into,
+            "metrics_collected":  summary,
+            "telegram_response":  telegram_status,
+        }
+    except Exception as e:
+        logger.error(f"[MorningIntelTrigger] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 

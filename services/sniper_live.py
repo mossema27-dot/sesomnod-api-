@@ -2807,3 +2807,445 @@ async def build_sniper_dashboard(pool, window_days: int = 30) -> dict:
         "recent_picks": [dict(r) for r in recent],
         "kill_switch_status": kill,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DON'S MORNING INTEL DUMP V1
+# Bygger MarkdownV2-formatert daglig DM til DON_INTERNAL_TELEGRAM_CHAT_ID.
+# Ren formattering — caller bygger summary-dict og sender via Telegram-helper.
+# Ingen DB-skriving, ingen network. Trygg å unit-teste.
+# ─────────────────────────────────────────────────────────────────────────────
+
+OSLO_TZ = ZoneInfo("Europe/Oslo")
+NORSK_DAGER = ["Mandag", "Tirsdag", "Onsdag", "Torsdag", "Fredag", "Lørdag", "Søndag"]
+
+
+def _mdv2_esc(text: str) -> str:
+    """Lokal MarkdownV2-escape — samme regelsett som main._mdv2_escape."""
+    if text is None:
+        return ""
+    s = str(text)
+    for ch in ("\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
+def _fmt_pct(v, decimals: int = 2, sign: bool = True) -> str:
+    if v is None:
+        return "ERR"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "ERR"
+    if sign:
+        return f"{f:+.{decimals}f}%"
+    return f"{f:.{decimals}f}%"
+
+
+def _gate_mark(passed: bool) -> str:
+    return "✅" if passed else "❌"
+
+
+def _next_event_oslo(kickoff_utc) -> str:
+    if kickoff_utc is None:
+        return "—"
+    try:
+        if isinstance(kickoff_utc, str):
+            dt = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
+        else:
+            dt = kickoff_utc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        oslo = dt.astimezone(OSLO_TZ)
+        return oslo.strftime("%H:%M")
+    except Exception:
+        return "—"
+
+
+def _priority_for_day(weekday_idx: int, dato_iso: str, stripe_set: bool) -> str:
+    """0=man,1=tir,2=ons,3=tor,4=fre,5=lør,6=søn"""
+    if weekday_idx == 5:
+        return "Smoke-test FIX 1 + medium frontend-fixes"
+    if weekday_idx == 6:
+        return "Stripe Dashboard product + STRIPE env-vars + Telegram BotFather webhook"
+    if weekday_idx == 0:
+        if dato_iso >= "2026-05-04" and not stripe_set:
+            return "🚨 LAUNCH-DAG. STRIPE IKKE ARMERT. Fix før bulk-onboard."
+        return "Bulk-onboard 40 kunder via /admin/bulk-onboard"
+    return "Observere weekend-data + ingen scope creep"
+
+
+def format_morning_intel_dump_telegram(summary: dict) -> str:
+    """
+    Bygg MarkdownV2-formatert daglig intel-DM fra summary-dict.
+
+    Forventet summary-struktur (alle felt valgfrie — ERR/— vises ved missing):
+      overnight: {settled, wins, losses, avg_clv, trigger_c_24h}
+      phase0:    {settled_primary, target_primary, hit_rate_pct, avg_clv_pct,
+                  brier, mirofish_30d_avg_clv, mirofish_30d_positive,
+                  mirofish_30d_total}
+      gate:      {settled_pass, hit_rate_pass, clv_pass, brier_pass,
+                  settled, hit_rate, clv, brier}
+      pipeline:  {pending_today, pending_7d, next_t60_match, next_t60_oslo,
+                  next_kickoff_match, next_kickoff_oslo}
+      alerts:    {trigger_a_24h, trigger_b_24h, trigger_c_24h, snapshot_fails,
+                  scheduler_fails, scheduler_fail_jobs}
+      config:    {stripe_env_set, botfather_webhook_set}
+      meta:      {dato_iso, klokke_oslo, dag_navn, weekday_idx}
+    """
+    o = summary.get("overnight", {}) or {}
+    p = summary.get("phase0", {}) or {}
+    g = summary.get("gate", {}) or {}
+    pl = summary.get("pipeline", {}) or {}
+    a = summary.get("alerts", {}) or {}
+    cfg = summary.get("config", {}) or {}
+    m = summary.get("meta", {}) or {}
+
+    settled = o.get("settled") or 0
+    wins = o.get("wins") or 0
+    losses = o.get("losses") or 0
+    win_rate = (wins / settled * 100.0) if settled else None
+    win_rate_str = f"{win_rate:.1f}" if win_rate is not None else "—"
+
+    n_primary = p.get("settled_primary") or 0
+    target_primary = p.get("target_primary") or 100
+    pct_primary = (n_primary / target_primary * 100.0) if target_primary else 0.0
+
+    pending_today = pl.get("pending_today") or 0
+    pending_7d = pl.get("pending_7d") or 0
+
+    sched_fails = int(a.get("scheduler_fails") or 0)
+    sched_fail_jobs = a.get("scheduler_fail_jobs") or []
+
+    stripe_set = bool(cfg.get("stripe_env_set"))
+    bot_set = bool(cfg.get("botfather_webhook_set"))
+
+    dato = m.get("dato_iso") or "—"
+    klokke = m.get("klokke_oslo") or "—"
+    dag_navn = m.get("dag_navn") or "—"
+    weekday_idx = int(m.get("weekday_idx") or 0)
+
+    L: list[str] = []
+
+    # Header
+    L.append("🎯 *SESOMNOD DAGLIG INTEL*")
+    L.append(f"{_mdv2_esc(dag_navn)} {_mdv2_esc(dato)} · {_mdv2_esc(klokke)} CEST")
+    L.append("")
+
+    # Overnight
+    L.append("═══════════════════════════════")
+    L.append("📊 *OVERNIGHT* \\(siste 24t\\)")
+    L.append("═══════════════════════════════")
+    L.append(f"\\- Picks settled: {_mdv2_esc(settled)}")
+    L.append(f"  └ Wins: {_mdv2_esc(wins)} \\({_mdv2_esc(win_rate_str)}%\\) │ Losses: {_mdv2_esc(losses)}")
+    L.append(f"\\- Avg CLV close: {_mdv2_esc(_fmt_pct(o.get('avg_clv')))}")
+    L.append(f"\\- Tier C\\-alerts: {_mdv2_esc(a.get('trigger_c_24h') or 0)}")
+    L.append("")
+
+    # Phase 0
+    L.append("═══════════════════════════════")
+    L.append("🎯 *PHASE 0 PROGRESS*")
+    L.append("═══════════════════════════════")
+    L.append(f"\\- Settled PRIMARY total: {_mdv2_esc(n_primary)}/{_mdv2_esc(target_primary)} \\({_mdv2_esc(f'{pct_primary:.1f}')}%\\)")
+    L.append(f"\\- Hit rate \\(all\\-time\\): {_mdv2_esc(_fmt_pct(p.get('hit_rate_pct'), sign=False))}")
+    L.append(f"\\- Avg CLV close \\(all\\-time\\): {_mdv2_esc(_fmt_pct(p.get('avg_clv_pct')))}")
+    mf30_total = p.get("mirofish_30d_total") or 0
+    mf30_pos = p.get("mirofish_30d_positive") or 0
+    L.append(f"\\- 30d rolling CLV \\(mirofish\\): {_mdv2_esc(_fmt_pct(p.get('mirofish_30d_avg_clv')))}")
+    L.append(f"  └ Positive: {_mdv2_esc(mf30_pos)}/{_mdv2_esc(mf30_total)}")
+    L.append("")
+    L.append("*GATE\\-STATUS:*")
+    L.append(f"\\- Settled ≥100: {_gate_mark(bool(g.get('settled_pass')))} \\({_mdv2_esc(g.get('settled') or 0)}/100\\)")
+    L.append(f"\\- Hit rate ≥55%: {_gate_mark(bool(g.get('hit_rate_pass')))} \\({_mdv2_esc(_fmt_pct(g.get('hit_rate'), sign=False))}\\)")
+    L.append(f"\\- CLV close ≥\\+2%: {_gate_mark(bool(g.get('clv_pass')))} \\({_mdv2_esc(_fmt_pct(g.get('clv')))}\\)")
+    brier_v = g.get("brier")
+    brier_disp = f"{float(brier_v):.4f}" if brier_v is not None else "—"
+    L.append(f"\\- Brier ≤0\\.25: {_gate_mark(bool(g.get('brier_pass')))} \\({_mdv2_esc(brier_disp)}\\)")
+    L.append("")
+
+    # Pipeline
+    L.append("═══════════════════════════════")
+    L.append("⏰ *DAGENS PIPELINE*")
+    L.append("═══════════════════════════════")
+    L.append(f"\\- Pending i dag: {_mdv2_esc(pending_today)}")
+    L.append(f"\\- Pending neste 7 dager: {_mdv2_esc(pending_7d)}")
+    L.append("")
+    if pending_today > 0:
+        L.append("*NESTE EVENT:*")
+        nt60_m = pl.get("next_t60_match") or "—"
+        nt60_t = pl.get("next_t60_oslo") or "—"
+        nko_m = pl.get("next_kickoff_match") or "—"
+        nko_t = pl.get("next_kickoff_oslo") or "—"
+        L.append(f"\\- T\\-60: {_mdv2_esc(nt60_m)} kl {_mdv2_esc(nt60_t)} CEST")
+        L.append(f"\\- Kickoff: {_mdv2_esc(nko_m)} kl {_mdv2_esc(nko_t)} CEST")
+    else:
+        L.append("\\- Ingen pending picks i dag\\. Disiplin\\.")
+    L.append("")
+
+    # Alerts
+    L.append("═══════════════════════════════")
+    L.append("🚨 *ALERTS SISTE 24T*")
+    L.append("═══════════════════════════════")
+    L.append("\\- T\\-60 capture fails:")
+    L.append(f"  └ Trigger A \\(no Pinnacle\\): {_mdv2_esc(a.get('trigger_a_24h') or 0)}")
+    L.append(f"  └ Trigger B \\(market closed\\): {_mdv2_esc(a.get('trigger_b_24h') or 0)}")
+    L.append(f"  └ Trigger C \\(window passed\\): {_mdv2_esc(a.get('trigger_c_24h') or 0)}")
+    L.append(f"\\- Snapshot failures: {_mdv2_esc(a.get('snapshot_fails') or 0)}")
+    L.append(f"\\- Scheduler job failures: {_mdv2_esc(sched_fails)}")
+    if sched_fails > 0 and sched_fail_jobs:
+        for jname in sched_fail_jobs[:6]:
+            L.append(f"  └ {_mdv2_esc(jname)}")
+    L.append("")
+
+    # Config
+    L.append("═══════════════════════════════")
+    L.append("⚠️ *KJENTE HULL & PENDING*")
+    L.append("═══════════════════════════════")
+    L.append(f"\\- Stripe env\\-vars: {_mdv2_esc('SET' if stripe_set else 'NOT SET')}")
+    L.append(f"\\- BotFather webhook: {_mdv2_esc('SET' if bot_set else 'NOT SET')}")
+    L.append("\\- 4 medium frontend\\-issues: pending lørdag")
+    L.append("\\- FIX 1 \\(DM\\-dispatch wired\\): pending lørdag")
+    if dato >= "2026-05-04" and not stripe_set:
+        L.append("")
+        L.append("🚨 *LAUNCH\\-DAG\\. STRIPE IKKE ARMERT\\.*")
+    L.append("")
+
+    # Priority
+    L.append("═══════════════════════════════")
+    L.append("*DAGENS PRIORITET*")
+    L.append("═══════════════════════════════")
+    L.append(_mdv2_esc(_priority_for_day(weekday_idx, dato, stripe_set)))
+
+    return "\n".join(L)
+
+
+async def build_morning_intel_summary(pool) -> dict:
+    """
+    Samle alle metrics for morgen-intel DM. Hver query er try/except —
+    en feilet seksjon viser "ERR" i melding, men resten leveres.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_oslo = now_utc.astimezone(OSLO_TZ)
+    dato_iso = now_oslo.date().isoformat()
+    klokke_oslo = now_oslo.strftime("%H:%M")
+    weekday_idx = now_oslo.weekday()
+    dag_navn = NORSK_DAGER[weekday_idx]
+
+    overnight: dict = {}
+    phase0: dict = {}
+    gate: dict = {}
+    pipeline: dict = {}
+    alerts: dict = {}
+    config: dict = {}
+
+    # Overnight (last 24h, settled + clv)
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS settled,
+                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
+                    COUNT(*) FILTER (WHERE result = 'LOSS') AS losses,
+                    AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv
+                FROM sniper_bets_v1
+                WHERE settled_at > NOW() - INTERVAL '24 hours'
+                  AND market_tier = 'PRIMARY'
+                """
+            )
+            overnight = {
+                "settled": int(row["settled"] or 0),
+                "wins":    int(row["wins"] or 0),
+                "losses":  int(row["losses"] or 0),
+                "avg_clv": float(row["avg_clv"]) if row["avg_clv"] is not None else None,
+            }
+    except Exception as e:
+        logger.warning(f"[MorningIntel] overnight query failed: {e}")
+        overnight = {"settled": None, "wins": None, "losses": None, "avg_clv": None}
+
+    # Phase 0 progress (PRIMARY all-time)
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS settled,
+                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
+                    AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv
+                FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                """
+            )
+            settled = int(row["settled"] or 0)
+            wins = int(row["wins"] or 0)
+            hit_rate = (wins / settled * 100.0) if settled else None
+            avg_clv = float(row["avg_clv"]) if row["avg_clv"] is not None else None
+            mf_row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    AVG(clv_pct) AS avg_clv,
+                    COUNT(*) FILTER (WHERE clv_pct > 0) AS positive
+                FROM clv_records
+                WHERE tracked_at > NOW() - INTERVAL '30 days'
+                """
+            )
+            phase0 = {
+                "settled_primary":          settled,
+                "target_primary":           100,
+                "hit_rate_pct":             hit_rate,
+                "avg_clv_pct":              avg_clv,
+                "brier":                    None,
+                "mirofish_30d_avg_clv":     float(mf_row["avg_clv"]) if mf_row and mf_row["avg_clv"] is not None else None,
+                "mirofish_30d_positive":    int(mf_row["positive"] or 0) if mf_row else 0,
+                "mirofish_30d_total":       int(mf_row["total"] or 0) if mf_row else 0,
+            }
+            try:
+                brier_row = await conn.fetchrow(
+                    """
+                    SELECT AVG(brier_score) AS avg_brier
+                    FROM picks_v2
+                    WHERE brier_score IS NOT NULL
+                    """
+                )
+                phase0["brier"] = float(brier_row["avg_brier"]) if brier_row and brier_row["avg_brier"] is not None else None
+            except Exception:
+                pass
+            gate = {
+                "settled":         settled,
+                "settled_pass":    settled >= 100,
+                "hit_rate":        hit_rate,
+                "hit_rate_pass":   hit_rate is not None and hit_rate >= 55.0,
+                "clv":             avg_clv,
+                "clv_pass":        avg_clv is not None and avg_clv >= 2.0,
+                "brier":           phase0["brier"],
+                "brier_pass":      phase0["brier"] is not None and phase0["brier"] <= 0.25,
+            }
+    except Exception as e:
+        logger.warning(f"[MorningIntel] phase0 query failed: {e}")
+        phase0 = {"settled_primary": None}
+        gate = {}
+
+    # Pipeline (pending today + 7d + next events)
+    try:
+        async with pool.acquire() as conn:
+            today_oslo_date = now_oslo.date()
+            tomorrow_oslo = today_oslo_date.replace() if False else None
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE (kickoff_time AT TIME ZONE 'Europe/Oslo')::date = (NOW() AT TIME ZONE 'Europe/Oslo')::date
+                    ) AS pending_today,
+                    COUNT(*) FILTER (
+                        WHERE kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '7 days'
+                    ) AS pending_7d
+                FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                  AND result = 'PENDING'
+                  AND kickoff_time > NOW()
+                """
+            )
+            next_row = await conn.fetchrow(
+                """
+                SELECT home_team, away_team, kickoff_time
+                FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                  AND result = 'PENDING'
+                  AND kickoff_time > NOW()
+                ORDER BY kickoff_time ASC
+                LIMIT 1
+                """
+            )
+            pending_today_count = int(row["pending_today"] or 0)
+            pending_7d_count = int(row["pending_7d"] or 0)
+            if next_row:
+                ko = next_row["kickoff_time"]
+                ko_oslo = ko.astimezone(OSLO_TZ) if ko else None
+                t60_oslo = (ko - timedelta(minutes=60)).astimezone(OSLO_TZ) if ko else None
+                pipeline = {
+                    "pending_today":         pending_today_count,
+                    "pending_7d":            pending_7d_count,
+                    "next_t60_match":        f"{next_row['home_team']} vs {next_row['away_team']}",
+                    "next_t60_oslo":         t60_oslo.strftime("%H:%M") if t60_oslo else "—",
+                    "next_kickoff_match":    f"{next_row['home_team']} vs {next_row['away_team']}",
+                    "next_kickoff_oslo":     ko_oslo.strftime("%H:%M") if ko_oslo else "—",
+                }
+            else:
+                pipeline = {
+                    "pending_today":         pending_today_count,
+                    "pending_7d":            pending_7d_count,
+                    "next_t60_match":        "—",
+                    "next_t60_oslo":         "—",
+                    "next_kickoff_match":    "—",
+                    "next_kickoff_oslo":     "—",
+                }
+    except Exception as e:
+        logger.warning(f"[MorningIntel] pipeline query failed: {e}")
+        pipeline = {"pending_today": None}
+
+    # Alerts (24h trigger A/B/C + snapshot fails)
+    try:
+        async with pool.acquire() as conn:
+            alert_rows = await conn.fetch(
+                """
+                SELECT trigger_type, COUNT(*) AS n
+                FROM sniper_alert_log
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY trigger_type
+                """
+            )
+            tri = {r["trigger_type"]: int(r["n"]) for r in alert_rows}
+
+            snap_fails = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM sniper_bets_v1
+                WHERE pick_timestamp > NOW() - INTERVAL '24 hours'
+                  AND COALESCE(snapshot_failed_count, 0) > 0
+                """
+            ) or 0
+
+            def _trig_count(prefix: str) -> int:
+                total = 0
+                for k, v in tri.items():
+                    if k and k.startswith(prefix):
+                        total += int(v)
+                return total
+
+            alerts = {
+                "trigger_a_24h":   _trig_count("A"),
+                "trigger_b_24h":   _trig_count("B"),
+                "trigger_c_24h":   _trig_count("C"),
+                "snapshot_fails":  int(snap_fails),
+                "scheduler_fails": 0,
+                "scheduler_fail_jobs": [],
+            }
+    except Exception as e:
+        logger.warning(f"[MorningIntel] alerts query failed: {e}")
+        alerts = {
+            "trigger_a_24h": None, "trigger_b_24h": None, "trigger_c_24h": None,
+            "snapshot_fails": None, "scheduler_fails": 0, "scheduler_fail_jobs": [],
+        }
+
+    # Config (env-vars)
+    config = {
+        "stripe_env_set":         bool(os.environ.get("STRIPE_SECRET_KEY") and os.environ.get("STRIPE_PRICE_ID")),
+        "botfather_webhook_set":  bool(os.environ.get("TELEGRAM_WEBHOOK_SECRET")),
+    }
+
+    return {
+        "overnight": overnight,
+        "phase0":    phase0,
+        "gate":      gate,
+        "pipeline":  pipeline,
+        "alerts":    alerts,
+        "config":    config,
+        "meta": {
+            "dato_iso":     dato_iso,
+            "klokke_oslo":  klokke_oslo,
+            "dag_navn":     dag_navn,
+            "weekday_idx":  weekday_idx,
+            "now_utc_iso":  now_utc.isoformat(),
+        },
+    }
