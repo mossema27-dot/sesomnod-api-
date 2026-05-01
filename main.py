@@ -76,6 +76,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sesomnod")
 
+# Module-load stamp for uptime/runtime-info debugging.
+_APP_LOADED_AT = datetime.now(timezone.utc)
+
 
 # ───────────────────────────────────────────────────
 # MiroFish Swarm V2 (ConsensusEngine + MOATEngine)
@@ -11977,6 +11980,65 @@ async def admin_sniper_missed_snapshots_manual():
     except Exception as e:
         logger.error(f"[SniperMissedManual] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/debug-env")
+async def admin_debug_env():
+    """
+    Diagnostic: list env vars matching TELEGRAM/CHAT/DON without exposing
+    actual values. Returns name, is_set, length, first 3 chars, last 2 chars.
+
+    Brukes for å avdekke env-name typo eller blank value uten å lekke
+    chat_ids til logg/respons.
+    """
+    keywords = ("TELEGRAM", "CHAT", "DON")
+    matched = sorted(
+        k for k in os.environ.keys()
+        if any(kw in k.upper() for kw in keywords)
+    )
+    out = []
+    for name in matched:
+        raw = os.environ.get(name, "")
+        is_set = bool(raw)
+        out.append({
+            "variable_name": name,
+            "is_set": is_set,
+            "value_length": len(raw),
+            "starts_with": raw[:3] if raw else None,
+            "ends_with": raw[-2:] if raw else None,
+            "has_leading_whitespace": bool(raw) and raw != raw.lstrip(),
+            "has_trailing_whitespace": bool(raw) and raw != raw.rstrip(),
+        })
+    return {
+        "status": "ok",
+        "keywords": list(keywords),
+        "match_count": len(out),
+        "matches": out,
+        "expected_var": "DON_INTERNAL_TELEGRAM_CHAT_ID",
+        "expected_set": bool(os.environ.get("DON_INTERNAL_TELEGRAM_CHAT_ID", "")),
+    }
+
+
+@app.get("/admin/runtime-info")
+async def admin_runtime_info():
+    """
+    Diagnostic: runtime-info for å avgjøre om Railway har restartet etter
+    siste deploy. Returns module-load timestamp + uptime + git commit.
+    """
+    now = datetime.now(timezone.utc)
+    uptime_seconds = int((now - _APP_LOADED_AT).total_seconds())
+    return {
+        "status": "ok",
+        "now_utc": now.isoformat(),
+        "module_loaded_at_utc": _APP_LOADED_AT.isoformat(),
+        "uptime_seconds": uptime_seconds,
+        "uptime_minutes": round(uptime_seconds / 60, 1),
+        "git_commit_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")[:12] or None,
+        "git_branch": os.environ.get("RAILWAY_GIT_BRANCH") or None,
+        "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID") or None,
+        "service_name": os.environ.get("RAILWAY_SERVICE_NAME", "sesomnod-api"),
+        "environment": os.environ.get("RAILWAY_ENVIRONMENT", "production"),
+    }
 
 
 @app.post("/admin/test-t60-alert")
