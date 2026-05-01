@@ -4877,14 +4877,17 @@ async def lifespan(app: FastAPI):
             return
         try:
             async with db_state.pool.acquire() as conn:
-                today_picks = await conn.fetchval(
-                    "SELECT COUNT(*) FROM picks_v2 WHERE DATE(kickoff_oslo) = CURRENT_DATE AND post_telegram = TRUE"
-                ) or 0
+                today_picks = await conn.fetchval("""
+                    SELECT COUNT(*) FROM picks_v2
+                    WHERE DATE(kickoff_time) = CURRENT_DATE
+                      AND telegram_posted = TRUE
+                      AND tier IN ('ATOMIC', 'EDGE')
+                """) or 0
             if today_picks == 0:
-                logger.info("[NoPickCron] 0 picks today → dispatching no-pick discipline DM")
+                logger.info("[NoPickCron] 0 ATOMIC/EDGE picks today → dispatching no-pick discipline DM")
                 await dispatch_no_pick_message()
             else:
-                logger.info(f"[NoPickCron] {today_picks} picks today → no discipline DM needed")
+                logger.info(f"[NoPickCron] {today_picks} ATOMIC/EDGE picks today → no discipline DM needed")
         except Exception as e:
             logger.error(f"[NoPickCron] {e}", exc_info=True)
 
