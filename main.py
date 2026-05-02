@@ -3024,8 +3024,16 @@ async def pre_kickoff_check():
                         # Notion
                         await _log_notion_pick(best_with_kickoff)
 
-                        # Telegram
-                        if cfg.TELEGRAM_TOKEN and cfg.TELEGRAM_CHAT_ID:
+                        # Telegram — TIER GATE (audit 2026-05-02): aldri post MONITORED til kunde-kanal.
+                        # Kunde-vendt posting krever ATOMIC eller EDGE + edge >= 6.0.
+                        # MONITORED-picks lagres til DB for sporbarhet, men sendes ikke ut.
+                        _best_tier = best.get("tier") or best_with_kickoff.get("tier")
+                        try:
+                            _best_edge = float(best.get("edge") or 0)
+                        except (TypeError, ValueError):
+                            _best_edge = 0.0
+                        _tier_ok = _best_tier in ("ATOMIC", "EDGE") and _best_edge >= 6.0
+                        if cfg.TELEGRAM_TOKEN and cfg.TELEGRAM_CHAT_ID and _tier_ok:
                             msg = _format_pick_message(best_with_kickoff, rank=1)
                             async with httpx.AsyncClient(timeout=15) as client:
                                 tresp = await client.post(
@@ -3038,7 +3046,12 @@ async def pre_kickoff_check():
                                         "UPDATE dagens_kamp SET telegram_posted=TRUE WHERE id=$1",
                                         row_id
                                     )
-                                logger.info(f"[PreKickoff] Postet til Telegram: {best['pick']} — {m['home_team']} vs {m['away_team']}")
+                                logger.info(f"[PreKickoff] Postet til Telegram: {best['pick']} — {m['home_team']} vs {m['away_team']} [{_best_tier} edge={_best_edge:.2f}]")
+                        elif cfg.TELEGRAM_TOKEN and cfg.TELEGRAM_CHAT_ID:
+                            logger.info(
+                                f"[PreKickoff] BLOCKED MONITORED leak: {m['home_team']} vs {m['away_team']} "
+                                f"tier={_best_tier} edge={_best_edge:.2f} (gate requires ATOMIC/EDGE + edge>=6.0)"
+                            )
                 else:
                     picks_ev = []
                     all_raw = await _analyse_snapshot(league, [m], now, conn=None)
@@ -3962,10 +3975,15 @@ async def _build_morning_brief() -> str:
                 )
                 api_calls_month = int(api_row["cnt"]) if api_row else 0
 
+                # TIER GATE (audit 2026-05-02): topp-3 i kunde-vendt morgen-brief
+                # MÅ være ATOMIC/EDGE + edge >= 6. Eksisterende fallback "ingen
+                # kvalifiserte picks" + "Disiplin > volum" trigges automatisk om 0 rader.
                 top3 = await conn.fetch("""
                     SELECT match, pick, odds, edge, tier
                     FROM dagens_kamp
                     WHERE result IS NULL
+                      AND tier IN ('ATOMIC', 'EDGE')
+                      AND edge >= 6
                       AND kickoff BETWEEN NOW() - INTERVAL '3 hours'
                                       AND NOW() + INTERVAL '36 hours'
                     ORDER BY score DESC NULLS LAST, ev DESC NULLS LAST

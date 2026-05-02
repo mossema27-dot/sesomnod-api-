@@ -2955,7 +2955,7 @@ def format_morning_intel_dump_telegram(summary: dict) -> str:
     L.append(f"  └ Positive: {_mdv2_esc(mf30_pos)}/{_mdv2_esc(mf30_total)}")
     L.append("")
     L.append("*GATE\\-STATUS:*")
-    L.append(f"\\- Settled ≥100: {_gate_mark(bool(g.get('settled_pass')))} \\({_mdv2_esc(g.get('settled') or 0)}/100\\)")
+    L.append(f"\\- Settled ≥30: {_gate_mark(bool(g.get('settled_pass')))} \\({_mdv2_esc(g.get('settled') or 0)}/30\\)")
     L.append(f"\\- Hit rate ≥55%: {_gate_mark(bool(g.get('hit_rate_pass')))} \\({_mdv2_esc(_fmt_pct(g.get('hit_rate'), sign=False))}\\)")
     L.append(f"\\- CLV close ≥\\+2%: {_gate_mark(bool(g.get('clv_pass')))} \\({_mdv2_esc(_fmt_pct(g.get('clv')))}\\)")
     brier_v = g.get("brier")
@@ -3063,23 +3063,31 @@ async def build_morning_intel_summary(pool) -> dict:
         logger.warning(f"[MorningIntel] overnight query failed: {e}")
         overnight = {"settled": None, "wins": None, "losses": None, "avg_clv": None}
 
-    # Phase 0 progress (PRIMARY all-time)
+    # Phase 0 progress — AUDIT 2026-05-02: hent fra dagens_kamp + picks_v2 (samme
+    # som morning_brief/_dashboard_stats), IKKE sniper_bets_v1. Sniper-pipelinen
+    # kjører som intern R&D men har 0 settled — det er ikke Don's track record.
+    # Gjeldende sannhet: ~28/30 settled, hit ~50%, CLV +3.77% (mirofish).
     try:
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
+            # Settled fra dagens_kamp (samme kilde som morning_brief)
+            ops_row = await conn.fetchrow("""
                 SELECT
-                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS settled,
-                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
-                    AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS avg_clv
-                FROM sniper_bets_v1
-                WHERE market_tier = 'PRIMARY'
-                """
-            )
-            settled = int(row["settled"] or 0)
-            wins = int(row["wins"] or 0)
+                    (SELECT COUNT(*) FROM dagens_kamp WHERE result IS NOT NULL) AS settled,
+                    (SELECT COUNT(*) FROM dagens_kamp dk
+                     LEFT JOIN picks_v2 pv
+                       ON pv.home_team = dk.home_team
+                       AND pv.away_team = dk.away_team
+                       AND pv.odds = dk.odds
+                       AND pv.kickoff_time = dk.kickoff
+                     WHERE dk.result IS NOT NULL
+                       AND COALESCE(pv.outcome,
+                           CASE WHEN dk.result IN ('WIN','LOSS') THEN dk.result END) = 'WIN') AS wins
+            """)
+            settled = int(ops_row["settled"] or 0) if ops_row else 0
+            wins = int(ops_row["wins"] or 0) if ops_row else 0
             hit_rate = (wins / settled * 100.0) if settled else None
-            avg_clv = float(row["avg_clv"]) if row["avg_clv"] is not None else None
+
+            # 30d rolling CLV fra clv_records (mirofish-domenet, samme som /clv)
             mf_row = await conn.fetchrow(
                 """
                 SELECT
@@ -3090,9 +3098,15 @@ async def build_morning_intel_summary(pool) -> dict:
                 WHERE tracked_at > NOW() - INTERVAL '30 days'
                 """
             )
+            # All-time avg CLV fra clv_records (kunde-vendt sannhet, +3.77%)
+            avg_clv_all = await conn.fetchval(
+                "SELECT AVG(clv_pct) FROM clv_records WHERE clv_pct IS NOT NULL"
+            )
+            avg_clv = float(avg_clv_all) if avg_clv_all is not None else None
+
             phase0 = {
                 "settled_primary":          settled,
-                "target_primary":           100,
+                "target_primary":           30,
                 "hit_rate_pct":             hit_rate,
                 "avg_clv_pct":              avg_clv,
                 "brier":                    None,
@@ -3111,9 +3125,12 @@ async def build_morning_intel_summary(pool) -> dict:
                 phase0["brier"] = float(brier_row["avg_brier"]) if brier_row and brier_row["avg_brier"] is not None else None
             except Exception:
                 pass
+
+            # Gate-kriterier matcher kunde-vendt morning_brief: settled ≥30, hit ≥55%,
+            # CLV ≥+2%, Brier ≤0.25.
             gate = {
                 "settled":         settled,
-                "settled_pass":    settled >= 100,
+                "settled_pass":    settled >= 30,
                 "hit_rate":        hit_rate,
                 "hit_rate_pass":   hit_rate is not None and hit_rate >= 55.0,
                 "clv":             avg_clv,
