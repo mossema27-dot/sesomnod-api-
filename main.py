@@ -3993,15 +3993,25 @@ async def _build_morning_brief() -> str:
         except Exception as e:
             logger.warning(f"[MorningBrief] DB-feil: {e}")
 
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as hx:
-            r = await hx.get("https://mirofish-service-production.up.railway.app/summary")
-            if r.status_code == 200:
-                _raw = r.json().get("avg_clv")
-                if _raw is not None:
-                    avg_clv = round(float(_raw), 2)
-    except Exception as e:
-        logger.warning(f"[MorningBrief] MiroFish-feil: {e}")
+    # AUDIT 2026-05-03: kunde-vendt morgen-brief leser nå clv_records (lokal DB)
+    # direkte — samme kilde som intel-dump (build_morning_intel_summary:3091-3105)
+    # og frontend DriftDisclosure (/clv). MiroFish-service /summary var stale
+    # siden 29. april (frosset på 101/+3.77%) og forårsaket tre divergerende
+    # CLV-tall mellom DM, kanal og frontend. Single source of truth = clv_records.
+    if db_state.connected and db_state.pool:
+        try:
+            async with db_state.pool.acquire() as conn:
+                mf_row = await conn.fetchrow(
+                    """
+                    SELECT AVG(clv_pct) AS avg_clv
+                    FROM clv_records
+                    WHERE tracked_at > NOW() - INTERVAL '30 days'
+                    """
+                )
+                if mf_row and mf_row["avg_clv"] is not None:
+                    avg_clv = round(float(mf_row["avg_clv"]), 2)
+        except Exception as e:
+            logger.warning(f"[MorningBrief] clv_records-feil: {e}")
 
     health_emoji = "🟢" if db_state.connected else "🔴"
     api_remaining = max(0, API_MONTHLY_BUDGET - api_calls_month)
