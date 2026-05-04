@@ -14759,7 +14759,7 @@ async def admin_unknown_league_forensics(window: int = 30):
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, match_name, home_team, away_team, league, market_name,
+                SELECT id, match_name, home_team, away_team, league, predicted_outcome,
                        tier, status, outcome, odds, soft_edge, soft_ev,
                        atomic_score, pinnacle_clv, kickoff_time, created_at,
                        (smartpick_payload IS NOT NULL) AS has_payload,
