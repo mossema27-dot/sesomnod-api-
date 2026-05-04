@@ -14783,3 +14783,83 @@ async def admin_unknown_league_forensics(window: int = 30):
     except Exception as e:
         logger.error(f"/admin/unknown-league-forensics error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/clv-export")
+async def admin_clv_export(days: int = 30):
+    """Per-pick rådata for offentlig CLV-verifikasjon.
+    JOINs picks_v2 with clv_records for real Pinnacle close.
+    Includes ALL tier (proves measurement integrity, not cherry-picking).
+    is_backfilled = scan_session IS NULL OR atomic_score = 0."""
+    if days < 1 or days > 365:
+        days = 30
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    p.id                                            AS pick_id,
+                    p.created_at                                    AS pick_timestamp_utc,
+                    p.league                                        AS league,
+                    p.home_team                                     AS home_team,
+                    p.away_team                                     AS away_team,
+                    p.kickoff_time                                  AS kickoff_utc,
+                    p.predicted_outcome                             AS market_code,
+                    p.match_name                                    AS selection,
+                    p.odds                                          AS our_odds_at_pick,
+                    cr.pinnacle_opening                             AS pinnacle_no_vig_open,
+                    cr.pinnacle_closing                             AS pinnacle_no_vig_close,
+                    cr.clv_pct                                      AS clv_pct,
+                    p.outcome                                       AS outcome,
+                    p.tier                                          AS tier,
+                    p.atomic_score                                  AS atomic_score,
+                    p.soft_edge                                     AS soft_edge,
+                    p.scan_session                                  AS scan_session,
+                    (p.scan_session IS NULL OR p.atomic_score = 0)  AS is_backfilled
+                FROM picks_v2 p
+                LEFT JOIN clv_records cr ON cr.pick_id = p.id
+                WHERE p.created_at >= NOW() - ($1 || ' days')::interval
+                  AND cr.pinnacle_closing IS NOT NULL
+                ORDER BY p.created_at DESC
+                """,
+                str(days),
+            )
+        return {
+            "days_requested": days,
+            "rows_returned": len(rows),
+            "picks": [
+                {
+                    "pick_id": int(r["pick_id"]),
+                    "pick_timestamp_utc": r["pick_timestamp_utc"].isoformat() if r["pick_timestamp_utc"] else None,
+                    "league": r["league"],
+                    "home_team": r["home_team"],
+                    "away_team": r["away_team"],
+                    "kickoff_utc": r["kickoff_utc"].isoformat() if r["kickoff_utc"] else None,
+                    "market_code": r["market_code"],
+                    "selection": r["selection"],
+                    "our_odds_at_pick": float(r["our_odds_at_pick"]) if r["our_odds_at_pick"] is not None else None,
+                    "pinnacle_no_vig_open": float(r["pinnacle_no_vig_open"]) if r["pinnacle_no_vig_open"] is not None else None,
+                    "pinnacle_no_vig_close": float(r["pinnacle_no_vig_close"]) if r["pinnacle_no_vig_close"] is not None else None,
+                    "clv_pct": float(r["clv_pct"]) if r["clv_pct"] is not None else None,
+                    "outcome": r["outcome"],
+                    "tier": r["tier"],
+                    "atomic_score": int(r["atomic_score"]) if r["atomic_score"] is not None else None,
+                    "soft_edge": float(r["soft_edge"]) if r["soft_edge"] is not None else None,
+                    "scan_session": r["scan_session"],
+                    "is_backfilled": bool(r["is_backfilled"]),
+                }
+                for r in rows
+            ],
+            "_notes": {
+                "filter": "Only picks with cr.pinnacle_closing NOT NULL — real Pinnacle close required",
+                "backfill_flag": "is_backfilled = true if scan_session IS NULL OR atomic_score = 0 (legacy backfill or dummy rescue)",
+                "tier_inclusion": "ALL tiers included (ATOMIC + EDGE + MONITORED) — measurement integrity proof",
+                "clv_source": "clv_records.clv_pct via Pinnacle no-vig opening + closing odds",
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/clv-export error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
