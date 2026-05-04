@@ -10651,21 +10651,25 @@ async def admin_phase0_stats(window: int = 30):
     # faktisk teller dummy-radene som ble ekskludert fra hovedaggregatene.
     DUMMY_COND = "(atomic_score = 0 AND (soft_ev IS NULL OR ABS(soft_ev) < 0.05))"
     NOT_DUMMY = f"NOT {DUMMY_COND}"
+    NOT_DEMO = "COALESCE(is_demo, false) = false"
 
     try:
         async with db_state.pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
                 SELECT
-                    COUNT(*) FILTER (WHERE status='RESULT_LOGGED' AND {NOT_DUMMY})                                    AS settled_count,
-                    COUNT(*) FILTER (WHERE tier='ATOMIC' AND {NOT_DUMMY})                                             AS atomic_count,
-                    COUNT(*) FILTER (WHERE tier='EDGE' AND {NOT_DUMMY})                                               AS edge_count,
-                    COUNT(*) FILTER (WHERE tier='MONITORED' AND {NOT_DUMMY})                                          AS monitored_count,
-                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND {NOT_DUMMY})      AS settled_atomic_edge,
-                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN' AND {NOT_DUMMY}) AS wins_atomic_edge,
-                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE AND {NOT_DUMMY}) AS avg_model_edge_pct,
-                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED' AND {NOT_DUMMY})    AS avg_brier_score,
-                    COUNT(*) FILTER (WHERE {DUMMY_COND}) AS dummy_excluded_count
+                    COUNT(*) FILTER (WHERE status='RESULT_LOGGED' AND {NOT_DUMMY} AND {NOT_DEMO})                                    AS settled_count,
+                    COUNT(*) FILTER (WHERE tier='ATOMIC' AND {NOT_DUMMY} AND {NOT_DEMO})                                             AS atomic_count,
+                    COUNT(*) FILTER (WHERE tier='EDGE' AND {NOT_DUMMY} AND {NOT_DEMO})                                               AS edge_count,
+                    COUNT(*) FILTER (WHERE tier='MONITORED' AND {NOT_DUMMY} AND {NOT_DEMO})                                          AS monitored_count,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND {NOT_DUMMY} AND {NOT_DEMO})      AS settled_atomic_edge,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED' AND outcome='WIN' AND {NOT_DUMMY} AND {NOT_DEMO}) AS wins_atomic_edge,
+                    AVG(pinnacle_clv) FILTER (WHERE pinnacle_clv IS NOT NULL AND clv_missing IS NOT TRUE AND {NOT_DUMMY} AND {NOT_DEMO}) AS avg_model_edge_pct,
+                    AVG(brier_score) FILTER (WHERE brier_score IS NOT NULL AND status='RESULT_LOGGED' AND {NOT_DUMMY} AND {NOT_DEMO})    AS avg_brier_score,
+                    COUNT(*) FILTER (WHERE {DUMMY_COND}) AS dummy_excluded_count,
+                    COUNT(*) FILTER (WHERE COALESCE(is_demo, false) = true
+                                     AND tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED'
+                                     AND {NOT_DUMMY}) AS demo_excluded_count
                 FROM picks_v2
                 WHERE created_at >= NOW() - ($1 || ' days')::interval
                 """,
@@ -10725,6 +10729,7 @@ async def admin_phase0_stats(window: int = 30):
                 "drawdown_under_20pct": "DEFERRED (sequential P&L not in single-aggregate SQL)",
             },
             "dummy_excluded_count": int(row["dummy_excluded_count"] or 0),
+            "demo_excluded_count": int(row["demo_excluded_count"] or 0),
             "_notes": {
                 "naming": "Path uses 'phase0' for caller compatibility; threshold logic = compute_phase1_gate per CLAUDE.md.",
                 "tier_filter": "hit_rate_pct restricted to tier IN ('ATOMIC','EDGE'); MONITORED/SKIP excluded.",
@@ -14862,4 +14867,163 @@ async def admin_clv_export(days: int = 30):
         }
     except Exception as e:
         logger.error(f"/admin/clv-export error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ─────────────────────────────────────────────────────────
+# DEMO-DATA INTEGRITY (additive markering, ingen sletting)
+# ─────────────────────────────────────────────────────────
+@app.get("/admin/demo-picks-audit")
+async def admin_demo_picks_audit():
+    """Identify likely demo/seeder picks via 4 signature criteria.
+    Read-only. Returns union + per-criterion breakdown."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            crit_a = await conn.fetch("""
+                SELECT id, match_name, tier, soft_edge, atomic_score, scan_session, league, outcome
+                FROM picks_v2
+                WHERE atomic_score = 0 AND soft_edge >= 10
+                ORDER BY id
+            """)
+            crit_b = await conn.fetch("""
+                SELECT id, match_name, tier, soft_edge, atomic_score, scan_session, league, outcome
+                FROM picks_v2
+                WHERE atomic_score = 0
+                  AND scan_session IS NULL
+                  AND tier IN ('ATOMIC','EDGE')
+                ORDER BY id
+            """)
+            crit_c = await conn.fetch("""
+                SELECT id, match_name, tier, soft_edge, atomic_score, scan_session, league, outcome
+                FROM picks_v2
+                WHERE league IS NULL
+                  AND home_team IS NOT NULL
+                  AND away_team IS NOT NULL
+                ORDER BY id
+            """)
+            crit_d = await conn.fetch("""
+                SELECT soft_edge, COUNT(*) AS n,
+                       array_agg(id ORDER BY id) AS pick_ids
+                FROM picks_v2
+                WHERE soft_edge IS NOT NULL
+                GROUP BY soft_edge
+                HAVING COUNT(*) > 2
+                ORDER BY n DESC
+            """)
+
+        def _row(r):
+            return {
+                "id": int(r["id"]),
+                "match_name": r["match_name"],
+                "tier": r["tier"],
+                "soft_edge": float(r["soft_edge"]) if r["soft_edge"] is not None else None,
+                "atomic_score": int(r["atomic_score"]) if r["atomic_score"] is not None else None,
+                "scan_session": r["scan_session"],
+                "league": r["league"],
+                "outcome": r["outcome"],
+            }
+
+        ids_a = {int(r["id"]) for r in crit_a}
+        ids_b = {int(r["id"]) for r in crit_b}
+        ids_c = {int(r["id"]) for r in crit_c}
+        ids_d = set()
+        for r in crit_d:
+            ids_d.update(int(x) for x in r["pick_ids"])
+        union = sorted(ids_a | ids_b | ids_c | ids_d)
+
+        return {
+            "criterion_a": [_row(r) for r in crit_a],
+            "criterion_b": [_row(r) for r in crit_b],
+            "criterion_c": [_row(r) for r in crit_c],
+            "criterion_d": [
+                {"soft_edge": float(r["soft_edge"]), "count": int(r["n"]),
+                 "pick_ids": [int(x) for x in r["pick_ids"]]}
+                for r in crit_d
+            ],
+            "union_unique": union,
+            "total_demo_candidates": len(union),
+            "_notes": {
+                "criterion_a": "atomic_score=0 AND soft_edge>=10 (impossible from real pipeline)",
+                "criterion_b": "atomic_score=0 AND scan_session IS NULL AND tier IN ATOMIC/EDGE (hardcoded tier)",
+                "criterion_c": "league IS NULL but home/away populated (legacy + seeder pattern)",
+                "criterion_d": "identical soft_edge appearing >2 times (hardcoded seed value)",
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/demo-picks-audit error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/migrate-add-is-demo-column")
+async def admin_migrate_add_is_demo_column():
+    """Schema migration: ADD COLUMN is_demo + demo_reason. Idempotent.
+    Approved by Don: 'godkjent ALTER' 2026-05-04."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            existed = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='picks_v2' AND column_name='is_demo')"
+            )
+            await conn.execute("""
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT FALSE;
+                ALTER TABLE picks_v2 ADD COLUMN IF NOT EXISTS demo_reason TEXT DEFAULT NULL;
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_picks_v2_is_demo "
+                "ON picks_v2(is_demo) WHERE is_demo = TRUE"
+            )
+        return {
+            "migration": "add_is_demo_column",
+            "status": "already_exists" if existed else "applied",
+            "columns_added": ["is_demo", "demo_reason"],
+            "index_created": "idx_picks_v2_is_demo",
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/migrate-add-is-demo-column error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/admin/mark-demo-picks")
+async def admin_mark_demo_picks(body: dict):
+    """Mark specific picks as demo. Body: {pick_ids:[int], reason:str}.
+    Idempotent. Returns marked + skipped lists. No DELETE."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    pick_ids = body.get("pick_ids") or []
+    reason = body.get("reason") or ""
+    if not isinstance(pick_ids, list) or not all(isinstance(x, int) for x in pick_ids):
+        return JSONResponse(status_code=400, content={"error": "pick_ids must be list of int"})
+    if not reason or not isinstance(reason, str):
+        return JSONResponse(status_code=400, content={"error": "reason (non-empty string) required"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            existing = await conn.fetch(
+                "SELECT id FROM picks_v2 WHERE id = ANY($1::bigint[])", pick_ids
+            )
+            existing_ids = [int(r["id"]) for r in existing]
+            skipped = [i for i in pick_ids if i not in existing_ids]
+            if existing_ids:
+                await conn.execute(
+                    "UPDATE picks_v2 SET is_demo = TRUE, demo_reason = $1 "
+                    "WHERE id = ANY($2::bigint[])",
+                    reason, existing_ids,
+                )
+            current_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM picks_v2 WHERE is_demo = TRUE"
+            )
+        return {
+            "marked": existing_ids,
+            "skipped": skipped,
+            "reason": reason,
+            "current_demo_count_in_db": int(current_count or 0),
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/mark-demo-picks error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})

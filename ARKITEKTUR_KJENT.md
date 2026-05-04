@@ -100,6 +100,47 @@ er villedende for nye agenter eller eksterne reviewere.
 Ikke en aktiv bug — bare et navnings-faremoment.
 Skal IKKE rename kolonnen før Don godkjenner schema-migrasjon.
 
+## RYDDING 1 — DEMO-DATA MARKERING (4. mai 2026)
+
+**Problem oppdaget:**
+4 demo-seeder-picks (ID 205-208) har telt som "wins" i
+/admin/phase0-stats siden ukjent dato. Signatur:
+
+- atomic_score=0, soft_edge=15.00, scan_session=NULL
+- league=NULL men lagnavn populated
+- tier='EDGE' hardkodet (ikke fra calculate_atomic_score)
+
+**Løsning:**
+
+- Lagt til picks_v2.is_demo BOOLEAN-kolonne (godkjent ALTER 2026-05-04)
+- Lagt til picks_v2.demo_reason TEXT-kolonne
+- Markert ID 205-208 (+ evt. flere fra audit) med is_demo=true
+- /admin/phase0-stats nå filtrerer COALESCE(is_demo, false) = false
+- Rådata bevart for audit trail (ingen DELETE)
+
+**Ny canonical Phase 0-tellingsregel:**
+
+```sql
+WHERE tier IN ('ATOMIC','EDGE')
+  AND status='RESULT_LOGGED'
+  AND COALESCE(is_demo, false) = false
+  AND NOT (atomic_score=0 AND ABS(soft_ev)<0.05)
+```
+
+**Effekt:**
+
+- Før: settled_atomic_edge=2, wins=2 (begge fra demo-seederen)
+- Etter: settled_atomic_edge=2, wins=0 (demo-wins ekskludert)
+- Ekte Phase 0 hit rate: 0/2 = 0.0%
+
+**Nye admin-endpoints:**
+
+- GET /admin/demo-picks-audit — identifiser kandidater (4 kriterier)
+- POST /admin/migrate-add-is-demo-column — schema-migrasjon
+- POST /admin/mark-demo-picks — body: {pick_ids:[int], reason:str}
+
+**Status:** Approved by Don: "alt skal være ekte" 4. mai 2026 18:09 Oslo.
+
 ## GOVERNANCE-REGEL (ny, fra 4. mai 2026)
 
 Hver fremtidig endring av tier-logikk, signal-vekter,
