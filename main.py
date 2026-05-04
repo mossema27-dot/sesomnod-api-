@@ -14598,3 +14598,188 @@ async def get_prism_gold_cards():
         "oraklion_top1": gold_cards[0] if gold_cards else None,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ─────────────────────────────────────────────────────────
+# OBSERVABILITY (read-only, additive — Phase 0 diagnose)
+# ─────────────────────────────────────────────────────────
+@app.get("/admin/atomic-score-distribution")
+async def admin_atomic_score_distribution(window: int = 30):
+    """Atomic-score + soft_edge fordeling i 30d-vindu. Eksponerer
+    hvor mange picks som ville vært ATOMIC ved alternative terskler.
+    Read-only, ingen schema-endring, ingen modifisering av eksisterende kode."""
+    if window not in (7, 30, 60):
+        window = 30
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE atomic_score >= 7)                                       AS band_7_9,
+                    COUNT(*) FILTER (WHERE atomic_score BETWEEN 4 AND 6)                            AS band_4_6,
+                    COUNT(*) FILTER (WHERE atomic_score BETWEEN 0 AND 3)                            AS band_0_3,
+                    COUNT(*) FILTER (WHERE atomic_score IS NULL OR atomic_score < 0)                AS band_null,
+                    AVG(atomic_score) FILTER (WHERE atomic_score >= 7)                              AS avg_7_9,
+                    AVG(atomic_score) FILTER (WHERE atomic_score BETWEEN 4 AND 6)                   AS avg_4_6,
+                    AVG(atomic_score) FILTER (WHERE atomic_score BETWEEN 0 AND 3)                   AS avg_0_3,
+                    COUNT(*) FILTER (WHERE atomic_score >= 7 AND status='RESULT_LOGGED')            AS settled_7_9,
+                    COUNT(*) FILTER (WHERE atomic_score BETWEEN 4 AND 6 AND status='RESULT_LOGGED') AS settled_4_6,
+                    COUNT(*) FILTER (WHERE atomic_score BETWEEN 0 AND 3 AND status='RESULT_LOGGED') AS settled_0_3,
+                    COUNT(*) FILTER (WHERE atomic_score >= 7 AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_7_9,
+                    COUNT(*) FILTER (WHERE atomic_score BETWEEN 4 AND 6 AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_4_6,
+                    COUNT(*) FILTER (WHERE atomic_score BETWEEN 0 AND 3 AND status='RESULT_LOGGED' AND outcome='WIN') AS wins_0_3,
+                    COUNT(*) FILTER (WHERE atomic_score >= 4 AND atomic_score < 5)                  AS near_4_to_4_99,
+                    COUNT(*) FILTER (WHERE atomic_score >= 5 AND soft_edge < 7)                     AS score_5plus_low_edge,
+                    COUNT(*) FILTER (WHERE atomic_score >= 4)                                       AS would_atomic_at_4,
+                    COUNT(*) FILTER (WHERE atomic_score >= 5)                                       AS would_atomic_at_5_no_edge,
+                    COUNT(*) FILTER (WHERE atomic_score >= 7 AND soft_edge >= 7)                    AS doctrine_atomic_strict,
+                    COUNT(*) FILTER (WHERE soft_edge < 3)                                           AS edge_below_3,
+                    COUNT(*) FILTER (WHERE soft_edge >= 3 AND soft_edge < 5)                        AS edge_3_5,
+                    COUNT(*) FILTER (WHERE soft_edge >= 5 AND soft_edge < 7)                        AS edge_5_7,
+                    COUNT(*) FILTER (WHERE soft_edge >= 7)                                          AS edge_above_7
+                FROM picks_v2
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                """,
+                str(window),
+            )
+        return {
+            "window_days": window,
+            "total_picks": int(row["total"] or 0),
+            "by_band": {
+                "ATOMIC_7_9": {
+                    "count": int(row["band_7_9"] or 0),
+                    "avg_score": round(float(row["avg_7_9"] or 0), 2),
+                    "settled": int(row["settled_7_9"] or 0),
+                    "wins": int(row["wins_7_9"] or 0),
+                },
+                "EDGE_4_6": {
+                    "count": int(row["band_4_6"] or 0),
+                    "avg_score": round(float(row["avg_4_6"] or 0), 2),
+                    "settled": int(row["settled_4_6"] or 0),
+                    "wins": int(row["wins_4_6"] or 0),
+                },
+                "MONITORED_0_3": {
+                    "count": int(row["band_0_3"] or 0),
+                    "avg_score": round(float(row["avg_0_3"] or 0), 2),
+                    "settled": int(row["settled_0_3"] or 0),
+                    "wins": int(row["wins_0_3"] or 0),
+                },
+                "NULL_OR_NEG": {"count": int(row["band_null"] or 0)},
+            },
+            "near_atomic": {
+                "score_4_to_4_99": int(row["near_4_to_4_99"] or 0),
+                "score_5_to_6_99_but_low_soft_edge": int(row["score_5plus_low_edge"] or 0),
+                "would_be_atomic_if_threshold_4": int(row["would_atomic_at_4"] or 0),
+                "would_be_atomic_if_threshold_5_no_soft_edge": int(row["would_atomic_at_5_no_edge"] or 0),
+                "doctrine_atomic_strict_score_7_edge_7": int(row["doctrine_atomic_strict"] or 0),
+            },
+            "soft_edge_distribution": {
+                "below_3": int(row["edge_below_3"] or 0),
+                "3_to_5": int(row["edge_3_5"] or 0),
+                "5_to_7": int(row["edge_5_7"] or 0),
+                "above_7": int(row["edge_above_7"] or 0),
+            },
+            "_notes": {
+                "current_atomic_rule": "tier=ATOMIC requires atomic_score>=5 AND soft_edge>=7 (main.py:1854)",
+                "doctrine_atomic_rule": "Doctrine per CLAUDE.md: ATOMIC = atomic_score 7-9 (no soft_edge gate)",
+                "diff_introduced": "Commit 17f8ead (2026-04-02) lowered atomic_score from >=7 to >=5 AND added soft_edge>=7",
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/atomic-score-distribution error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/picks-daily-timeline")
+async def admin_picks_daily_timeline(days: int = 30):
+    """Daglig tidsserie per tier siste N dager. Read-only."""
+    if days < 1 or days > 90:
+        days = 30
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    DATE(created_at AT TIME ZONE 'UTC') AS day,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE tier = 'ATOMIC')                                                AS atomic,
+                    COUNT(*) FILTER (WHERE tier = 'EDGE')                                                  AS edge,
+                    COUNT(*) FILTER (WHERE tier = 'MONITORED')                                             AS monitored,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED')           AS settled_ae,
+                    COUNT(*) FILTER (WHERE tier IN ('ATOMIC','EDGE') AND status='RESULT_LOGGED'
+                                     AND outcome='WIN')                                                    AS wins_ae,
+                    COUNT(*) FILTER (WHERE league IS NULL OR league = '' OR league = '(unknown)')          AS unknown_league,
+                    AVG(atomic_score)                                                                       AS avg_atomic,
+                    AVG(soft_edge)                                                                          AS avg_soft_edge
+                FROM picks_v2
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                GROUP BY day
+                ORDER BY day DESC
+                """,
+                str(days),
+            )
+        timeline = [
+            {
+                "date": r["day"].isoformat() if r["day"] else None,
+                "total_picks": int(r["total"] or 0),
+                "atomic": int(r["atomic"] or 0),
+                "edge": int(r["edge"] or 0),
+                "monitored": int(r["monitored"] or 0),
+                "settled_ae": int(r["settled_ae"] or 0),
+                "wins_ae": int(r["wins_ae"] or 0),
+                "unknown_league": int(r["unknown_league"] or 0),
+                "avg_atomic_score": round(float(r["avg_atomic"] or 0), 2),
+                "avg_soft_edge": round(float(r["avg_soft_edge"] or 0), 2),
+            }
+            for r in rows
+        ]
+        return {
+            "days_requested": days,
+            "rows_returned": len(timeline),
+            "timeline": timeline,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/picks-daily-timeline error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.get("/admin/unknown-league-forensics")
+async def admin_unknown_league_forensics(window: int = 30):
+    """Per-pick detalj for picks med NULL/empty/unknown league. Read-only."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, match_name, home_team, away_team, league, market_name,
+                       tier, status, outcome, odds, soft_edge, soft_ev,
+                       atomic_score, pinnacle_clv, kickoff_time, created_at,
+                       (smartpick_payload IS NOT NULL) AS has_payload,
+                       scan_session
+                FROM picks_v2
+                WHERE (league IS NULL OR league = '' OR league = '(unknown)')
+                  AND created_at >= NOW() - ($1 || ' days')::interval
+                ORDER BY created_at DESC
+                """,
+                str(window),
+            )
+        return {
+            "window_days": window,
+            "count": len(rows),
+            "picks": [dict(r) for r in rows],
+            "_notes": {
+                "purpose": "Forensics on picks missing league field — likely from main.py:8918 legacy backfill (no home/away/league columns)",
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/unknown-league-forensics error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
