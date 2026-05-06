@@ -150,3 +150,46 @@ gate-kriterier, eller atomic-arkitektur krever:
 2. Eksplisitt Don-godkjennelse i commit-meldingen
    (format: "Approved by Don: [reason]")
 3. ARKITEKTUR_KJENT.md-oppdatering hvis mismatch beholdes
+
+## 30-DAGERS PROVE-REALITY-PROTOKOLL (5. mai 2026 → 4. juni 2026)
+
+**Aktivert:** 5. mai 2026 18:30 Oslo
+**Approved by Don:** "alt skal være ekte" + "30-dagers-protokoll"
+
+**Mål:** bevise eller drepe sniper-edge på 30 dager.
+
+**Kanonisk gate-kilde:** /admin/sniper-30day-protocol-status
+
+**Suksess (alle 4):**
+- n_settled_combined_active ≥ 30 (PRIMARY + SHADOW_BIG5)
+- Median CLV ≥ +1.5%
+- Stdev CLV ≤ 12%
+- ≥50% picks positiv CLV close
+
+**Kill (én = drep):**
+- n < 15 ved dag 30 → diagnose, ikke kill
+- Median CLV < 0 ved n ≥ 30
+- Stdev > 30% ved n ≥ 30
+- Trend siste 14d: median dropper >5pp
+
+**Early-kill dag 7:** median dag 7 >5pp under dag 3-snittet
+
+**Hard-locked under protokoll:**
+- Sniper-terskler (EDGE_THRESHOLD, ODDS-bånd, MAX_PICKS_PER_DAY)
+- signals/, dixon_coles, xgboost
+- sniper_bets_v1 schema
+- Frontend-tekst (Locked Draft fortsatt)
+- /dashboard/stats logikk
+- B0/B1/B2-beslutning fra 4. mai (atomic-debattene)
+
+**Tillatt under protokoll:**
+- Ny tabell sniper_daily_snapshots, oraklion_card_drafts,
+  bot_simulator_state, bot_simulator_history
+- Read-only admin-endpoints under /admin/sniper-*,
+  /admin/oraklion-*, /admin/bot-simulator-*
+- Manuell trigger av snapshot, replay, draft-batch
+
+**Daglig ritual (aktivert fra 6. mai):**
+- 22:00 Oslo: scheduler-job sniper_daily_snapshot kaller
+  /admin/sniper-snapshot-capture
+- 18:00 Oslo: Don manuelt curl-er sniper-30day-protocol-status

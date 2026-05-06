@@ -12675,6 +12675,1619 @@ async def admin_sniper_kill_switch_status():
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
 
+# ───────────────────────────────────────────────────────────────────
+# 30-DAGERS PROVE-REALITY-PROTOKOLL — observability + snapshot + draft + sim
+# Aktivert 2026-05-05 18:30 Oslo. Slutt 2026-06-04 18:30 Oslo.
+# Alt additivt. Ingen endring av sniper-logikk eller eksisterende schema.
+# Approved by Don: 5. mai 2026 18:30 Oslo.
+# ───────────────────────────────────────────────────────────────────
+
+PROTOCOL_START_UTC_STR = "2026-05-05T16:00:00+00:00"
+PROTOCOL_END_UTC_STR = "2026-06-04T16:00:00+00:00"
+PROTOCOL_START_DT = datetime.fromisoformat(PROTOCOL_START_UTC_STR)
+PROTOCOL_END_DT = datetime.fromisoformat(PROTOCOL_END_UTC_STR)
+COMBINED_ACTIVE_TIERS = ("PRIMARY", "SHADOW_BIG5")
+
+PROTOCOL_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS sniper_daily_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    snapshot_date DATE NOT NULL UNIQUE,
+    protocol_day INT NOT NULL,
+    n_settled_combined_active INT NOT NULL DEFAULT 0,
+    median_clv_close_pct NUMERIC(8,2),
+    stdev_clv_close_pct NUMERIC(8,2),
+    mean_clv_close_pct NUMERIC(8,2),
+    pct_positive_clv NUMERIC(5,2),
+    wins INT NOT NULL DEFAULT 0,
+    losses INT NOT NULL DEFAULT 0,
+    voids INT NOT NULL DEFAULT 0,
+    primary_n INT NOT NULL DEFAULT 0,
+    primary_median_clv NUMERIC(8,2),
+    primary_roi_pct NUMERIC(8,2),
+    primary_win_rate_pct NUMERIC(5,2),
+    shadow_big5_n INT NOT NULL DEFAULT 0,
+    shadow_big5_median_clv NUMERIC(8,2),
+    shadow_big5_roi_pct NUMERIC(8,2),
+    shadow_big5_win_rate_pct NUMERIC(5,2),
+    shadow_global_n INT NOT NULL DEFAULT 0,
+    raw_status_json JSONB,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sniper_snapshots_date
+    ON sniper_daily_snapshots(snapshot_date DESC);
+CREATE INDEX IF NOT EXISTS idx_sniper_snapshots_protocol_day
+    ON sniper_daily_snapshots(protocol_day);
+
+CREATE TABLE IF NOT EXISTS oraklion_card_drafts (
+    id BIGSERIAL PRIMARY KEY,
+    source_pick_id BIGINT NOT NULL REFERENCES sniper_bets_v1(id) ON DELETE CASCADE,
+    card_text TEXT NOT NULL,
+    card_text_format VARCHAR(20) NOT NULL DEFAULT 'text_only_v1',
+    market_tier VARCHAR(20) NOT NULL,
+    league TEXT,
+    home_team TEXT,
+    away_team TEXT,
+    kickoff_utc TIMESTAMPTZ,
+    market_code VARCHAR(50),
+    selection VARCHAR(50),
+    odds_open NUMERIC(6,2),
+    edge_pct NUMERIC(6,2),
+    model_prob NUMERIC(6,4),
+    is_published_to_telegram BOOLEAN NOT NULL DEFAULT FALSE,
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source_pick_id)
+);
+CREATE INDEX IF NOT EXISTS idx_oraklion_drafts_pick
+    ON oraklion_card_drafts(source_pick_id);
+CREATE INDEX IF NOT EXISTS idx_oraklion_drafts_published
+    ON oraklion_card_drafts(is_published_to_telegram, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS bot_simulator_state (
+    id BIGSERIAL PRIMARY KEY,
+    simulator_name VARCHAR(50) NOT NULL UNIQUE,
+    starting_bankroll NUMERIC(12,2) NOT NULL,
+    current_bankroll NUMERIC(12,2) NOT NULL,
+    target_bankroll NUMERIC(12,2) NOT NULL,
+    drawdown_stop_pct NUMERIC(5,2) NOT NULL DEFAULT 50.0,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_completed BOOLEAN NOT NULL DEFAULT FALSE,
+    completion_reason VARCHAR(50),
+    total_picks_played INT NOT NULL DEFAULT 0,
+    total_wins INT NOT NULL DEFAULT 0,
+    total_losses INT NOT NULL DEFAULT 0,
+    peak_bankroll NUMERIC(12,2) NOT NULL,
+    trough_bankroll NUMERIC(12,2) NOT NULL,
+    kelly_fraction NUMERIC(4,2) NOT NULL DEFAULT 0.25,
+    max_stake_pct_of_bankroll NUMERIC(5,2) NOT NULL DEFAULT 5.0,
+    market_tiers_played TEXT[] NOT NULL DEFAULT ARRAY['PRIMARY']::TEXT[],
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_action_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS bot_simulator_history (
+    id BIGSERIAL PRIMARY KEY,
+    simulator_id BIGINT NOT NULL REFERENCES bot_simulator_state(id) ON DELETE CASCADE,
+    pick_id BIGINT NOT NULL REFERENCES sniper_bets_v1(id),
+    bankroll_before NUMERIC(12,2) NOT NULL,
+    stake NUMERIC(12,2) NOT NULL,
+    odds NUMERIC(6,2) NOT NULL,
+    outcome VARCHAR(10),
+    pnl NUMERIC(12,2),
+    bankroll_after NUMERIC(12,2),
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(simulator_id, pick_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_history_simulator
+    ON bot_simulator_history(simulator_id, recorded_at DESC);
+"""
+
+DEFAULT_SIMULATOR_NAME = "primary_1k_to_50k"
+
+
+def _protocol_day_for(now_dt: datetime | None = None) -> int:
+    """Returns 1 on day 1 of the protocol, 30 on the final day."""
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    days_elapsed = (now_dt - PROTOCOL_START_DT).days
+    return max(1, days_elapsed + 1)
+
+
+def _protocol_days_remaining(now_dt: datetime | None = None) -> int:
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    days_elapsed = (now_dt - PROTOCOL_START_DT).days
+    return max(0, 30 - days_elapsed)
+
+
+@app.post("/admin/init-protocol-schema")
+async def admin_init_protocol_schema():
+    """Idempotent CREATE TABLE for sniper_daily_snapshots, oraklion_card_drafts,
+    bot_simulator_state, bot_simulator_history. Initialiserer default-simulator.
+    """
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            await conn.execute(PROTOCOL_SCHEMA_DDL)
+            existing = await conn.fetchval(
+                "SELECT COUNT(*) FROM bot_simulator_state;"
+            )
+            sim_initialized = False
+            if int(existing or 0) == 0:
+                await conn.execute(
+                    """
+                    INSERT INTO bot_simulator_state (
+                        simulator_name, starting_bankroll, current_bankroll,
+                        target_bankroll, drawdown_stop_pct,
+                        peak_bankroll, trough_bankroll,
+                        kelly_fraction, max_stake_pct_of_bankroll,
+                        market_tiers_played
+                    ) VALUES (
+                        $1, 1000, 1000, 50000, 50.0,
+                        1000, 1000, 0.25, 5.0,
+                        ARRAY['PRIMARY','SHADOW_BIG5']::TEXT[]
+                    )
+                    ON CONFLICT (simulator_name) DO NOTHING;
+                    """,
+                    DEFAULT_SIMULATOR_NAME,
+                )
+                sim_initialized = True
+        return {
+            "status": "ok",
+            "schema_applied": True,
+            "default_simulator_initialized": sim_initialized,
+            "default_simulator_name": DEFAULT_SIMULATOR_NAME,
+        }
+    except Exception as e:
+        logger.error(f"[InitProtocolSchema] error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 1.1: /admin/sniper-daily-timeline ──────────────────────────
+@app.get("/admin/sniper-daily-timeline")
+async def admin_sniper_daily_timeline(days: int = 30):
+    """Per-dag aggregert metrikk pr tier (PRIMARY, SHADOW_BIG5, SHADOW_GLOBAL)
+    + COMBINED_ACTIVE = PRIMARY ∪ SHADOW_BIG5. Read-only mot sniper_bets_v1.
+    """
+    if days < 1 or days > 365:
+        days = 30
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    DATE(created_at AT TIME ZONE 'UTC') AS day,
+                    market_tier,
+                    COUNT(*) AS n_picks,
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS','VOID','PUSH'))
+                        AS n_settled,
+                    COUNT(*) FILTER (WHERE clv_close_pct IS NOT NULL)
+                        AS n_with_close_clv,
+                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
+                    COALESCE(SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS')), 0)
+                        AS profit_units_sum,
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS staked_count,
+                    AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL)
+                        AS avg_clv,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE clv_close_pct IS NOT NULL) AS median_clv,
+                    STDDEV_SAMP(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL)
+                        AS stdev_clv,
+                    COUNT(*) FILTER (WHERE clv_close_pct > 0) AS n_positive_clv
+                FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND market_tier IN ('PRIMARY','SHADOW_BIG5','SHADOW_GLOBAL')
+                GROUP BY 1, 2
+                ORDER BY day DESC, market_tier
+                """,
+                str(days),
+            )
+            combined_rows = await conn.fetch(
+                """
+                SELECT
+                    DATE(created_at AT TIME ZONE 'UTC') AS day,
+                    COUNT(*) AS n_picks,
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS','VOID','PUSH'))
+                        AS n_settled,
+                    COUNT(*) FILTER (WHERE clv_close_pct IS NOT NULL)
+                        AS n_with_close_clv,
+                    COUNT(*) FILTER (WHERE result = 'WIN') AS wins,
+                    COALESCE(SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS')), 0)
+                        AS profit_units_sum,
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS staked_count,
+                    AVG(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL)
+                        AS avg_clv,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE clv_close_pct IS NOT NULL) AS median_clv,
+                    STDDEV_SAMP(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL)
+                        AS stdev_clv,
+                    COUNT(*) FILTER (WHERE clv_close_pct > 0) AS n_positive_clv
+                FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND market_tier IN ('PRIMARY','SHADOW_BIG5')
+                GROUP BY 1
+                ORDER BY day DESC
+                """,
+                str(days),
+            )
+
+        def _f(v):
+            return float(v) if v is not None else None
+
+        def _block(r):
+            n_picks = int(r["n_picks"] or 0)
+            n_settled = int(r["n_settled"] or 0)
+            n_close = int(r["n_with_close_clv"] or 0)
+            wins = int(r["wins"] or 0)
+            staked = int(r["staked_count"] or 0)
+            n_pos = int(r["n_positive_clv"] or 0)
+            profit_sum = float(r["profit_units_sum"] or 0)
+            win_rate = (wins / staked * 100) if staked > 0 else None
+            roi = (profit_sum / staked * 100) if staked > 0 else None
+            pct_pos = (n_pos / n_close * 100) if n_close > 0 else None
+            return {
+                "n_picks": n_picks,
+                "n_settled": n_settled,
+                "n_with_close_clv": n_close,
+                "wins": wins,
+                "win_rate_pct": round(win_rate, 2) if win_rate is not None else None,
+                "roi_pct": round(roi, 2) if roi is not None else None,
+                "avg_clv_close_pct": (
+                    round(_f(r["avg_clv"]), 2) if r["avg_clv"] is not None else None
+                ),
+                "median_clv_close_pct": (
+                    round(_f(r["median_clv"]), 2)
+                    if r["median_clv"] is not None else None
+                ),
+                "stdev_clv_close_pct": (
+                    round(_f(r["stdev_clv"]), 2)
+                    if r["stdev_clv"] is not None else None
+                ),
+                "pct_positive_clv": round(pct_pos, 2) if pct_pos is not None else None,
+            }
+
+        empty_block = {
+            "n_picks": 0, "n_settled": 0, "n_with_close_clv": 0, "wins": 0,
+            "win_rate_pct": None, "roi_pct": None,
+            "avg_clv_close_pct": None, "median_clv_close_pct": None,
+            "stdev_clv_close_pct": None, "pct_positive_clv": None,
+        }
+        per_day: dict = {}
+        for r in rows:
+            day_key = r["day"].isoformat() if r["day"] else None
+            if day_key is None:
+                continue
+            slot = per_day.setdefault(day_key, {
+                "date": day_key,
+                "primary": dict(empty_block),
+                "shadow_big5": dict(empty_block),
+                "shadow_global": dict(empty_block),
+                "combined_active": dict(empty_block),
+            })
+            tier = r["market_tier"]
+            if tier == "PRIMARY":
+                slot["primary"] = _block(r)
+            elif tier == "SHADOW_BIG5":
+                slot["shadow_big5"] = _block(r)
+            elif tier == "SHADOW_GLOBAL":
+                slot["shadow_global"] = _block(r)
+        for r in combined_rows:
+            day_key = r["day"].isoformat() if r["day"] else None
+            if day_key is None:
+                continue
+            slot = per_day.setdefault(day_key, {
+                "date": day_key,
+                "primary": dict(empty_block),
+                "shadow_big5": dict(empty_block),
+                "shadow_global": dict(empty_block),
+                "combined_active": dict(empty_block),
+            })
+            slot["combined_active"] = _block(r)
+
+        ordered = sorted(per_day.values(), key=lambda x: x["date"], reverse=True)
+        return {
+            "window_days": days,
+            "rows": ordered,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/sniper-daily-timeline error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 1.2: /admin/sniper-clv-distribution ────────────────────────
+@app.get("/admin/sniper-clv-distribution")
+async def admin_sniper_clv_distribution(days: int = 30, tier: str = "COMBINED_ACTIVE"):
+    """Histogram + descriptive stats for clv_close_pct, valgt tier."""
+    if days < 1 or days > 365:
+        days = 30
+    tier = (tier or "COMBINED_ACTIVE").upper()
+    valid = {"PRIMARY", "SHADOW_BIG5", "SHADOW_GLOBAL", "COMBINED_ACTIVE", "ALL"}
+    if tier not in valid:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"tier must be one of {sorted(valid)}"},
+        )
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+
+    if tier == "PRIMARY":
+        tier_clause = "AND market_tier = 'PRIMARY'"
+    elif tier == "SHADOW_BIG5":
+        tier_clause = "AND market_tier = 'SHADOW_BIG5'"
+    elif tier == "SHADOW_GLOBAL":
+        tier_clause = "AND market_tier = 'SHADOW_GLOBAL'"
+    elif tier == "COMBINED_ACTIVE":
+        tier_clause = "AND market_tier IN ('PRIMARY','SHADOW_BIG5')"
+    else:
+        tier_clause = "AND market_tier IN ('PRIMARY','SHADOW_BIG5','SHADOW_GLOBAL')"
+
+    try:
+        async with db_state.pool.acquire() as conn:
+            n_total = await conn.fetchval(
+                f"""
+                SELECT COUNT(*) FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  {tier_clause};
+                """,
+                str(days),
+            )
+            stats_row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*) AS n,
+                    AVG(clv_close_pct) AS mean,
+                    PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY clv_close_pct) AS median,
+                    STDDEV_SAMP(clv_close_pct) AS stdev,
+                    PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY clv_close_pct) AS p5,
+                    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY clv_close_pct) AS p25,
+                    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY clv_close_pct) AS p75,
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY clv_close_pct) AS p95
+                FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND clv_close_pct IS NOT NULL
+                  {tier_clause};
+                """,
+                str(days),
+            )
+            hist_row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE clv_close_pct < -50) AS lt_minus_50,
+                    COUNT(*) FILTER (WHERE clv_close_pct >= -50 AND clv_close_pct < -20) AS minus_50_to_minus_20,
+                    COUNT(*) FILTER (WHERE clv_close_pct >= -20 AND clv_close_pct < -10) AS minus_20_to_minus_10,
+                    COUNT(*) FILTER (WHERE clv_close_pct >= -10 AND clv_close_pct < 0)   AS minus_10_to_0,
+                    COUNT(*) FILTER (WHERE clv_close_pct >=   0 AND clv_close_pct < 2)   AS zero_to_2,
+                    COUNT(*) FILTER (WHERE clv_close_pct >=   2 AND clv_close_pct < 5)   AS two_to_5,
+                    COUNT(*) FILTER (WHERE clv_close_pct >=   5 AND clv_close_pct < 10)  AS five_to_10,
+                    COUNT(*) FILTER (WHERE clv_close_pct >= 10) AS gt_10
+                FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND clv_close_pct IS NOT NULL
+                  {tier_clause};
+                """,
+                str(days),
+            )
+            wl_row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE result = 'WIN')  AS n_wins,
+                    AVG(clv_close_pct) FILTER (WHERE result = 'WIN')  AS mean_clv_wins,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE result = 'WIN') AS median_clv_wins,
+                    COUNT(*) FILTER (WHERE result = 'LOSS') AS n_losses,
+                    AVG(clv_close_pct) FILTER (WHERE result = 'LOSS') AS mean_clv_losses,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE result = 'LOSS') AS median_clv_losses,
+                    CORR(
+                        clv_close_pct,
+                        CASE WHEN result='WIN' THEN 1.0
+                             WHEN result='LOSS' THEN 0.0 END
+                    ) AS corr_clv_outcome
+                FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND clv_close_pct IS NOT NULL
+                  AND result IN ('WIN','LOSS')
+                  {tier_clause};
+                """,
+                str(days),
+            )
+            clv_values = await conn.fetch(
+                f"""
+                SELECT clv_close_pct FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                  AND clv_close_pct IS NOT NULL
+                  {tier_clause}
+                ORDER BY clv_close_pct;
+                """,
+                str(days),
+            )
+
+        def _f(v, ndigits=2):
+            return round(float(v), ndigits) if v is not None else None
+
+        n_close = int(stats_row["n"] or 0) if stats_row else 0
+        mean_v = float(stats_row["mean"]) if stats_row and stats_row["mean"] is not None else None
+        stdev_v = float(stats_row["stdev"]) if stats_row and stats_row["stdev"] is not None else None
+        p25 = float(stats_row["p25"]) if stats_row and stats_row["p25"] is not None else None
+        p75 = float(stats_row["p75"]) if stats_row and stats_row["p75"] is not None else None
+        iqr_v = (p75 - p25) if (p25 is not None and p75 is not None) else None
+
+        skewness = None
+        n_outliers_2std = None
+        if mean_v is not None and stdev_v is not None and stdev_v > 0 and n_close >= 3:
+            cubed_sum = sum(((float(r["clv_close_pct"]) - mean_v) ** 3) for r in clv_values)
+            skewness = cubed_sum / (n_close * (stdev_v ** 3))
+            n_outliers_2std = sum(
+                1 for r in clv_values
+                if abs(float(r["clv_close_pct"]) - mean_v) > 2 * stdev_v
+            )
+
+        trim_3_mean = None
+        if n_close >= 7:
+            trimmed = [float(r["clv_close_pct"]) for r in clv_values][3:-3]
+            if trimmed:
+                trim_3_mean = sum(trimmed) / len(trimmed)
+
+        return {
+            "tier": tier,
+            "window_days": days,
+            "n_total": int(n_total or 0),
+            "n_settled_with_close": n_close,
+            "histogram": {
+                "lt_minus_50": int(hist_row["lt_minus_50"] or 0),
+                "minus_50_to_minus_20": int(hist_row["minus_50_to_minus_20"] or 0),
+                "minus_20_to_minus_10": int(hist_row["minus_20_to_minus_10"] or 0),
+                "minus_10_to_0": int(hist_row["minus_10_to_0"] or 0),
+                "0_to_2": int(hist_row["zero_to_2"] or 0),
+                "2_to_5": int(hist_row["two_to_5"] or 0),
+                "5_to_10": int(hist_row["five_to_10"] or 0),
+                "gt_10": int(hist_row["gt_10"] or 0),
+            } if hist_row else {},
+            "stats": {
+                "mean": _f(mean_v),
+                "median": _f(stats_row["median"]) if stats_row else None,
+                "stdev": _f(stdev_v),
+                "p5": _f(stats_row["p5"]) if stats_row else None,
+                "p25": _f(p25),
+                "p75": _f(p75),
+                "p95": _f(stats_row["p95"]) if stats_row else None,
+                "iqr": _f(iqr_v),
+                "skewness": _f(skewness, 3),
+                "n_outliers_2std": n_outliers_2std,
+            },
+            "trim_3_mean": _f(trim_3_mean),
+            "win_loss_breakdown": {
+                "wins": {
+                    "n": int(wl_row["n_wins"] or 0) if wl_row else 0,
+                    "mean_clv": _f(wl_row["mean_clv_wins"]) if wl_row else None,
+                    "median_clv": _f(wl_row["median_clv_wins"]) if wl_row else None,
+                },
+                "losses": {
+                    "n": int(wl_row["n_losses"] or 0) if wl_row else 0,
+                    "mean_clv": _f(wl_row["mean_clv_losses"]) if wl_row else None,
+                    "median_clv": _f(wl_row["median_clv_losses"]) if wl_row else None,
+                },
+                "correlation_clv_x_outcome": (
+                    _f(wl_row["corr_clv_outcome"], 4) if wl_row else None
+                ),
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/sniper-clv-distribution error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 1.3: /admin/sniper-segment-analysis ────────────────────────
+@app.get("/admin/sniper-segment-analysis")
+async def admin_sniper_segment_analysis(days: int = 30):
+    """5 segmenter for edge-pocket-discovery: odds_band, kickoff_hour, dow,
+    league, clv_movement (T-60 → T-5)."""
+    if days < 1 or days > 365:
+        days = 30
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    base = (
+        "WHERE created_at >= NOW() - ($1 || ' days')::interval "
+        "  AND clv_close_pct IS NOT NULL "
+        "  AND market_tier IN ('PRIMARY','SHADOW_BIG5','SHADOW_GLOBAL')"
+    )
+    try:
+        async with db_state.pool.acquire() as conn:
+            n_total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM sniper_bets_v1 {base};",
+                str(days),
+            )
+            odds_band = await conn.fetch(
+                f"""
+                SELECT
+                    CASE
+                        WHEN odds_open >= 1.40 AND odds_open < 1.60 THEN '1.40-1.60'
+                        WHEN odds_open >= 1.60 AND odds_open < 1.80 THEN '1.60-1.80'
+                        WHEN odds_open >= 1.80 AND odds_open < 2.00 THEN '1.80-2.00'
+                        WHEN odds_open >= 2.00 AND odds_open <= 2.50 THEN '2.00-2.50'
+                    END AS band,
+                    market_tier,
+                    COUNT(*) AS n,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        AS median_clv,
+                    AVG(CASE WHEN result='WIN' THEN 1.0
+                             WHEN result='LOSS' THEN 0.0 END) * 100 AS win_rate_pct,
+                    SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS'))
+                        / NULLIF(COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')), 0)
+                        * 100 AS roi_pct
+                FROM sniper_bets_v1 {base}
+                GROUP BY band, market_tier
+                ORDER BY band, market_tier;
+                """,
+                str(days),
+            )
+            hour_band = await conn.fetch(
+                f"""
+                SELECT
+                    CASE
+                        WHEN EXTRACT(HOUR FROM kickoff_time AT TIME ZONE 'Europe/Oslo') BETWEEN 12 AND 14 THEN '12-15'
+                        WHEN EXTRACT(HOUR FROM kickoff_time AT TIME ZONE 'Europe/Oslo') BETWEEN 15 AND 17 THEN '15-18'
+                        WHEN EXTRACT(HOUR FROM kickoff_time AT TIME ZONE 'Europe/Oslo') BETWEEN 18 AND 20 THEN '18-21'
+                        WHEN EXTRACT(HOUR FROM kickoff_time AT TIME ZONE 'Europe/Oslo') BETWEEN 21 AND 23 THEN '21-23'
+                    END AS hour_band,
+                    market_tier,
+                    COUNT(*) AS n,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        AS median_clv,
+                    AVG(CASE WHEN result='WIN' THEN 1.0
+                             WHEN result='LOSS' THEN 0.0 END) * 100 AS win_rate_pct
+                FROM sniper_bets_v1 {base}
+                GROUP BY hour_band, market_tier
+                ORDER BY hour_band, market_tier;
+                """,
+                str(days),
+            )
+            dow = await conn.fetch(
+                f"""
+                SELECT
+                    TRIM(TO_CHAR(kickoff_time AT TIME ZONE 'Europe/Oslo', 'Day')) AS dow,
+                    EXTRACT(DOW FROM kickoff_time AT TIME ZONE 'Europe/Oslo') AS dow_num,
+                    market_tier,
+                    COUNT(*) AS n,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        AS median_clv,
+                    AVG(CASE WHEN result='WIN' THEN 1.0
+                             WHEN result='LOSS' THEN 0.0 END) * 100 AS win_rate_pct
+                FROM sniper_bets_v1 {base}
+                GROUP BY dow, dow_num, market_tier
+                ORDER BY dow_num, market_tier;
+                """,
+                str(days),
+            )
+            league = await conn.fetch(
+                f"""
+                SELECT
+                    league,
+                    market_tier,
+                    COUNT(*) AS n,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        AS median_clv,
+                    AVG(CASE WHEN result='WIN' THEN 1.0
+                             WHEN result='LOSS' THEN 0.0 END) * 100 AS win_rate_pct,
+                    SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS'))
+                        / NULLIF(COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')), 0)
+                        * 100 AS roi_pct
+                FROM sniper_bets_v1 {base}
+                GROUP BY league, market_tier
+                HAVING COUNT(*) >= 3
+                ORDER BY median_clv DESC NULLS LAST;
+                """,
+                str(days),
+            )
+            movement = await conn.fetch(
+                f"""
+                SELECT
+                    CASE
+                        WHEN clv_close_pct - clv_t60_pct > 1  THEN 'sharp_with_us'
+                        WHEN clv_close_pct - clv_t60_pct < -1 THEN 'sharp_against_us'
+                        ELSE 'stable'
+                    END AS movement,
+                    COUNT(*) AS n,
+                    AVG(CASE WHEN result='WIN' THEN 1.0
+                             WHEN result='LOSS' THEN 0.0 END) * 100 AS win_rate_pct,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        AS median_final_clv
+                FROM sniper_bets_v1 {base}
+                  AND clv_t60_pct IS NOT NULL
+                GROUP BY movement;
+                """,
+                str(days),
+            )
+
+        def _f(v, n=2):
+            return round(float(v), n) if v is not None else None
+
+        return {
+            "window_days": days,
+            "n_settled_with_close_total": int(n_total or 0),
+            "segments": {
+                "odds_band_x_tier": [
+                    {
+                        "band": r["band"],
+                        "tier": r["market_tier"],
+                        "n": int(r["n"] or 0),
+                        "median_clv": _f(r["median_clv"]),
+                        "win_rate_pct": _f(r["win_rate_pct"]),
+                        "roi_pct": _f(r["roi_pct"]),
+                    }
+                    for r in odds_band if r["band"] is not None
+                ],
+                "kickoff_hour_oslo_x_tier": [
+                    {
+                        "hour_band": r["hour_band"],
+                        "tier": r["market_tier"],
+                        "n": int(r["n"] or 0),
+                        "median_clv": _f(r["median_clv"]),
+                        "win_rate_pct": _f(r["win_rate_pct"]),
+                    }
+                    for r in hour_band if r["hour_band"] is not None
+                ],
+                "day_of_week_x_tier": [
+                    {
+                        "dow": r["dow"],
+                        "dow_num": int(r["dow_num"] or 0),
+                        "tier": r["market_tier"],
+                        "n": int(r["n"] or 0),
+                        "median_clv": _f(r["median_clv"]),
+                        "win_rate_pct": _f(r["win_rate_pct"]),
+                    }
+                    for r in dow
+                ],
+                "league_x_tier": [
+                    {
+                        "league": r["league"],
+                        "tier": r["market_tier"],
+                        "n": int(r["n"] or 0),
+                        "median_clv": _f(r["median_clv"]),
+                        "win_rate_pct": _f(r["win_rate_pct"]),
+                        "roi_pct": _f(r["roi_pct"]),
+                    }
+                    for r in league
+                ],
+                "clv_movement": [
+                    {
+                        "movement": r["movement"],
+                        "n": int(r["n"] or 0),
+                        "win_rate_pct": _f(r["win_rate_pct"]),
+                        "median_final_clv": _f(r["median_final_clv"]),
+                    }
+                    for r in movement
+                ],
+            },
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/sniper-segment-analysis error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 1.4: /admin/sniper-30day-protocol-status ───────────────────
+async def _compute_protocol_metrics(conn) -> dict:
+    """Felles helper for protocol-status og snapshot-capture."""
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS n,
+            AVG(clv_close_pct) AS mean,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct) AS median,
+            STDDEV_SAMP(clv_close_pct) AS stdev,
+            COUNT(*) FILTER (WHERE clv_close_pct > 0) AS n_pos,
+            COUNT(*) FILTER (WHERE result = 'WIN')  AS wins,
+            COUNT(*) FILTER (WHERE result = 'LOSS') AS losses,
+            COUNT(*) FILTER (WHERE result IN ('VOID','PUSH')) AS voids
+        FROM sniper_bets_v1
+        WHERE created_at >= $1
+          AND market_tier IN ('PRIMARY','SHADOW_BIG5')
+          AND clv_close_pct IS NOT NULL
+          AND result IN ('WIN','LOSS','VOID','PUSH');
+        """,
+        PROTOCOL_START_DT,
+    )
+    n = int(row["n"] or 0) if row else 0
+    pct_pos = (
+        float(row["n_pos"] or 0) / n * 100 if n > 0 and row else None
+    )
+    return {
+        "n_settled_combined_active": n,
+        "median_clv": float(row["median"]) if row and row["median"] is not None else None,
+        "stdev_clv": float(row["stdev"]) if row and row["stdev"] is not None else None,
+        "mean_clv": float(row["mean"]) if row and row["mean"] is not None else None,
+        "pct_positive_clv": pct_pos,
+        "wins": int(row["wins"] or 0) if row else 0,
+        "losses": int(row["losses"] or 0) if row else 0,
+        "voids": int(row["voids"] or 0) if row else 0,
+    }
+
+
+async def _compute_tier_block(conn, tier: str) -> dict:
+    """PRIMARY/SHADOW_BIG5-block (n, median_clv, roi_pct, win_rate_pct)
+    siden PROTOCOL_START."""
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS n,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                FILTER (WHERE clv_close_pct IS NOT NULL) AS median_clv,
+            COALESCE(SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS')), 0)
+                AS profit_sum,
+            COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')) AS staked,
+            COUNT(*) FILTER (WHERE result = 'WIN') AS wins
+        FROM sniper_bets_v1
+        WHERE created_at >= $1
+          AND market_tier = $2;
+        """,
+        PROTOCOL_START_DT, tier,
+    )
+    n = int(row["n"] or 0) if row else 0
+    staked = int(row["staked"] or 0) if row else 0
+    wins = int(row["wins"] or 0) if row else 0
+    profit = float(row["profit_sum"] or 0) if row else 0.0
+    return {
+        "n": n,
+        "median_clv": float(row["median_clv"]) if row and row["median_clv"] is not None else None,
+        "roi_pct": (profit / staked * 100) if staked > 0 else None,
+        "win_rate_pct": (wins / staked * 100) if staked > 0 else None,
+    }
+
+
+@app.get("/admin/sniper-30day-protocol-status")
+async def admin_sniper_30day_protocol_status():
+    """Live status mot 30-dagers prove-reality-protokoll suksess/kill-kriterier."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        now_dt = datetime.now(timezone.utc)
+        days_elapsed = (now_dt - PROTOCOL_START_DT).days
+        current_day = max(1, days_elapsed + 1)
+        days_remaining = max(0, 30 - days_elapsed)
+
+        async with db_state.pool.acquire() as conn:
+            metrics = await _compute_protocol_metrics(conn)
+            trend_row = await conn.fetchrow(
+                """
+                SELECT
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE created_at >= NOW() - INTERVAL '14 days')
+                        AS current_14d_median,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE created_at >= NOW() - INTERVAL '28 days'
+                                  AND created_at <  NOW() - INTERVAL '14 days')
+                        AS previous_14d_median,
+                    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '14 days'
+                                       AND clv_close_pct IS NOT NULL) AS n_current,
+                    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '28 days'
+                                       AND created_at <  NOW() - INTERVAL '14 days'
+                                       AND clv_close_pct IS NOT NULL) AS n_previous
+                FROM sniper_bets_v1
+                WHERE market_tier IN ('PRIMARY','SHADOW_BIG5')
+                  AND clv_close_pct IS NOT NULL;
+                """
+            )
+            try:
+                snap_day3 = await conn.fetchval(
+                    """
+                    SELECT median_clv_close_pct FROM sniper_daily_snapshots
+                    WHERE protocol_day = 3 LIMIT 1;
+                    """
+                )
+                snap_day7 = await conn.fetchval(
+                    """
+                    SELECT median_clv_close_pct FROM sniper_daily_snapshots
+                    WHERE protocol_day = 7 LIMIT 1;
+                    """
+                )
+            except Exception:
+                snap_day3 = None
+                snap_day7 = None
+
+        n = metrics["n_settled_combined_active"]
+        median_clv = metrics["median_clv"]
+        stdev_clv = metrics["stdev_clv"]
+        pct_pos = metrics["pct_positive_clv"]
+
+        success_criteria = {
+            "n_30_or_more": {
+                "target": 30, "actual": n, "pass": n >= 30,
+            },
+            "median_clv_1_5_or_more": {
+                "target": 1.5,
+                "actual": round(median_clv, 2) if median_clv is not None else None,
+                "pass": median_clv is not None and median_clv >= 1.5,
+            },
+            "stdev_clv_12_or_less": {
+                "target": 12.0,
+                "actual": round(stdev_clv, 2) if stdev_clv is not None else None,
+                "pass": stdev_clv is not None and stdev_clv <= 12.0,
+            },
+            "pct_positive_50_or_more": {
+                "target": 50.0,
+                "actual": round(pct_pos, 2) if pct_pos is not None else None,
+                "pass": pct_pos is not None and pct_pos >= 50.0,
+            },
+        }
+
+        cur14 = float(trend_row["current_14d_median"]) if trend_row and trend_row["current_14d_median"] is not None else None
+        prev14 = float(trend_row["previous_14d_median"]) if trend_row and trend_row["previous_14d_median"] is not None else None
+        n_cur = int(trend_row["n_current"] or 0) if trend_row else 0
+        n_prev = int(trend_row["n_previous"] or 0) if trend_row else 0
+        trend_drop_triggered = False
+        trend_drop_pp = None
+        if cur14 is not None and prev14 is not None and n_cur >= 5 and n_prev >= 5:
+            trend_drop_pp = cur14 - prev14
+            trend_drop_triggered = trend_drop_pp < -5
+
+        kill_criteria = {
+            "n_below_15_at_30d": {
+                "applicable_from_day": 30,
+                "actual_n": n,
+                "would_trigger": current_day >= 30 and n < 15,
+            },
+            "median_below_0_at_n30": {
+                "triggered": n >= 30 and median_clv is not None and median_clv < 0,
+            },
+            "stdev_above_30_at_n30": {
+                "triggered": n >= 30 and stdev_clv is not None and stdev_clv > 30,
+            },
+            "trend_drop_5pp_14d": {
+                "current_14d_median": round(cur14, 2) if cur14 is not None else None,
+                "previous_14d_median": round(prev14, 2) if prev14 is not None else None,
+                "drop_pp": round(trend_drop_pp, 2) if trend_drop_pp is not None else None,
+                "n_current": n_cur,
+                "n_previous": n_prev,
+                "triggered": trend_drop_triggered,
+            },
+        }
+
+        early_kill_triggered = False
+        early_kill_drop_pp = None
+        snap3 = float(snap_day3) if snap_day3 is not None else None
+        snap7 = float(snap_day7) if snap_day7 is not None else None
+        if snap3 is not None and snap7 is not None:
+            early_kill_drop_pp = snap7 - snap3
+            early_kill_triggered = current_day >= 7 and early_kill_drop_pp < -5
+        early_kill = {
+            "applicable_from_day": 7,
+            "day_3_baseline_median": snap3,
+            "day_7_median": snap7,
+            "drop_pp": round(early_kill_drop_pp, 2) if early_kill_drop_pp is not None else None,
+            "triggered": early_kill_triggered,
+        }
+
+        any_kill = (
+            kill_criteria["n_below_15_at_30d"]["would_trigger"]
+            or kill_criteria["median_below_0_at_n30"]["triggered"]
+            or kill_criteria["stdev_above_30_at_n30"]["triggered"]
+            or kill_criteria["trend_drop_5pp_14d"]["triggered"]
+        )
+        all_success = all(c["pass"] for c in success_criteria.values())
+
+        if current_day < 3:
+            verdict = "TOO_EARLY"
+        elif early_kill_triggered:
+            verdict = "EARLY_KILL_TRIGGERED"
+        elif any_kill:
+            verdict = "KILL_AT_30D"
+        elif current_day >= 30 and all_success:
+            verdict = "PASS_AT_30D"
+        elif n < 15 and current_day >= 14:
+            verdict = "WARNING"
+        else:
+            verdict = "ON_TRACK"
+
+        return {
+            "protocol_start_utc": PROTOCOL_START_UTC_STR,
+            "protocol_end_utc": PROTOCOL_END_UTC_STR,
+            "current_day": current_day,
+            "days_remaining": days_remaining,
+            "current_metrics": {
+                "n_settled_combined_active": n,
+                "median_clv_close_pct": round(median_clv, 2) if median_clv is not None else None,
+                "stdev_clv_close_pct": round(stdev_clv, 2) if stdev_clv is not None else None,
+                "mean_clv_close_pct": round(metrics["mean_clv"], 2) if metrics["mean_clv"] is not None else None,
+                "pct_positive_clv": round(pct_pos, 2) if pct_pos is not None else None,
+                "wins": metrics["wins"],
+                "losses": metrics["losses"],
+                "voids": metrics["voids"],
+            },
+            "success_criteria_status": success_criteria,
+            "kill_criteria_status": kill_criteria,
+            "early_kill_day_7": early_kill,
+            "verdict": verdict,
+            "computed_at": now_dt.isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"/admin/sniper-30day-protocol-status error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 2.2: /admin/sniper-snapshot-capture ────────────────────────
+@app.post("/admin/sniper-snapshot-capture")
+async def admin_sniper_snapshot_capture():
+    """Idempotent: ON CONFLICT (snapshot_date) DO UPDATE. Skriver dagens
+    metrikk til sniper_daily_snapshots + raw_status_json fra protocol-status."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        now_dt = datetime.now(timezone.utc)
+        protocol_day = _protocol_day_for(now_dt)
+
+        async with db_state.pool.acquire() as conn:
+            snapshot_date = await conn.fetchval(
+                "SELECT (NOW() AT TIME ZONE 'Europe/Oslo')::date;"
+            )
+            metrics = await _compute_protocol_metrics(conn)
+            primary = await _compute_tier_block(conn, "PRIMARY")
+            shadow_b5 = await _compute_tier_block(conn, "SHADOW_BIG5")
+            shadow_g_n = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM sniper_bets_v1
+                WHERE created_at >= $1 AND market_tier = 'SHADOW_GLOBAL';
+                """,
+                PROTOCOL_START_DT,
+            )
+            raw_status = {
+                "protocol_day": protocol_day,
+                "captured_at": now_dt.isoformat(),
+                "metrics": metrics,
+                "primary": primary,
+                "shadow_big5": shadow_b5,
+                "shadow_global_n": int(shadow_g_n or 0),
+            }
+            inserted_id = await conn.fetchval(
+                """
+                INSERT INTO sniper_daily_snapshots (
+                    snapshot_date, protocol_day,
+                    n_settled_combined_active, median_clv_close_pct,
+                    stdev_clv_close_pct, mean_clv_close_pct,
+                    pct_positive_clv, wins, losses, voids,
+                    primary_n, primary_median_clv, primary_roi_pct, primary_win_rate_pct,
+                    shadow_big5_n, shadow_big5_median_clv, shadow_big5_roi_pct,
+                    shadow_big5_win_rate_pct, shadow_global_n, raw_status_json
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb
+                )
+                ON CONFLICT (snapshot_date) DO UPDATE SET
+                    protocol_day = EXCLUDED.protocol_day,
+                    n_settled_combined_active = EXCLUDED.n_settled_combined_active,
+                    median_clv_close_pct = EXCLUDED.median_clv_close_pct,
+                    stdev_clv_close_pct = EXCLUDED.stdev_clv_close_pct,
+                    mean_clv_close_pct = EXCLUDED.mean_clv_close_pct,
+                    pct_positive_clv = EXCLUDED.pct_positive_clv,
+                    wins = EXCLUDED.wins,
+                    losses = EXCLUDED.losses,
+                    voids = EXCLUDED.voids,
+                    primary_n = EXCLUDED.primary_n,
+                    primary_median_clv = EXCLUDED.primary_median_clv,
+                    primary_roi_pct = EXCLUDED.primary_roi_pct,
+                    primary_win_rate_pct = EXCLUDED.primary_win_rate_pct,
+                    shadow_big5_n = EXCLUDED.shadow_big5_n,
+                    shadow_big5_median_clv = EXCLUDED.shadow_big5_median_clv,
+                    shadow_big5_roi_pct = EXCLUDED.shadow_big5_roi_pct,
+                    shadow_big5_win_rate_pct = EXCLUDED.shadow_big5_win_rate_pct,
+                    shadow_global_n = EXCLUDED.shadow_global_n,
+                    raw_status_json = EXCLUDED.raw_status_json,
+                    captured_at = NOW()
+                RETURNING id;
+                """,
+                snapshot_date, protocol_day,
+                metrics["n_settled_combined_active"],
+                metrics["median_clv"], metrics["stdev_clv"], metrics["mean_clv"],
+                metrics["pct_positive_clv"],
+                metrics["wins"], metrics["losses"], metrics["voids"],
+                primary["n"], primary["median_clv"], primary["roi_pct"],
+                primary["win_rate_pct"],
+                shadow_b5["n"], shadow_b5["median_clv"], shadow_b5["roi_pct"],
+                shadow_b5["win_rate_pct"],
+                int(shadow_g_n or 0), json.dumps(raw_status, default=str),
+            )
+
+        return {
+            "captured": True,
+            "date": snapshot_date.isoformat() if snapshot_date else None,
+            "protocol_day": protocol_day,
+            "snapshot_id": int(inserted_id) if inserted_id else None,
+            "metrics_captured": {
+                "n_settled_combined_active": metrics["n_settled_combined_active"],
+                "median_clv_close_pct": metrics["median_clv"],
+                "stdev_clv_close_pct": metrics["stdev_clv"],
+                "mean_clv_close_pct": metrics["mean_clv"],
+                "pct_positive_clv": metrics["pct_positive_clv"],
+                "wins": metrics["wins"],
+                "losses": metrics["losses"],
+                "voids": metrics["voids"],
+                "primary_n": primary["n"],
+                "primary_median_clv": primary["median_clv"],
+                "primary_roi_pct": primary["roi_pct"],
+                "primary_win_rate_pct": primary["win_rate_pct"],
+                "shadow_big5_n": shadow_b5["n"],
+                "shadow_big5_median_clv": shadow_b5["median_clv"],
+                "shadow_big5_roi_pct": shadow_b5["roi_pct"],
+                "shadow_big5_win_rate_pct": shadow_b5["win_rate_pct"],
+                "shadow_global_n": int(shadow_g_n or 0),
+            },
+        }
+    except Exception as e:
+        logger.error(f"/admin/sniper-snapshot-capture error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 2.3: /admin/sniper-snapshot-history ────────────────────────
+@app.get("/admin/sniper-snapshot-history")
+async def admin_sniper_snapshot_history(days: int = 30):
+    if days < 1 or days > 365:
+        days = 30
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    snapshot_date, protocol_day,
+                    n_settled_combined_active, median_clv_close_pct,
+                    stdev_clv_close_pct, mean_clv_close_pct,
+                    pct_positive_clv, wins, losses, voids,
+                    primary_n, primary_median_clv, primary_roi_pct,
+                    primary_win_rate_pct,
+                    shadow_big5_n, shadow_big5_median_clv,
+                    shadow_big5_roi_pct, shadow_big5_win_rate_pct,
+                    shadow_global_n, captured_at
+                FROM sniper_daily_snapshots
+                WHERE snapshot_date >= CURRENT_DATE - $1::int
+                ORDER BY snapshot_date DESC;
+                """,
+                days,
+            )
+
+        def _f(v):
+            return float(v) if v is not None else None
+
+        out = []
+        for r in rows:
+            out.append({
+                "snapshot_date": r["snapshot_date"].isoformat() if r["snapshot_date"] else None,
+                "protocol_day": int(r["protocol_day"] or 0),
+                "n_settled_combined_active": int(r["n_settled_combined_active"] or 0),
+                "median_clv_close_pct": _f(r["median_clv_close_pct"]),
+                "stdev_clv_close_pct": _f(r["stdev_clv_close_pct"]),
+                "mean_clv_close_pct": _f(r["mean_clv_close_pct"]),
+                "pct_positive_clv": _f(r["pct_positive_clv"]),
+                "wins": int(r["wins"] or 0),
+                "losses": int(r["losses"] or 0),
+                "voids": int(r["voids"] or 0),
+                "primary_n": int(r["primary_n"] or 0),
+                "primary_median_clv": _f(r["primary_median_clv"]),
+                "primary_roi_pct": _f(r["primary_roi_pct"]),
+                "primary_win_rate_pct": _f(r["primary_win_rate_pct"]),
+                "shadow_big5_n": int(r["shadow_big5_n"] or 0),
+                "shadow_big5_median_clv": _f(r["shadow_big5_median_clv"]),
+                "shadow_big5_roi_pct": _f(r["shadow_big5_roi_pct"]),
+                "shadow_big5_win_rate_pct": _f(r["shadow_big5_win_rate_pct"]),
+                "shadow_global_n": int(r["shadow_global_n"] or 0),
+                "captured_at": r["captured_at"].isoformat() if r["captured_at"] else None,
+            })
+        return {"window_days": days, "rows": out, "count": len(out)}
+    except Exception as e:
+        logger.error(f"/admin/sniper-snapshot-history error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 3: Oraklion card-draft helpers + endpoints ─────────────────
+def _build_oraklion_card_v1(pick: dict) -> tuple[str, dict]:
+    """Returnerer (card_text, metadata). Format: TELEGRAM_CARD_V1."""
+    import zoneinfo as _zoneinfo
+    pid = pick.get("id")
+    league = pick.get("league") or "Ukjent liga"
+    home = pick.get("home_team") or "TBD"
+    away = pick.get("away_team") or "TBD"
+    kickoff = pick.get("kickoff_time")
+    if isinstance(kickoff, datetime):
+        if kickoff.tzinfo is None:
+            kickoff = kickoff.replace(tzinfo=timezone.utc)
+        kickoff_oslo = kickoff.astimezone(
+            _zoneinfo.ZoneInfo("Europe/Oslo")
+        ).strftime("%d.%m %H:%M")
+    else:
+        kickoff_oslo = "TBD"
+    odds_open = pick.get("odds_open")
+    odds_str = f"{float(odds_open):.2f}" if odds_open is not None else "?"
+    model_prob = pick.get("model_prob")
+    model_pct = f"{float(model_prob) * 100:.1f}" if model_prob is not None else "?"
+    edge_v = pick.get("edge_pct")
+    edge_str = f"{float(edge_v):.1f}" if edge_v is not None else "?"
+    market_tier = pick.get("market_tier") or "PRIMARY"
+    sep = "━" * 33
+    text = (
+        f"🎯 SesomNod Sniper Pick #{pid}\n"
+        f"{sep}\n"
+        f"Liga:        {league}\n"
+        f"Kamp:        {home} vs {away}\n"
+        f"Kickoff:     {kickoff_oslo}\n"
+        f"Marked:      Over 2.5 Goals\n"
+        f"Odds:        {odds_str} (Pinnacle)\n"
+        f"Modell-prob: {model_pct}%\n"
+        f"Edge:        {edge_str}%\n"
+        f"Tier:        {market_tier}\n"
+        f"{sep}\n"
+        f"Pick lagret. CLV-tracking aktiv.\n"
+        f"Verifisering tilgjengelig etter settlement."
+    )
+    md_specials = set("_*[]()~`>#+-=|{}.!")
+    text_body = (
+        f"{league}{home}{away}{market_tier}"
+    )
+    has_specials = any(c in md_specials for c in text_body)
+    metadata = {
+        "market_tier": market_tier,
+        "league": league,
+        "home_team": home,
+        "away_team": away,
+        "kickoff_utc": kickoff.isoformat() if isinstance(kickoff, datetime) else None,
+        "odds_open": float(odds_open) if odds_open is not None else None,
+        "edge_pct": float(edge_v) if edge_v is not None else None,
+        "model_prob": float(model_prob) if model_prob is not None else None,
+        "is_settled": pick.get("result") in ("WIN", "LOSS", "VOID", "PUSH"),
+        "result": pick.get("result") if pick.get("result") not in (None, "PENDING") else None,
+    }
+    return text, {**metadata, "_has_md_specials": has_specials}
+
+
+# ── DEL 3.2: /admin/oraklion-card-draft-preview ────────────────────
+@app.get("/admin/oraklion-card-draft-preview")
+async def admin_oraklion_card_draft_preview(pick_id: int):
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, match_id, league, home_team, away_team, kickoff_time,
+                       odds_open, edge_pct, model_prob, market_tier, market, result
+                FROM sniper_bets_v1
+                WHERE id = $1;
+                """,
+                pick_id,
+            )
+        if not row:
+            return JSONResponse(
+                status_code=404, content={"error": "pick_id not found"}
+            )
+        pick = dict(row)
+        card_text, meta = _build_oraklion_card_v1(pick)
+        char_count = len(card_text)
+        telegram_safe = char_count <= 4096 and not meta.pop("_has_md_specials", False)
+        return {
+            "pick_id": int(pick_id),
+            "card_text": card_text,
+            "format": "text_only_v1",
+            "char_count": char_count,
+            "telegram_safe": telegram_safe,
+            "ready_for_publish": False,
+            "preview_only": True,
+            "pick_metadata": meta,
+        }
+    except Exception as e:
+        logger.error(f"/admin/oraklion-card-draft-preview error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 3.3: /admin/oraklion-card-draft-batch ──────────────────────
+@app.post("/admin/oraklion-card-draft-batch")
+async def admin_oraklion_card_draft_batch(days: int = 7):
+    if days < 1 or days > 365:
+        days = 7
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        created = 0
+        skipped = 0
+        async with db_state.pool.acquire() as conn:
+            picks = await conn.fetch(
+                """
+                SELECT id, match_id, league, home_team, away_team, kickoff_time,
+                       odds_open, edge_pct, model_prob, market_tier, market, result
+                FROM sniper_bets_v1
+                WHERE created_at >= NOW() - ($1 || ' days')::interval
+                ORDER BY id ASC;
+                """,
+                str(days),
+            )
+            for p in picks:
+                pick = dict(p)
+                card_text, meta = _build_oraklion_card_v1(pick)
+                rid = await conn.fetchval(
+                    """
+                    INSERT INTO oraklion_card_drafts (
+                        source_pick_id, card_text, card_text_format, market_tier,
+                        league, home_team, away_team, kickoff_utc,
+                        market_code, selection, odds_open, edge_pct, model_prob,
+                        is_published_to_telegram
+                    ) VALUES (
+                        $1, $2, 'text_only_v1', $3,
+                        $4, $5, $6, $7,
+                        $8, $9, $10, $11, $12,
+                        FALSE
+                    )
+                    ON CONFLICT (source_pick_id) DO NOTHING
+                    RETURNING id;
+                    """,
+                    int(pick["id"]),
+                    card_text,
+                    pick["market_tier"],
+                    pick["league"],
+                    pick["home_team"],
+                    pick["away_team"],
+                    pick["kickoff_time"],
+                    pick.get("market") or "OVER_2_5",
+                    "OVER",
+                    float(pick["odds_open"]) if pick["odds_open"] is not None else None,
+                    float(pick["edge_pct"]) if pick["edge_pct"] is not None else None,
+                    float(pick["model_prob"]) if pick["model_prob"] is not None else None,
+                )
+                if rid is not None:
+                    created += 1
+                else:
+                    skipped += 1
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM oraklion_card_drafts;"
+            )
+        return {
+            "drafts_created": created,
+            "drafts_skipped_already_existed": skipped,
+            "total_drafts_in_table": int(total or 0),
+        }
+    except Exception as e:
+        logger.error(f"/admin/oraklion-card-draft-batch error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 4.3: /admin/bot-simulator-state ────────────────────────────
+@app.get("/admin/bot-simulator-state")
+async def admin_bot_simulator_state(name: str = DEFAULT_SIMULATOR_NAME):
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            state = await conn.fetchrow(
+                """
+                SELECT * FROM bot_simulator_state WHERE simulator_name = $1;
+                """,
+                name,
+            )
+            if not state:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"simulator '{name}' not found"},
+                )
+            recent = await conn.fetch(
+                """
+                SELECT h.id, h.pick_id, h.bankroll_before, h.stake, h.odds,
+                       h.outcome, h.pnl, h.bankroll_after, h.recorded_at,
+                       p.league, p.home_team, p.away_team, p.market_tier
+                FROM bot_simulator_history h
+                LEFT JOIN sniper_bets_v1 p ON p.id = h.pick_id
+                WHERE h.simulator_id = $1
+                ORDER BY h.recorded_at DESC
+                LIMIT 10;
+                """,
+                state["id"],
+            )
+
+        def _num(v):
+            return float(v) if v is not None else None
+
+        history = []
+        for r in recent:
+            history.append({
+                "id": int(r["id"]),
+                "pick_id": int(r["pick_id"]),
+                "league": r["league"],
+                "match": (
+                    f"{r['home_team']} vs {r['away_team']}"
+                    if r["home_team"] else None
+                ),
+                "tier": r["market_tier"],
+                "bankroll_before": _num(r["bankroll_before"]),
+                "stake": _num(r["stake"]),
+                "odds": _num(r["odds"]),
+                "outcome": r["outcome"],
+                "pnl": _num(r["pnl"]),
+                "bankroll_after": _num(r["bankroll_after"]),
+                "recorded_at": r["recorded_at"].isoformat() if r["recorded_at"] else None,
+            })
+
+        return {
+            "simulator_name": state["simulator_name"],
+            "starting_bankroll": _num(state["starting_bankroll"]),
+            "current_bankroll": _num(state["current_bankroll"]),
+            "target_bankroll": _num(state["target_bankroll"]),
+            "drawdown_stop_pct": _num(state["drawdown_stop_pct"]),
+            "is_active": bool(state["is_active"]),
+            "is_completed": bool(state["is_completed"]),
+            "completion_reason": state["completion_reason"],
+            "total_picks_played": int(state["total_picks_played"] or 0),
+            "total_wins": int(state["total_wins"] or 0),
+            "total_losses": int(state["total_losses"] or 0),
+            "peak_bankroll": _num(state["peak_bankroll"]),
+            "trough_bankroll": _num(state["trough_bankroll"]),
+            "kelly_fraction": _num(state["kelly_fraction"]),
+            "max_stake_pct_of_bankroll": _num(state["max_stake_pct_of_bankroll"]),
+            "market_tiers_played": list(state["market_tiers_played"] or []),
+            "started_at": state["started_at"].isoformat() if state["started_at"] else None,
+            "last_action_at": (
+                state["last_action_at"].isoformat() if state["last_action_at"] else None
+            ),
+            "completed_at": (
+                state["completed_at"].isoformat() if state["completed_at"] else None
+            ),
+            "recent_history": history,
+        }
+    except Exception as e:
+        logger.error(f"/admin/bot-simulator-state error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 4.4: /admin/bot-simulator-replay ───────────────────────────
+@app.post("/admin/bot-simulator-replay")
+async def admin_bot_simulator_replay(
+    name: str = DEFAULT_SIMULATOR_NAME,
+    from_date: str = "2026-05-05",
+):
+    """Replayer simulator mot settled sniper-picks fra from_date i tier-listen.
+    Kelly 0.25 stake-formel per spec. UNIQUE(simulator_id, pick_id) hindrer
+    duplikater — ON CONFLICT DO NOTHING + skipping."""
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from_dt = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "from_date must be ISO date YYYY-MM-DD"},
+        )
+    try:
+        async with db_state.pool.acquire() as conn:
+            state = await conn.fetchrow(
+                "SELECT * FROM bot_simulator_state WHERE simulator_name = $1;",
+                name,
+            )
+            if not state:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"simulator '{name}' not found"},
+                )
+            if state["is_completed"]:
+                return {
+                    "simulator_name": name,
+                    "picks_replayed": 0,
+                    "starting_bankroll": float(state["starting_bankroll"]),
+                    "ending_bankroll": float(state["current_bankroll"]),
+                    "peak": float(state["peak_bankroll"]),
+                    "trough": float(state["trough_bankroll"]),
+                    "completed": True,
+                    "completion_reason": state["completion_reason"],
+                    "wins": int(state["total_wins"] or 0),
+                    "losses": int(state["total_losses"] or 0),
+                    "note": "simulator already completed",
+                }
+
+            tier_list = list(state["market_tiers_played"] or [])
+            picks = await conn.fetch(
+                """
+                SELECT id, kickoff_time, odds_open, edge_pct, market_tier, result,
+                       profit_units
+                FROM sniper_bets_v1
+                WHERE created_at >= $1
+                  AND market_tier = ANY($2::TEXT[])
+                  AND result IN ('WIN','LOSS','VOID','PUSH')
+                ORDER BY kickoff_time ASC, id ASC;
+                """,
+                from_dt, tier_list,
+            )
+            already = await conn.fetch(
+                """
+                SELECT pick_id FROM bot_simulator_history
+                WHERE simulator_id = $1;
+                """,
+                state["id"],
+            )
+            already_ids = {int(r["pick_id"]) for r in already}
+
+            bankroll = float(state["current_bankroll"])
+            peak = float(state["peak_bankroll"])
+            trough = float(state["trough_bankroll"])
+            total_played = int(state["total_picks_played"] or 0)
+            total_wins = int(state["total_wins"] or 0)
+            total_losses = int(state["total_losses"] or 0)
+            kelly_f = float(state["kelly_fraction"])
+            max_stake_pct = float(state["max_stake_pct_of_bankroll"])
+            drawdown_pct = float(state["drawdown_stop_pct"])
+            target = float(state["target_bankroll"])
+            starting = float(state["starting_bankroll"])
+
+            replayed = 0
+            completed = False
+            completion_reason = None
+
+            for p in picks:
+                pid = int(p["id"])
+                if pid in already_ids:
+                    continue
+                odds = float(p["odds_open"]) if p["odds_open"] is not None else None
+                edge_pct_val = float(p["edge_pct"]) if p["edge_pct"] is not None else None
+                outcome = p["result"]
+                if odds is None or odds <= 1.0 or edge_pct_val is None:
+                    continue
+
+                edge_decimal = edge_pct_val / 100.0
+                b = odds - 1.0
+                kelly_raw = bankroll * kelly_f * (
+                    (edge_decimal * b) - (1.0 - edge_decimal)
+                ) / b
+                kelly_raw = max(0.0, kelly_raw)
+                cap = bankroll * max_stake_pct / 100.0
+                stake = min(kelly_raw, cap)
+                if stake <= 0:
+                    continue
+
+                bankroll_before = bankroll
+                if outcome == "WIN":
+                    pnl = stake * b
+                    total_wins += 1
+                elif outcome == "LOSS":
+                    pnl = -stake
+                    total_losses += 1
+                else:
+                    pnl = 0.0
+                bankroll = bankroll_before + pnl
+                if bankroll > peak:
+                    peak = bankroll
+                if bankroll < trough:
+                    trough = bankroll
+                total_played += 1
+
+                await conn.execute(
+                    """
+                    INSERT INTO bot_simulator_history (
+                        simulator_id, pick_id, bankroll_before, stake, odds,
+                        outcome, pnl, bankroll_after
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (simulator_id, pick_id) DO NOTHING;
+                    """,
+                    state["id"], pid,
+                    round(bankroll_before, 2), round(stake, 2),
+                    round(odds, 2), outcome, round(pnl, 2),
+                    round(bankroll, 2),
+                )
+                replayed += 1
+
+                if bankroll >= target:
+                    completed = True
+                    completion_reason = "TARGET_REACHED"
+                    break
+                drawdown_floor = starting * (1.0 - drawdown_pct / 100.0)
+                if bankroll <= drawdown_floor:
+                    completed = True
+                    completion_reason = "DRAWDOWN_STOP_TRIGGERED"
+                    break
+
+            await conn.execute(
+                """
+                UPDATE bot_simulator_state SET
+                    current_bankroll = $1,
+                    peak_bankroll = $2,
+                    trough_bankroll = $3,
+                    total_picks_played = $4,
+                    total_wins = $5,
+                    total_losses = $6,
+                    is_completed = $7,
+                    completion_reason = COALESCE($8, completion_reason),
+                    last_action_at = NOW(),
+                    completed_at = CASE WHEN $7 THEN NOW() ELSE completed_at END
+                WHERE id = $9;
+                """,
+                round(bankroll, 2), round(peak, 2), round(trough, 2),
+                total_played, total_wins, total_losses,
+                completed, completion_reason, state["id"],
+            )
+
+        return {
+            "simulator_name": name,
+            "picks_replayed": replayed,
+            "starting_bankroll": round(starting, 2),
+            "ending_bankroll": round(bankroll, 2),
+            "peak": round(peak, 2),
+            "trough": round(trough, 2),
+            "completed": completed,
+            "completion_reason": completion_reason,
+            "wins": total_wins,
+            "losses": total_losses,
+        }
+    except Exception as e:
+        logger.error(f"/admin/bot-simulator-replay error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ── DEL 4.5: /admin/bot-simulator-history ──────────────────────────
+@app.get("/admin/bot-simulator-history")
+async def admin_bot_simulator_history(
+    name: str = DEFAULT_SIMULATOR_NAME, limit: int = 50,
+):
+    if limit < 1 or limit > 1000:
+        limit = 50
+    if not db_state.connected or not db_state.pool:
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        async with db_state.pool.acquire() as conn:
+            state = await conn.fetchrow(
+                "SELECT id FROM bot_simulator_state WHERE simulator_name = $1;",
+                name,
+            )
+            if not state:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"simulator '{name}' not found"},
+                )
+            rows = await conn.fetch(
+                """
+                SELECT h.id, h.pick_id, h.bankroll_before, h.stake, h.odds,
+                       h.outcome, h.pnl, h.bankroll_after, h.recorded_at,
+                       p.league, p.home_team, p.away_team, p.market_tier, p.market
+                FROM bot_simulator_history h
+                LEFT JOIN sniper_bets_v1 p ON p.id = h.pick_id
+                WHERE h.simulator_id = $1
+                ORDER BY h.recorded_at DESC
+                LIMIT $2;
+                """,
+                state["id"], limit,
+            )
+
+        def _num(v):
+            return float(v) if v is not None else None
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": int(r["id"]),
+                "pick_id": int(r["pick_id"]),
+                "league": r["league"],
+                "match": (
+                    f"{r['home_team']} vs {r['away_team']}"
+                    if r["home_team"] else None
+                ),
+                "tier": r["market_tier"],
+                "market": r["market"],
+                "bankroll_before": _num(r["bankroll_before"]),
+                "stake": _num(r["stake"]),
+                "odds": _num(r["odds"]),
+                "outcome": r["outcome"],
+                "pnl": _num(r["pnl"]),
+                "bankroll_after": _num(r["bankroll_after"]),
+                "recorded_at": r["recorded_at"].isoformat() if r["recorded_at"] else None,
+            })
+        return {
+            "simulator_name": name,
+            "limit": limit,
+            "rows": out,
+            "count": len(out),
+        }
+    except Exception as e:
+        logger.error(f"/admin/bot-simulator-history error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
 @app.get("/admin/verify-pinnacle")
 async def admin_verify_pinnacle(days_ahead: int = 3):
     """
