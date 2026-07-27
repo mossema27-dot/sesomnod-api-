@@ -1,9 +1,9 @@
 """
-AdminAuthMiddleware — beskytter alle /admin/* endepunkter med ADMIN_API_KEY.
+AdminAuthMiddleware — beskytter admin- og docs-endepunkter med ADMIN_API_KEY.
 
 Sjekker Authorization: Bearer <key> header mot os.environ["ADMIN_API_KEY"].
 Returnerer 401 hvis nøkkel mangler, 403 hvis feil.
-Non-admin ruter passerer uendret.
+Ubeskyttede ruter passerer uendret.
 """
 from __future__ import annotations
 
@@ -16,10 +16,20 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("sesomnod.admin_auth")
 
+PROTECTED_PREFIXES: tuple[str, ...] = (
+    "/admin",
+    "/waitlist/admin",
+    "/operator",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+)
+
 
 class AdminAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if not request.url.path.startswith("/admin"):
+        path = request.url.path
+        if not any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES):
             return await call_next(request)
 
         api_key = os.environ.get("ADMIN_API_KEY")
