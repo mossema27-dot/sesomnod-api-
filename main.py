@@ -5699,6 +5699,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── Admin Auth ──
+from services.admin_auth import AdminAuthMiddleware
+app.add_middleware(AdminAuthMiddleware)
+logger.info("[AdminAuth] /admin/* endpoints locked behind ADMIN_API_KEY.")
+
 # ── SlowAPI Rate Limiting ──
 from slowapi import Limiter
 from slowapi.util import get_remote_address
