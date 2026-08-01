@@ -1515,8 +1515,15 @@ async def catch_missed_snapshots(pool) -> dict:
     }
 
 
-# ── DON'S 5-PICKS KILL-SWITCH (KODE 5) ──────────────────────────────────────
+# ── DON'S KILL-SWITCH (KODE 5) ──────────────────────────────────────────────
 SNIPER_PAUSE_KEY = "sniper_pick_gen_paused"
+
+# Kill-switch-terskel (rev. 2026-08-01): statistisk grunnlag krever
+# n>=30 settled PRIMARY-picks med registrert close før auto-stop kan fyre.
+# Under n=30 er 55%-signalers varians for stor til å skille edge-drift
+# fra normal støy. Referanse: pause 2026-05-03 ved n=5 (feilklasse 17f8ead).
+SNIPER_KILLSWITCH_MIN_SETTLED = 30
+SNIPER_KILLSWITCH_POSITIVE_RATE_MIN = 0.40  # under denne raten → PAUSE
 
 
 async def is_sniper_paused(pool) -> bool:
@@ -1531,15 +1538,19 @@ async def is_sniper_paused(pool) -> bool:
 
 async def check_don_kill_switch(pool) -> dict:
     """
-    Don's regel: etter 5 settled picks med odds_close, hvis ≤2 har
-    is_positive_clv_close = TRUE, AUTO_STOP pick generation.
+    Don's regel (rev. 2026-08-01): kill-switch krever n>=30 settled
+    PRIMARY-picks med registrert close før den kan fyre. Under n=30 logges
+    WARNING, men flagget snus IKKE — fem eller ti dårlige utfall er normal
+    varians for et 55%-signal og gir ikke statistisk grunnlag for auto-stop.
 
-    Skriver system_state.sniper_pick_gen_paused = 'true' og logger CRITICAL.
+    Ved n>=30 og positive_clv_rate < 0.40 → AUTO_STOP.
+    Skriver sniper_killswitch_audit → deretter system_state.sniper_pick_gen_paused='true'
+    i samme transaksjon. Logger CRITICAL.
     """
     # SHADOW MODE: kill-switch leser KUN PRIMARY-tier. SHADOW skal aldri
     # påvirke pause-flagget — det er research, ikke styringssignal.
     async with pool.acquire() as conn:
-        last_5 = await conn.fetch(
+        rows = await conn.fetch(
             """
             SELECT id, match_id, is_positive_clv_close
             FROM sniper_bets_v1
@@ -1547,37 +1558,83 @@ async def check_don_kill_switch(pool) -> dict:
               AND odds_close IS NOT NULL
               AND is_positive_clv_close IS NOT NULL
             ORDER BY kickoff_time DESC
-            LIMIT 5;
-            """
+            LIMIT $1;
+            """,
+            SNIPER_KILLSWITCH_MIN_SETTLED,
         )
-    if len(last_5) < 5:
-        return {"status": "INSUFFICIENT_DATA", "n": len(last_5)}
-    positive_count = sum(1 for p in last_5 if p["is_positive_clv_close"])
-    pick_ids = [p["id"] for p in last_5]
-    if positive_count <= 2:
+    n = len(rows)
+    positive_count = sum(1 for p in rows if p["is_positive_clv_close"])
+    pick_ids = [p["id"] for p in rows]
+
+    if n < SNIPER_KILLSWITCH_MIN_SETTLED:
+        logger.warning(
+            "[Sniper] kill-switch check SKIPPED: n=%d < %d settled PRIMARY-picks "
+            "med close. positive_count=%d, pick_ids=%s. "
+            "Insufficient statistical power — ingen auto-stop.",
+            n, SNIPER_KILLSWITCH_MIN_SETTLED, positive_count, pick_ids,
+        )
+        return {
+            "status": "INSUFFICIENT_DATA",
+            "n": n,
+            "min_required": SNIPER_KILLSWITCH_MIN_SETTLED,
+            "positive_count": positive_count,
+            "paused": False,
+        }
+
+    positive_rate = positive_count / n
+    if positive_rate < SNIPER_KILLSWITCH_POSITIVE_RATE_MIN:
+        gate_snapshot = {
+            "n": n,
+            "positive_count": positive_count,
+            "positive_rate": round(positive_rate, 4),
+            "threshold_rate": SNIPER_KILLSWITCH_POSITIVE_RATE_MIN,
+            "min_settled": SNIPER_KILLSWITCH_MIN_SETTLED,
+            "checked_picks": pick_ids,
+        }
+        reason = (
+            f"AUTO_STOP: positive_clv_rate={positive_rate:.2%} "
+            f"< {SNIPER_KILLSWITCH_POSITIVE_RATE_MIN:.0%} "
+            f"ved n={n} settled PRIMARY-picks med close."
+        )
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO system_state (key, value, updated_at)
-                VALUES ($1, 'true', NOW())
-                ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = NOW();
-                """,
-                SNIPER_PAUSE_KEY,
-            )
+            async with conn.transaction():
+                # Audit FØR flagget snus (Don-krav 2026-08-01).
+                await conn.execute(
+                    """
+                    INSERT INTO sniper_killswitch_audit
+                        (action, actor, reason, gate_snapshot)
+                    VALUES ('PAUSE', 'check_don_kill_switch', $1, $2::jsonb);
+                    """,
+                    reason, json.dumps(gate_snapshot),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO system_state (key, value, updated_at)
+                    VALUES ($1, 'true', NOW())
+                    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = NOW();
+                    """,
+                    SNIPER_PAUSE_KEY,
+                )
         logger.critical(
-            "[Sniper] DON_KILL_SWITCH_TRIGGERED: %d/5 positive CLV (picks=%s). "
+            "[Sniper] DON_KILL_SWITCH_TRIGGERED: %d/%d positive CLV "
+            "(%.1f%% < %.0f%% terskel, picks=%s). "
             "Pick generation PAUSED via system_state. Manuell restart kreves.",
-            positive_count, pick_ids,
+            positive_count, n, positive_rate * 100,
+            SNIPER_KILLSWITCH_POSITIVE_RATE_MIN * 100, pick_ids,
         )
         return {
             "status": "AUTO_STOP",
             "positive_count": positive_count,
+            "n": n,
+            "positive_rate": round(positive_rate, 4),
             "checked_picks": pick_ids,
             "paused": True,
         }
     return {
         "status": "PASS",
         "positive_count": positive_count,
+        "n": n,
+        "positive_rate": round(positive_rate, 4),
         "checked_picks": pick_ids,
         "paused": False,
     }
@@ -2063,9 +2120,12 @@ async def check_kill_switches(pool) -> dict:
     roi = (total_profit / n_settled * 100) if n_settled > 0 else 0.0
     pos_clv_pct = (n_positive / n_close * 100) if n_close > 0 else 0.0
 
+    # Kill-switch-terskel hevet fra n>=5 til n>=30 (rev. 2026-08-01):
+    # ved n=5 er 55%-signalers varians for stor til å skille edge-drift
+    # fra normal støy. Samme feilklasse som check_don_kill_switch.
     flags = []
-    if n_close >= 5 and n_positive == 0:
-        flags.append("KILL_SWITCH_NO_POSITIVE_CLV (0/5+ close-snapshots)")
+    if n_close >= SNIPER_KILLSWITCH_MIN_SETTLED and n_positive == 0:
+        flags.append(f"KILL_SWITCH_NO_POSITIVE_CLV (0/{SNIPER_KILLSWITCH_MIN_SETTLED}+ close-snapshots)")
     if n_settled >= 30 and pos_clv_pct < 50.0:
         flags.append("EARLY_WARNING_CLV_BELOW_50PCT")
     if n_settled >= 50 and roi < -3.0:
@@ -2085,9 +2145,11 @@ async def check_kill_switches(pool) -> dict:
         "roi_pct": round(roi, 2),
         "avg_clv_close_pct": round(avg_clv, 2) if avg_clv is not None else None,
         "flags": flags,
-        "auto_stop_required": any(f in ("KILL_SWITCH_NO_POSITIVE_CLV (0/5+ close-snapshots)",
-                                         "CRITICAL_ROI_BELOW_NEG_3PCT",
-                                         "HARD_STOP_REQUIRED") for f in flags),
+        "auto_stop_required": any(
+            f.startswith("KILL_SWITCH_NO_POSITIVE_CLV")
+            or f in ("CRITICAL_ROI_BELOW_NEG_3PCT", "HARD_STOP_REQUIRED")
+            for f in flags
+        ),
     }
 
 

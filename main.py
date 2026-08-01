@@ -41,7 +41,7 @@ import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from services.mirofish_client import (
@@ -12603,25 +12603,61 @@ async def admin_sniper_shadow_mismatches(window_days: int = 7, limit: int = 50):
 
 
 @app.post("/admin/sniper-kill-switch-resume")
-async def admin_sniper_kill_switch_resume():
+async def admin_sniper_kill_switch_resume(
+    reason: str = Query(
+        ..., min_length=10,
+        description="Hvorfor resumer vi? Min 10 tegn. Skrives til sniper_killswitch_audit.",
+    ),
+    actor: str = Query(
+        "admin_endpoint", min_length=1,
+        description="Hvem/hva ba om resume (f.eks. 'don', 'ops-bot').",
+    ),
+):
     """
     KODE 5: manuelt resume etter kill-switch trigger. Setter
     system_state.sniper_pick_gen_paused = 'false'. Bruker har ansvar for
     å kun kjøre dette etter manuell verifisering av CLV-trend.
+
+    Krever ?reason=<min 10 chars>&actor=<hvem>. Skriver sniper_killswitch_audit
+    FØR flagget snus (Don-krav 2026-08-01).
     """
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"error": "DB offline"})
     try:
         async with db_state.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO system_state (key, value, updated_at)
-                VALUES ('sniper_pick_gen_paused', 'false', NOW())
-                ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = NOW();
-                """
+            prev = await conn.fetchrow(
+                "SELECT value, updated_at FROM system_state WHERE key = 'sniper_pick_gen_paused';"
             )
-        logger.warning("[Sniper] kill-switch RESUMED via admin endpoint")
-        return {"status": "ok", "paused": False}
+        gate_snapshot = {
+            "prev_value": (prev["value"] if prev else None),
+            "prev_updated_at": (
+                prev["updated_at"].isoformat()
+                if prev and prev["updated_at"] else None
+            ),
+        }
+        async with db_state.pool.acquire() as conn:
+            async with conn.transaction():
+                # Audit FØR flip.
+                await conn.execute(
+                    """
+                    INSERT INTO sniper_killswitch_audit
+                        (action, actor, reason, gate_snapshot)
+                    VALUES ('RESUME', $1, $2, $3::jsonb);
+                    """,
+                    actor, reason, json.dumps(gate_snapshot),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO system_state (key, value, updated_at)
+                    VALUES ('sniper_pick_gen_paused', 'false', NOW())
+                    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = NOW();
+                    """
+                )
+        logger.warning(
+            "[Sniper] kill-switch RESUMED via admin endpoint. actor=%s reason=%s",
+            actor, reason,
+        )
+        return {"status": "ok", "paused": False, "actor": actor, "reason": reason}
     except Exception as e:
         logger.error(f"[SniperResume] error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
