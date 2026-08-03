@@ -16681,3 +16681,432 @@ async def admin_mark_demo_picks(body: dict):
     except Exception as e:
         logger.error(f"/admin/mark-demo-picks error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# /public/oraklion/* — offentlige aggregatendepunkter (BRIEF-2 §8)
+#
+# INGEN AUTH. Prefikset ligger UTENFOR AdminAuthMiddleware.PROTECTED_PREFIXES
+# (se services/admin_auth.py). Kun aggregater — ingen personopplysninger,
+# ingen kamp-id / lagnavn / noe som identifiserer uavgjorte kamper.
+#
+# Konvolutt: {data, as_of, source, degraded}. Felt uten måling = null.
+# 30s in-memory cache per endepunkt (kan bli truffet av mange samtidig).
+# ═════════════════════════════════════════════════════════════════════════
+
+_ORAKLION_CACHE: dict[str, tuple[float, dict]] = {}
+_ORAKLION_CACHE_TTL_SEC = 30.0
+
+
+def _oraklion_cache_get(key: str) -> dict | None:
+    hit = _ORAKLION_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _ORAKLION_CACHE_TTL_SEC:
+        return hit[1]
+    return None
+
+
+def _oraklion_cache_set(key: str, value: dict) -> dict:
+    _ORAKLION_CACHE[key] = (time.time(), value)
+    return value
+
+
+def _oraklion_envelope(data: dict, *, degraded: bool = False, source: str = "live") -> dict:
+    return {
+        "data": data,
+        "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": source,
+        "degraded": degraded,
+    }
+
+
+async def _oraklion_table_exists(pool, table_name: str) -> bool:
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL;",
+            f"public.{table_name}",
+        ))
+
+
+@app.get("/public/oraklion/state")
+async def public_oraklion_state():
+    """Motorens nåværende tilstand (BRIEF-2 §8.1)."""
+    cached = _oraklion_cache_get("state")
+    if cached is not None:
+        return cached
+    if not db_state.connected or not db_state.pool:
+        return _oraklion_cache_set("state", _oraklion_envelope(
+            {"engine_paused": None, "paused_since": None,
+             "leagues_monitored": None, "scanned_today": None,
+             "sealed_today": None, "chain_intact": None},
+            degraded=True, source="db_offline",
+        ))
+    try:
+        from services.sniper_live import PRIMARY_LEAGUES, SHADOW_GLOBAL_LEAGUES
+
+        degraded = False
+        async with db_state.pool.acquire() as conn:
+            paused_row = await conn.fetchrow(
+                "SELECT value FROM system_state WHERE key = 'sniper_pick_gen_paused';"
+            )
+            paused = bool(paused_row) and (paused_row["value"] or "").lower() == "true"
+
+            paused_since = None
+            if paused:
+                audit_row = await conn.fetchrow(
+                    """
+                    SELECT changed_at FROM sniper_killswitch_audit
+                    WHERE action = 'PAUSE'
+                    ORDER BY changed_at DESC LIMIT 1;
+                    """
+                )
+                if audit_row and audit_row["changed_at"]:
+                    paused_since = audit_row["changed_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            scanned_today: int | None = None
+            if await _oraklion_table_exists(db_state.pool, "sniper_scan_log"):
+                scanned_today = int(await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(fixtures_scanned), 0)
+                    FROM sniper_scan_log
+                    WHERE scanned_at::date = (NOW() AT TIME ZONE 'UTC')::date;
+                    """
+                ) or 0)
+            else:
+                degraded = True
+
+            sealed_today: int | None = None
+            chain_intact: bool | None = None
+            if await _oraklion_table_exists(db_state.pool, "oraklion_chain"):
+                sealed_today = int(await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM oraklion_chain
+                    WHERE sealed_at::date = (NOW() AT TIME ZONE 'UTC')::date;
+                    """
+                ) or 0)
+                chain_intact = bool(await conn.fetchval(
+                    "SELECT COALESCE(BOOL_AND(status <> 'VOID'), TRUE) FROM oraklion_chain;"
+                ))
+            else:
+                degraded = True
+
+        leagues_monitored = len(set(PRIMARY_LEAGUES) | set(SHADOW_GLOBAL_LEAGUES))
+
+        return _oraklion_cache_set("state", _oraklion_envelope({
+            "engine_paused": paused,
+            "paused_since": paused_since,
+            "leagues_monitored": leagues_monitored,
+            "scanned_today": scanned_today,
+            "sealed_today": sealed_today,
+            "chain_intact": chain_intact,
+        }, degraded=degraded))
+    except Exception as e:
+        logger.error(f"[/public/oraklion/state] {e}", exc_info=True)
+        return _oraklion_envelope(
+            {"engine_paused": None, "paused_since": None,
+             "leagues_monitored": None, "scanned_today": None,
+             "sealed_today": None, "chain_intact": None},
+            degraded=True, source="error",
+        )
+
+
+@app.get("/public/oraklion/eye")
+async def public_oraklion_eye():
+    """CLV-aggregater siste 30 dager, PRIMARY-tier (BRIEF-2 §8.2)."""
+    cached = _oraklion_cache_get("eye")
+    if cached is not None:
+        return cached
+    if not db_state.connected or not db_state.pool:
+        return _oraklion_cache_set("eye", _oraklion_envelope({
+            "settled_30d": 0, "median_clv_pct": None, "positive_clv_ratio": None,
+            "roi_pct": None, "hit_rate_pct": None, "stdev_pct": None, "n": 0,
+        }, degraded=True, source="db_offline"))
+    try:
+        async with db_state.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE result IN ('WIN','LOSS'))              AS settled,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY clv_close_pct)
+                        FILTER (WHERE clv_close_pct IS NOT NULL)                  AS median_clv,
+                    COUNT(*) FILTER (WHERE is_positive_clv_close IS TRUE)         AS pos_clv,
+                    COUNT(*) FILTER (WHERE clv_close_pct IS NOT NULL)             AS n_clv,
+                    SUM(profit_units) FILTER (WHERE result IN ('WIN','LOSS'))     AS profit,
+                    COUNT(*) FILTER (WHERE result = 'WIN')                        AS wins,
+                    stddev_samp(clv_close_pct) FILTER (WHERE clv_close_pct IS NOT NULL) AS stdev_clv
+                FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                  AND settled_at >= NOW() - INTERVAL '30 days';
+                """
+            )
+        settled = int(row["settled"] or 0)
+        n_clv = int(row["n_clv"] or 0)
+        pos_clv = int(row["pos_clv"] or 0)
+        wins = int(row["wins"] or 0)
+
+        if settled == 0:
+            data = {
+                "settled_30d": 0, "median_clv_pct": None, "positive_clv_ratio": None,
+                "roi_pct": None, "hit_rate_pct": None, "stdev_pct": None, "n": 0,
+            }
+        else:
+            profit = float(row["profit"] or 0.0)
+            data = {
+                "settled_30d": settled,
+                "median_clv_pct": round(float(row["median_clv"]), 2) if row["median_clv"] is not None else None,
+                "positive_clv_ratio": round(pos_clv / n_clv, 4) if n_clv > 0 else None,
+                "roi_pct": round(profit / settled * 100, 2),
+                "hit_rate_pct": round(wins / settled * 100, 2),
+                "stdev_pct": round(float(row["stdev_clv"]), 2) if row["stdev_clv"] is not None else None,
+                "n": settled,
+            }
+        return _oraklion_cache_set("eye", _oraklion_envelope(data))
+    except Exception as e:
+        logger.error(f"[/public/oraklion/eye] {e}", exc_info=True)
+        return _oraklion_envelope({
+            "settled_30d": 0, "median_clv_pct": None, "positive_clv_ratio": None,
+            "roi_pct": None, "hit_rate_pct": None, "stdev_pct": None, "n": 0,
+        }, degraded=True, source="error")
+
+
+@app.get("/public/oraklion/network")
+async def public_oraklion_network():
+    """Dagens skanning + eventuell konvergens (BRIEF-2 §8.3).
+
+    highest_conviction returneres KUN når picken er settled (WIN/LOSS),
+    og aldri med lagnavn/kamp-id.
+    """
+    cached = _oraklion_cache_get("network")
+    if cached is not None:
+        return cached
+    if not db_state.connected or not db_state.pool:
+        return _oraklion_cache_set("network", _oraklion_envelope({
+            "scanned": None, "rejected": None, "converged": None,
+            "rejection_breakdown": {}, "highest_conviction": None,
+        }, degraded=True, source="db_offline"))
+    try:
+        degraded = False
+        scanned: int | None = None
+        rejection_breakdown: dict[str, int] = {}
+        converged = 0
+
+        async with db_state.pool.acquire() as conn:
+            if await _oraklion_table_exists(db_state.pool, "sniper_scan_log"):
+                agg = await conn.fetchrow(
+                    """
+                    SELECT
+                        COALESCE(SUM(fixtures_scanned), 0)          AS scanned,
+                        COALESCE(SUM(rejected_odds), 0)             AS odds,
+                        COALESCE(SUM(rejected_model), 0)            AS model,
+                        COALESCE(SUM(rejected_edge), 0)             AS edge,
+                        COALESCE(SUM(rejected_cap), 0)              AS cap
+                    FROM sniper_scan_log
+                    WHERE scanned_at::date = (NOW() AT TIME ZONE 'UTC')::date;
+                    """
+                )
+                scanned = int(agg["scanned"] or 0)
+                rejection_breakdown = {
+                    "odds":  int(agg["odds"]  or 0),
+                    "model": int(agg["model"] or 0),
+                    "edge":  int(agg["edge"]  or 0),
+                    "cap":   int(agg["cap"]   or 0),
+                }
+            else:
+                degraded = True
+
+            converged = int(await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                  AND pick_timestamp::date = (NOW() AT TIME ZONE 'UTC')::date;
+                """
+            ) or 0)
+
+            best_row = await conn.fetchrow(
+                """
+                SELECT market, model_prob, market_implied_prob, edge_pct,
+                       odds_open, odds_close, clv_close_pct, result
+                FROM sniper_bets_v1
+                WHERE market_tier = 'PRIMARY'
+                  AND pick_timestamp::date = (NOW() AT TIME ZONE 'UTC')::date
+                  AND result IN ('WIN', 'LOSS')
+                ORDER BY edge_pct DESC
+                LIMIT 1;
+                """
+            )
+
+        highest_conviction = None
+        if best_row:
+            reasoning = [
+                {"factor": "odds",  "status": "PASSED",
+                 "detail": f"Pinnacle @ {float(best_row['odds_open']):.2f}"},
+                {"factor": "model", "status": "PASSED",
+                 "detail": f"Dixon-Coles prob={float(best_row['model_prob']):.3f}"},
+                {"factor": "edge",  "status": "PASSED",
+                 "detail": f"{float(best_row['edge_pct']):.1f}%"},
+                {"factor": "cap",   "status": "PASSED",
+                 "detail": "PRIMARY (aldri cappet)"},
+            ]
+            highest_conviction = {
+                "market": best_row["market"],
+                "model_prob": round(float(best_row["model_prob"]), 4),
+                "market_prob": round(float(best_row["market_implied_prob"]), 4),
+                "edge_pct": round(float(best_row["edge_pct"]), 2),
+                "confidence": None,
+                "reasoning": reasoning,
+            }
+
+        rejected = (scanned - converged) if scanned is not None else None
+
+        return _oraklion_cache_set("network", _oraklion_envelope({
+            "scanned": scanned,
+            "rejected": rejected,
+            "converged": converged,
+            "rejection_breakdown": rejection_breakdown,
+            "highest_conviction": highest_conviction,
+        }, degraded=degraded))
+    except Exception as e:
+        logger.error(f"[/public/oraklion/network] {e}", exc_info=True)
+        return _oraklion_envelope({
+            "scanned": None, "rejected": None, "converged": None,
+            "rejection_breakdown": {}, "highest_conviction": None,
+        }, degraded=True, source="error")
+
+
+@app.get("/public/oraklion/chain")
+async def public_oraklion_chain(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Beviskjeden — paginert (BRIEF-2 §8.4). Skjema mangler ennå."""
+    cache_key = f"chain:{limit}:{offset}"
+    cached = _oraklion_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    if not db_state.connected or not db_state.pool:
+        return _oraklion_cache_set(cache_key, _oraklion_envelope({
+            "breaks": None, "gaps": None, "total_sealed": None, "entries": [],
+        }, degraded=True, source="db_offline"))
+    try:
+        if not await _oraklion_table_exists(db_state.pool, "oraklion_chain"):
+            return _oraklion_cache_set(cache_key, _oraklion_envelope({
+                "breaks": None, "gaps": None, "total_sealed": None, "entries": [],
+            }, degraded=True, source="schema_missing"))
+
+        async with db_state.pool.acquire() as conn:
+            summary = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'VOID')  AS breaks,
+                    COUNT(*)                                  AS total_sealed
+                FROM oraklion_chain;
+                """
+            )
+            entries_rows = await conn.fetch(
+                """
+                SELECT seq, hash, sealed_at, kickoff_utc, margin_seconds, status, revealed
+                FROM oraklion_chain
+                ORDER BY seq DESC
+                LIMIT $1 OFFSET $2;
+                """,
+                limit, offset,
+            )
+        entries = []
+        for r in entries_rows:
+            d = dict(r)
+            for k in ("sealed_at", "kickoff_utc"):
+                if d.get(k):
+                    d[k] = d[k].strftime("%Y-%m-%dT%H:%M:%SZ")
+            if d.get("status") == "COMMITTED":
+                d["revealed"] = None
+            entries.append(d)
+
+        return _oraklion_cache_set(cache_key, _oraklion_envelope({
+            "breaks": int(summary["breaks"] or 0),
+            "gaps": 0,  # gap-analyse krever seq-window; kommer med skjema-oppdatering
+            "total_sealed": int(summary["total_sealed"] or 0),
+            "entries": entries,
+        }))
+    except Exception as e:
+        logger.error(f"[/public/oraklion/chain] {e}", exc_info=True)
+        return _oraklion_envelope({
+            "breaks": None, "gaps": None, "total_sealed": None, "entries": [],
+        }, degraded=True, source="error")
+
+
+@app.get("/public/oraklion/calibration")
+async def public_oraklion_calibration():
+    """Kalibrering-status og gate-terskler (BRIEF-2 §8.5)."""
+    cached = _oraklion_cache_get("calibration")
+    if cached is not None:
+        return cached
+    from services.sniper_live import CALIBRATION_GATE, LAUNCH_GATE
+
+    day = max(0, (datetime.now(timezone.utc) - PROTOCOL_START_DT).days)
+
+    settled: int | None = 0
+    degraded = False
+    if not db_state.connected or not db_state.pool:
+        degraded = True
+        settled = None
+    else:
+        try:
+            async with db_state.pool.acquire() as conn:
+                settled = int(await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM sniper_bets_v1
+                    WHERE market_tier = 'PRIMARY'
+                      AND result IN ('WIN','LOSS')
+                      AND settled_at >= NOW() - INTERVAL '30 days';
+                    """
+                ) or 0)
+        except Exception as e:
+            logger.error(f"[/public/oraklion/calibration] {e}", exc_info=True)
+            settled = None
+            degraded = True
+
+    return _oraklion_cache_set("calibration", _oraklion_envelope({
+        "day": day,
+        "window_days": 30,
+        "settled": settled,
+        "gate": dict(CALIBRATION_GATE),
+        "launch_gate": dict(LAUNCH_GATE),
+    }, degraded=degraded))
+
+
+@app.get("/public/oraklion/telemetry")
+async def public_oraklion_telemetry():
+    """Systemhendelser — kun faktiske tilstandsendringer (BRIEF-2 §8.6)."""
+    cached = _oraklion_cache_get("telemetry")
+    if cached is not None:
+        return cached
+    if not db_state.connected or not db_state.pool:
+        return _oraklion_cache_set("telemetry", _oraklion_envelope(
+            {"events": []}, degraded=True, source="db_offline",
+        ))
+    try:
+        async with db_state.pool.acquire() as conn:
+            audit_rows = await conn.fetch(
+                """
+                SELECT changed_at AS ts, action, actor,
+                       LEFT(reason, 140) AS reason
+                FROM sniper_killswitch_audit
+                ORDER BY changed_at DESC
+                LIMIT 20;
+                """
+            )
+        events = []
+        for r in audit_rows:
+            ts = r["ts"].strftime("%Y-%m-%dT%H:%M:%SZ")
+            action = r["action"]
+            actor = r["actor"] or "unknown"
+            reason = r["reason"] or ""
+            if action == "PAUSE":
+                events.append({"ts": ts,
+                    "message": f"Kill-switch pauset ({actor}): {reason}"})
+            else:
+                events.append({"ts": ts,
+                    "message": f"Kill-switch resumert ({actor}): {reason}"})
+        return _oraklion_cache_set("telemetry", _oraklion_envelope({"events": events}))
+    except Exception as e:
+        logger.error(f"[/public/oraklion/telemetry] {e}", exc_info=True)
+        return _oraklion_envelope({"events": []}, degraded=True, source="error")

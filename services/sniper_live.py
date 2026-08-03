@@ -1525,6 +1525,25 @@ SNIPER_PAUSE_KEY = "sniper_pick_gen_paused"
 SNIPER_KILLSWITCH_MIN_SETTLED = 30
 SNIPER_KILLSWITCH_POSITIVE_RATE_MIN = 0.40  # under denne raten → PAUSE
 
+# Kalibrering-gate: vurdert etter n=30 settled picks. Bestemmer om
+# 30d-vinduet møter minstekrav for videre skalering. Publisert via
+# /public/oraklion/calibration.
+CALIBRATION_GATE = {
+    "min_settled": 30,
+    "median_clv_min": 1.5,      # %
+    "stdev_max": 12.0,          # % (samplet stdev av clv_close_pct)
+    "positive_ratio_min": 50.0, # %
+}
+
+# Launch-gate: vurdert etter n=100 settled picks. Bestemmer om systemet
+# har verifisert edge og kan gå live. Publisert via same endepunkt.
+LAUNCH_GATE = {
+    "min_settled": 100,
+    "roi_min": 3.0,             # %
+    "clv_close_min": 55.0,      # % positive-CLV ratio
+    "max_drawdown": 20.0,       # %
+}
+
 
 async def is_sniper_paused(pool) -> bool:
     """Sjekk om generate_picks er pauset av kill-switch."""
