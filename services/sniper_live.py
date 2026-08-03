@@ -737,6 +737,7 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
         shadow_today_initial = 0
     shadow_today = shadow_today_initial
 
+    scan_start_dt = datetime.now(timezone.utc)  # frekvenslogging (BRIEF-2 §8)
     stats = {
         "fixtures_scanned": 0,
         "no_pinnacle_odds": 0,
@@ -956,6 +957,10 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                                 "[Sniper] PRIMARY MAX_PICKS_PER_DAY (%d) reached",
                                 MAX_PICKS_PER_DAY,
                             )
+                            await _log_scan_stats(
+                                pool, stats, scan_start_dt,
+                                "generate_picks_cap_hit", days_ahead,
+                            )
                             return stats
                     elif market_tier == "SHADOW_BIG5":
                         stats["shadow_big5_created"] += 1
@@ -964,7 +969,51 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                         stats["shadow_global_created"] += 1
                         shadow_today += 1
 
+    await _log_scan_stats(pool, stats, scan_start_dt, "generate_picks", days_ahead)
     return stats
+
+
+# ── FREKVENSLOGGING (BRIEF-2 §8) ────────────────────────────────────────────
+# Måler om n=30 er nåbart innen rimelig tid — én rad per skanning.
+# Bucket-mapping (fire motorer):
+#   rejected_odds  ← no_pinnacle_odds + outside_odds_range
+#   rejected_model ← model_predict_failed
+#   rejected_edge  ← low_edge + quarantined_high_edge
+#   rejected_cap   ← shadow_cap_skipped
+async def _log_scan_stats(
+    pool, stats: dict, scan_start_dt: datetime,
+    scan_type: str, days_ahead: int,
+) -> None:
+    """Skriv én rad til sniper_scan_log. Feiler stille — logging må aldri
+    stoppe pick-generering."""
+    try:
+        duration_sec = (datetime.now(timezone.utc) - scan_start_dt).total_seconds()
+        rejected_odds  = int(stats.get("no_pinnacle_odds", 0) + stats.get("outside_odds_range", 0))
+        rejected_model = int(stats.get("model_predict_failed", 0))
+        rejected_edge  = int(stats.get("low_edge", 0) + stats.get("quarantined_high_edge", 0))
+        rejected_cap   = int(stats.get("shadow_cap_skipped", 0))
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sniper_scan_log (
+                    scanned_at, scan_type, days_ahead, duration_seconds,
+                    fixtures_scanned, rejected_odds, rejected_model,
+                    rejected_edge, rejected_cap,
+                    picks_created, primary_created,
+                    shadow_big5_created, shadow_global_created, raw_stats
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb);
+                """,
+                scan_start_dt, scan_type, int(days_ahead), duration_sec,
+                int(stats.get("fixtures_scanned", 0)),
+                rejected_odds, rejected_model, rejected_edge, rejected_cap,
+                int(stats.get("picks_created", 0)),
+                int(stats.get("primary_created", 0)),
+                int(stats.get("shadow_big5_created", 0)),
+                int(stats.get("shadow_global_created", 0)),
+                json.dumps(stats, default=str),
+            )
+    except Exception as e:
+        logger.warning("[Sniper] scan-log write failed: %s", e)
 
 
 # ── ODDS-SNAPSHOTS ──────────────────────────────────────────────────────────
