@@ -7282,7 +7282,15 @@ async def get_public_upcoming_edge():
 
 @app.get("/clv")
 async def get_clv():
-    """Henter siste CLV-records med statistikk."""
+    """Henter siste CLV-records med statistikk.
+
+    ADVARSEL: closing line her er fanget POST-kickoff (rot-årsak i
+    track_clv scheduler-jobb — fanger live-odds 90 min etter kickoff, ikke
+    pre-match closing line). Rader med |clv_pct|>25 er åpenbart ugyldige
+    og filtreres bort fra stats_30d-aggregatet som midlertidig demning.
+
+    For verifisert sniper-CLV, se /public/oraklion/eye (sniper_bets_v1).
+    """
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"status": "offline", "error": "Database ikke tilgjengelig"})
     try:
@@ -7292,14 +7300,20 @@ async def get_clv():
             )
             stats = await conn.fetchrow("""
                 SELECT
-                    COUNT(*) as total,
-                    ROUND(AVG(clv_pct)::numeric, 2) as avg_clv,
-                    COUNT(CASE WHEN clv_pct > 0 THEN 1 END) as positive_clv
+                    COUNT(*) FILTER (WHERE ABS(clv_pct) <= 25)                     AS total,
+                    COUNT(*) FILTER (WHERE ABS(clv_pct) >  25)                     AS excluded_invalid,
+                    ROUND(AVG(clv_pct) FILTER (WHERE ABS(clv_pct) <= 25)::numeric, 2) AS avg_clv,
+                    COUNT(*) FILTER (WHERE clv_pct > 0 AND ABS(clv_pct) <= 25)     AS positive_clv
                 FROM clv_records
                 WHERE tracked_at >= NOW() - INTERVAL '30 days'
             """)
         return {
             "status": "ok",
+            "source": "legacy_dagens_kamp",
+            "warning": (
+                "Closing line captured post-kickoff. Not CLV. "
+                "Use /public/oraklion/eye for verified sniper CLV."
+            ),
             "stats_30d": dict(stats) if stats else {},
             "records": [dict(r) for r in rows],
             "count": len(rows),
