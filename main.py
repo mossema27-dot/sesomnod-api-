@@ -16769,6 +16769,65 @@ async def admin_mark_demo_picks(body: dict):
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# /mentor/chat — Oraklion Mentor (BRIEF 2026-08-03)
+#
+# Pipeline: RateLimiter → SafetyGate → FactRetriever → Anthropic Sonnet 5
+# → NumericGuard → PhraseGuard → oraklion.mentor_log (PII-maskert).
+# Se services/oraklion_mentor.py for full logikk.
+#
+# ANTHROPIC_API_KEY leses fra Railway env. Tabellene fra
+# services/oraklion_mentor_ddl.sql må eksistere.
+# ═════════════════════════════════════════════════════════════════════════
+
+class MentorChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+
+@app.post("/mentor/chat")
+async def mentor_chat(body: MentorChatRequest):
+    if not body.session_id or not body.message:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "session_id and message required"},
+        )
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "ANTHROPIC_API_KEY not configured on this deployment"},
+        )
+    if not db_state.connected or not db_state.pool:
+        # Fail closed on DB — audit-log er sikkerhetskritisk.
+        return JSONResponse(status_code=503, content={"error": "DB offline"})
+    try:
+        from services.oraklion_mentor import run_mentor
+        result = await run_mentor(
+            db_state.pool,
+            session_id=body.session_id.strip()[:80],
+            message=body.message,
+        )
+        if not result.ok:
+            status = 429 if result.verdict == "rate_limited" else 400
+            return JSONResponse(
+                status_code=status,
+                content={
+                    "ok": False,
+                    "verdict": result.verdict,
+                    "reason": result.reason,
+                    "detail": result.detail,
+                },
+            )
+        return {
+            "ok": True,
+            "text": result.text,
+            "facts_snapshot": result.facts,
+        }
+    except Exception as e:
+        logger.error("[/mentor/chat] %s", e, exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # /public/oraklion/* — offentlige aggregatendepunkter (BRIEF-2 §8)
 #
 # INGEN AUTH. Prefikset ligger UTENFOR AdminAuthMiddleware.PROTECTED_PREFIXES
