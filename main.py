@@ -5454,6 +5454,77 @@ async def lifespan(app: FastAPI):
             coalesce=True,
         )
 
+    # ── UPTIME HEARTBEAT — 07:00 UTC daglig (2026-08-03) ────────────────
+    # Motoren stod stille i 12 uker fordi ingen ble varslet. Denne jobben
+    # fyrer ALLTID — også når alt er grønt. En stille dag skal bekreftes,
+    # ikke antas. Se sniper_scan_log + sniper_bets_v1 + system_state.
+    async def _uptime_heartbeat_job():
+        try:
+            if not db_state.connected or not db_state.pool:
+                await _send_telegram_markdownv2(
+                    "🩺 *SesomNod uptime*\nDB offline — kan ikke lese tilstand\\."
+                )
+                return
+            async with db_state.pool.acquire() as conn:
+                paused_row = await conn.fetchrow(
+                    "SELECT value FROM system_state WHERE key = 'sniper_pick_gen_paused';"
+                )
+                paused = bool(paused_row) and (paused_row["value"] or "").lower() == "true"
+
+                summary = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last_24h,
+                        COUNT(*) FILTER (WHERE result IN ('WIN','LOSS')
+                                          AND market_tier = 'PRIMARY')                    AS settled_primary,
+                        MAX(created_at)                                                    AS newest
+                    FROM sniper_bets_v1;
+                """)
+                last_24h = int(summary["last_24h"] or 0)
+                settled_primary = int(summary["settled_primary"] or 0)
+                newest = summary["newest"]
+            days_since = None
+            if newest:
+                days_since = (datetime.now(timezone.utc) - newest).days
+            engine_line = "🟢 Motor kjører" if not paused else "🔴 Motor PAUSET"
+            days_line = (
+                f"Siste pick: {days_since}d siden" if days_since is not None
+                else "Siste pick: aldri"
+            )
+            target = 30
+            # Alt escapes for MarkdownV2.
+            msg = (
+                "🩺 *SesomNod daglig uptime*\n"
+                f"{_mdv2_escape(engine_line)}\n"
+                f"Picks siste 24t: *{last_24h}*\n"
+                f"{_mdv2_escape(days_line)}\n"
+                f"Settled PRIMARY: *{settled_primary}* / mål {target}"
+            )
+            await _send_telegram_markdownv2(msg)
+            logger.info(
+                "[Uptime] heartbeat sent: paused=%s last24h=%d settled=%d days_since=%s",
+                paused, last_24h, settled_primary, days_since,
+            )
+        except Exception as e:
+            logger.error("[Uptime] heartbeat failed: %s", e, exc_info=True)
+            try:
+                await _send_telegram_markdownv2(
+                    f"🩺 *SesomNod uptime*\nHeartbeat feilet: {_mdv2_escape(str(e)[:120])}"
+                )
+            except Exception:
+                pass
+
+    if not scheduler.get_job("uptime_heartbeat"):
+        scheduler.add_job(
+            _uptime_heartbeat_job,
+            trigger=CronTrigger(hour=7, minute=0, timezone="UTC"),
+            id="uptime_heartbeat",
+            replace_existing=True,
+            name="Daily Uptime Heartbeat 07:00 UTC",
+            misfire_grace_time=900,
+            max_instances=1,
+            coalesce=True,
+        )
+
     scheduler.start()
     # Expose scheduler to request handlers (read-only) and capture per-job execution history.
     app.state.scheduler = scheduler
