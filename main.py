@@ -5482,10 +5482,49 @@ async def lifespan(app: FastAPI):
             coalesce=True,
         )
 
-    # ── UPTIME HEARTBEAT — 07:00 UTC daglig (2026-08-03) ────────────────
+    # ── UPTIME HEARTBEAT — 07:00 UTC daglig (2026-08-03, utvidet 2026-08-15) ─
     # Motoren stod stille i 12 uker fordi ingen ble varslet. Denne jobben
     # fyrer ALLTID — også når alt er grønt. En stille dag skal bekreftes,
     # ikke antas. Se sniper_scan_log + sniper_bets_v1 + system_state.
+    #
+    # 2026-08-15: utvidet med API-Football /status-sjekk. Tre tjenester har
+    # dødd av manglende fornyelse i år (Netlify, API-Football, Supabase).
+    # /status koster 0 kvote-kall og fanger alle tre fail-modi:
+    #   subscription.active=false, requests.current nær limit, plan=Free
+    # når vi trenger paid.
+    async def _check_api_football_subscription():
+        """Returnerer (status_line, is_warning) — plain text."""
+        api_key = os.environ.get("FOOTBALL_API_KEY", "")
+        if not api_key:
+            return ("API-Football: NØKKEL MANGLER i env", True)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://v3.football.api-sports.io/status",
+                    headers={
+                        "X-RapidAPI-Key": api_key,
+                        "X-RapidAPI-Host": "v3.football.api-sports.io",
+                    },
+                )
+                data = r.json().get("response") or {}
+        except Exception as e:
+            return (f"API-Football: /status feilet — {str(e)[:80]}", True)
+        subscription = data.get("subscription") or {}
+        requests_info = data.get("requests") or {}
+        active = bool(subscription.get("active"))
+        plan = subscription.get("plan") or "?"
+        end = subscription.get("end") or "?"
+        current = int(requests_info.get("current") or 0)
+        limit_day = int(requests_info.get("limit_day") or 0)
+        pct = (current / limit_day * 100) if limit_day > 0 else 0
+        warn = (not active) or (limit_day > 0 and pct >= 80)
+        icon = "🔴" if warn else "🟢"
+        return (
+            f"{icon} API-Football: plan={plan} active={active} "
+            f"req={current}/{limit_day} ({pct:.0f}%) end={end}",
+            warn,
+        )
+
     async def _uptime_heartbeat_job():
         try:
             if not db_state.connected or not db_state.pool:
@@ -5519,13 +5558,18 @@ async def lifespan(app: FastAPI):
                 else "Siste pick: aldri"
             )
             target = 30
+
+            # API-Football subscription check (koster 0 kvote-kall).
+            subscription_line, _warn = await _check_api_football_subscription()
+
             # Alt escapes for MarkdownV2.
             msg = (
                 "🩺 *SesomNod daglig uptime*\n"
                 f"{_mdv2_escape(engine_line)}\n"
                 f"Picks siste 24t: *{last_24h}*\n"
                 f"{_mdv2_escape(days_line)}\n"
-                f"Settled PRIMARY: *{settled_primary}* / mål {target}"
+                f"Settled PRIMARY: *{settled_primary}* / mål {target}\n"
+                f"{_mdv2_escape(subscription_line)}"
             )
             await _send_telegram_markdownv2(msg)
             logger.info(
