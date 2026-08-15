@@ -3092,18 +3092,34 @@ async def pre_kickoff_check():
 
 async def track_clv():
     """
-    Kjører hvert 30. minutt.
-    For picks der kickoff er passert (kamp ferdig), henter Pinnacle-sluttodds
-    og beregner CLV = (odds_taken / pinnacle_closing - 1) × 100.
+    Kjører hvert 30. minutt. Orchestrator: kaller kun pre_kickoff_check
+    (som poster kvalifiserte picks til Telegram og logger daily_summaries).
+
+    CLV-capture er flyttet til capture_pre_kickoff_closing (minute-frekvent
+    scheduler). Den gamle post-kickoff-blokken fanget LIVE-odds 90 min etter
+    kickoff istedenfor pre-match closing line — se f90c61e for demning på
+    /clv-siden.
     """
     await pre_kickoff_check()
 
+
+async def capture_pre_kickoff_closing():
+    """Pre-kickoff closing-line capture — speiler
+    services/sniper_live.py::update_odds_close (BUG-fiks 2026-08-15).
+
+    Fanger dagens_kamp-picks i vinduet [NOW+3min, NOW+7min] — dvs. T-5 —
+    HVER MINUTT 12:00–22:00 UTC, samme som sniperens close-jobb. Skriver
+    clv_records med clv_source='PRE_KICKOFF'. Krever at clv_source-kolonnen
+    finnes (kjørt via scratchpad/clv_source_marker.sql).
+    """
     if not db_state.connected or not db_state.pool:
+        return
+    if not cfg.ODDS_API_KEY:
         return
 
     now = datetime.now(timezone.utc)
-    cutoff_start = now - timedelta(hours=4)
-    cutoff_end = now - timedelta(minutes=90)
+    window_start = now + timedelta(minutes=3)
+    window_end = now + timedelta(minutes=7)
 
     async with db_state.pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -3114,15 +3130,12 @@ async def track_clv():
             WHERE dk.kickoff BETWEEN $1 AND $2
               AND dk.pinnacle_opening IS NOT NULL
               AND cr.id IS NULL
-        """, cutoff_start, cutoff_end)
+        """, window_start, window_end)
 
     if not rows:
         return
 
-    logger.info(f"[CLV] Tracker {len(rows)} picks for CLV")
-
-    if not cfg.ODDS_API_KEY:
-        return
+    logger.info(f"[CLV] Pre-kickoff capture — {len(rows)} picks i T-5-vinduet")
 
     async with httpx.AsyncClient(timeout=20) as client:
         for row in rows:
@@ -3148,9 +3161,8 @@ async def track_clv():
                 if resp.status_code != 200:
                     continue
 
-                matches = resp.json()
                 match_data = next(
-                    (m for m in matches
+                    (m for m in resp.json()
                      if m.get("home_team") == row["home_team"]
                      and m.get("away_team") == row["away_team"]),
                     None
@@ -3189,27 +3201,31 @@ async def track_clv():
                 async with db_state.pool.acquire() as conn:
                     await conn.execute("""
                         INSERT INTO clv_records
-                            (pick_id, match, pick, odds_taken, pinnacle_opening, pinnacle_closing, clv_pct, kickoff)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                            (pick_id, match, pick, odds_taken,
+                             pinnacle_opening, pinnacle_closing,
+                             clv_pct, kickoff, clv_source)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PRE_KICKOFF')
                     """,
-                        row["id"],
-                        row["match"],
-                        row["pick"],
-                        odds_taken,
-                        pin_opening,
-                        pin_closing,
-                        clv_pct,
-                        row["kickoff"],
+                        row["id"], row["match"], row["pick"],
+                        odds_taken, pin_opening, pin_closing,
+                        clv_pct, row["kickoff"],
                     )
                     await conn.execute(
-                        "UPDATE dagens_kamp SET pinnacle_closing = $1, clv_pct = $2 WHERE id = $3",
+                        """UPDATE dagens_kamp
+                           SET pinnacle_closing = $1,
+                               clv_pct          = $2,
+                               clv_source       = 'PRE_KICKOFF'
+                           WHERE id = $3""",
                         pin_closing, clv_pct, row["id"]
                     )
 
-                logger.info(f"[CLV] Pick id={row['id']}: CLV={clv_pct:+.1f}% (tatt {odds_taken} / closing {pin_closing})")
+                logger.info(
+                    f"[CLV] pre-kickoff pick_id={row['id']}: "
+                    f"CLV={clv_pct:+.1f}% (tatt {odds_taken} / closing {pin_closing})"
+                )
 
             except Exception as e:
-                logger.warning(f"[CLV] Feil for pick id={row['id']}: {e}")
+                logger.warning(f"[CLV] pre-kickoff feil pick_id={row['id']}: {e}")
                 continue
 
 
@@ -4939,12 +4955,24 @@ async def lifespan(app: FastAPI):
     #     replace_existing=True,
     # )
 
-    # CLV tracking hvert 30. minutt
+    # CLV tracking hvert 30. minutt (kaller kun pre_kickoff_check nå)
     scheduler.add_job(
         track_clv,
         trigger=CronTrigger(minute="*/30", timezone="UTC"),
         id="track_clv",
         misfire_grace_time=120,
+        replace_existing=True,
+    )
+
+    # Pre-kickoff CLV-capture — speiler sniper_odds_close mønster (2026-08-15).
+    # Fanger T-5-vinduet HVER MINUTT 12-22 UTC. Uten dette misser vi ~87% av
+    # kickoffs pga 4-min utvalgsvindu — sniperen kjører samme mønster.
+    scheduler.add_job(
+        capture_pre_kickoff_closing,
+        trigger=CronTrigger(minute="*", hour="12-22", timezone="UTC"),
+        id="clv_pre_kickoff_capture",
+        name="CLV Pre-Kickoff Closing Capture",
+        misfire_grace_time=60, max_instances=1, coalesce=True,
         replace_existing=True,
     )
 
