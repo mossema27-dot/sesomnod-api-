@@ -4588,8 +4588,18 @@ async def _auto_settle_results():
 
                 outcome_str = "WIN" if pick_won else "LOSS"
 
-                # Brier score: using soft_edge as confidence proxy
-                # confidence = min(0.9, 0.5 + soft_edge/100) for positive edge
+                # ADVARSEL (2026-08-16 audit): dette er IKKE ekte Brier-score.
+                # Ekte Brier krever model-sannsynligheten for utfallet
+                # (dvs. prob_over_25 / prob_home / … som Dixon-Coles ga oss).
+                # Her transformerer vi soft_edge til en heuristisk konfidens
+                # i [0.5, 0.9] og scorer den mot faktisk utfall. Resultatet
+                # er en TALL som ligner Brier, men måler ikke modell-
+                # kalibrering — kun edge-to-outcome. Skal ikke publiseres
+                # som "Brier under 0.25" bevis før den erstattes med den
+                # ekte model_prob-verdien (se picks_v2.model_prob eller
+                # dagens_kamp.model_prob avhengig av kilde).
+                # Samme feilklasse som legacy track_clv (fikset i 030ab85):
+                # måler noe annet enn navnet lover.
                 soft_edge = float(pick["soft_edge"] or 0)
                 confidence = min(0.9, max(0.5, 0.5 + soft_edge / 100.0))
                 actual = 1.0 if pick_won else 0.0
