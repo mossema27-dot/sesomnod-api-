@@ -46,7 +46,17 @@ import httpx
 logger = logging.getLogger("sesomnod.sniper")
 
 # ── KONSTANTER ──────────────────────────────────────────────────────────────
-EDGE_THRESHOLD = 0.09           # 9% — Force Edge Discovery v3 robust signal
+# ADVARSEL (2026-08-16 audit): denne 0.09-terskelen ble sannsynligvis
+# valgt ETTER at scripts/sniper_validation.py gridsøkte
+# EDGE_THRESHOLDS = [0.05, 0.07, 0.08, 0.09, 0.10] mot samme
+# force_edge_discovery_results.csv som var testset.
+# Tidsstempler samme dag (2026-04-28): grid-script 19:21, sniper_live.py
+# EDGE_THRESHOLD 22:16 (commit 9dd446b). Backtest-scriptet dekker heller
+# ikke fire motorer — kun Dixon-Coles + edge. ROI-tallet fra CSV-en er
+# derfor in-sample og skal IKKE publiseres som "bevist ROI".
+# Live-verifisering krever ny data etter deploy — det er selve poenget
+# med kalibrerings-vinduet på n>=30.
+EDGE_THRESHOLD = 0.09           # 9% — Force Edge Discovery v3 (in-sample)
 EDGE_QUARANTINE = 0.30          # 30%+ = bug-signal, drop pick
 ODDS_MIN = 1.40
 ODDS_MAX = 2.50
