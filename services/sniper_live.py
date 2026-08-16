@@ -3098,9 +3098,9 @@ def format_morning_intel_dump_telegram(summary: dict) -> str:
     L.append(f"\\- Settled ≥30: {_gate_mark(bool(g.get('settled_pass')))} \\({_mdv2_esc(g.get('settled') or 0)}/30\\)")
     L.append(f"\\- Hit rate ≥55%: {_gate_mark(bool(g.get('hit_rate_pass')))} \\({_mdv2_esc(_fmt_pct(g.get('hit_rate'), sign=False))}\\)")
     L.append(f"\\- CLV close ≥\\+2%: {_gate_mark(bool(g.get('clv_pass')))} \\({_mdv2_esc(_fmt_pct(g.get('clv')))}\\)")
-    brier_v = g.get("brier")
-    brier_disp = f"{float(brier_v):.4f}" if brier_v is not None else "—"
-    L.append(f"\\- Brier ≤0\\.25: {_gate_mark(bool(g.get('brier_pass')))} \\({_mdv2_esc(brier_disp)}\\)")
+    # Brier deaktivert 2026-08-16: soft_edge-proxy, ikke ekte model_prob.
+    # Vises som "IKKE VERIFISERT" til picks_v2.model_prob er backfylt.
+    L.append(f"\\- Brier ≤0\\.25: ⚠️ IKKE VERIFISERT \\(soft\\_edge\\-proxy, se audit 2026\\-08\\-16\\)")
     L.append("")
 
     # Pipeline

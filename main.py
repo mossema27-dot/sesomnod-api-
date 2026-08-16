@@ -10871,7 +10871,13 @@ async def admin_phase0_stats(window: int = 30):
         gate_1_pass = settled_ae >= 30
         gate_2_pass = hit_rate_pct is not None and hit_rate_pct > 55.0
         gate_3_pass = clv_avg_pct is not None and clv_avg_pct >= 2.0
-        gate_4_pass = brier_score is not None and brier_score < 0.25
+        # Brier-gate DEAKTIVERT (2026-08-16 audit): brier_score i auto_settle
+        # er beregnet fra soft_edge/100-proxy, ikke fra ekte model_prob.
+        # picks_v2.model_prob har KUN 1/232 rader utfylt (0.4 %) — kan ikke
+        # backfille uten Dixon-Coles re-run per historisk pick. Gate returnerer
+        # None inntil vi enten backfyller model_prob eller redesigner
+        # kalibrerings-metrikken.
+        gate_4_pass = None
 
         def _verdict(pass_flag: bool, value_str: str) -> str:
             return f"PASS ({value_str})" if pass_flag else f"FAIL ({value_str})"
@@ -10897,7 +10903,10 @@ async def admin_phase0_stats(window: int = 30):
                     "PENDING (mirofish unavailable)" if clv_source == "unavailable"
                     else _verdict(gate_3_pass, f"{clv_avg_pct}%" if clv_avg_pct is not None else "n/a")
                 ),
-                "brier_under_025": _verdict(gate_4_pass, f"{brier_score}" if brier_score is not None else "n/a"),
+                "brier_under_025": (
+                    "DEACTIVATED (2026-08-16 audit — brier_score uses soft_edge proxy, "
+                    "not real model_prob; picks_v2.model_prob 1/232 filled — cannot verify)"
+                ),
                 "drawdown_under_20pct": "DEFERRED (sequential P&L not in single-aggregate SQL)",
             },
             "dummy_excluded_count": int(row["dummy_excluded_count"] or 0),
