@@ -2760,6 +2760,22 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                 except (TypeError, ValueError):
                     return None
 
+            # model_prob normaliseres til [0,1] uansett kilde-skala.
+            # Sniper-pickene har prob i [0,1] (Dixon-Coles over_25 direkte).
+            # Analyse-pickene har prob i [0,100] (main.py:2434 soft_model_prob*100).
+            # market_scanner har [0,100] også. Vi skriver alltid [0,1] slik at
+            # Brier-beregning fra picks_v2.model_prob blir triviell fremover.
+            _mp_raw = pick.get("model_prob")
+            if _mp_raw is None:
+                _model_prob = None
+            else:
+                try:
+                    _mp = float(_mp_raw)
+                    _model_prob = _mp / 100.0 if _mp > 1.0 else _mp
+                    if _model_prob < 0 or _model_prob > 1:
+                        _model_prob = None
+                except (TypeError, ValueError):
+                    _model_prob = None
             v2_id = await conn.fetchval("""
                 INSERT INTO picks_v2 (
                     match_name, home_team, away_team, league,
@@ -2775,6 +2791,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                     dc_over_15, dc_over_25, dc_over_35,
                     dc_under_25, dc_under_35,
                     dc_model_edge,
+                    model_prob,
                     created_at, updated_at, timestamp
                 ) VALUES (
                     $1, $2, $3, $4,
@@ -2790,6 +2807,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                     $27, $28, $29,
                     $30, $31,
                     $32,
+                    $33,
                     NOW(), NOW(), NOW()
                 )
                 RETURNING id
@@ -2820,6 +2838,7 @@ async def _sync_to_picks_v2(pick: dict, dagens_kamp_id: int) -> int | None:
                 _dc("dc_over_15"), _dc("dc_over_25"), _dc("dc_over_35"),
                 _dc("dc_under_25"), _dc("dc_under_35"),
                 _dc("dc_model_edge"),
+                _model_prob,
             )
         logger.info(f"[picks_v2] Synced dagens_kamp id={dagens_kamp_id} → picks_v2 id={v2_id}: {pick.get('match') or pick.get('home_team','?')}")
         return v2_id
