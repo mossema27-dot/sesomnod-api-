@@ -7,6 +7,14 @@ Korrigert for penaltyblog 1.9.0:
 - pred.home_win / pred.draw / pred.away_win (ikke _probability)
 - pred.home_goal_expectation / pred.away_goal_expectation
 - pred.totals(2.5) returnerer (under, push, over)
+
+ADVARSEL (audit 2026-08-16):
+    IN-SAMPLE. EDGE_THRESHOLD 0.09 ble valgt ETTER gridsøket i
+    scripts/sniper_validation.py samme dag (2026-04-28).
+    Test-CSV-en er samme datasett terskelen ble optimalisert på.
+    +14.62 % ROI og 62.4 % hit rate SKAL ALDRI publiseres som bevis.
+    Live-verifikasjon krever n ≥ 30 signaler fra data som ikke var
+    i denne CSV-en — det er hele poenget med kalibrerings-vinduet.
 """
 from __future__ import annotations
 

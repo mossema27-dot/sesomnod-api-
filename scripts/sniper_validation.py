@@ -5,6 +5,14 @@ Tester edge × odds-range × Kelly sizing for Over 2.5-markedet.
 
 Inputs : scripts/force_edge_discovery_results.csv
 Output : print til stdout
+
+ADVARSEL (audit 2026-08-16):
+    IN-SAMPLE. Dette scriptet er selve gridsøket som produserte
+    den 0.09-terskelen sniperen kjører på i produksjon. Terskelen
+    ble valgt ETTER dette søket, og testes mot samme CSV. Enhver
+    ROI-, hit-rate- eller Kelly-tall herfra er in-sample og SKAL
+    ALDRI publiseres som bevis. Live-verifikasjon krever n ≥ 30
+    signaler fra data som ikke var i CSV-en.
 """
 from __future__ import annotations
 
