@@ -1318,6 +1318,10 @@ async def _capture_close(pool, row: dict, late: bool, client: httpx.AsyncClient)
     # Tolkning: "hva ville vi tjent hvis vi solgte tilbake til close-odds?"
     # Positiv = vi var tidlig på riktig side av sharp money.
     expected_roi = (float(row["odds_open"]) / new_odds - 1.0) * 100.0
+    kickoff_ref = row.get("kickoff_time")
+    clv_src = ("POST_KICKOFF_INVALID"
+               if kickoff_ref is not None and now >= kickoff_ref
+               else "PRE_KICKOFF")
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -1329,11 +1333,12 @@ async def _capture_close(pool, row: dict, late: bool, client: httpx.AsyncClient)
                 close_late_capture = $6,
                 close_capture_minutes_before = $7,
                 expected_roi_pct = $8,
+                clv_source = $9,
                 updated_at = NOW()
-            WHERE id = $9;
+            WHERE id = $10;
             """,
             new_odds, now, clv, is_positive, bets_blob, late, minutes_before,
-            expected_roi, row["id"],
+            expected_roi, clv_src, row["id"],
         )
     return "updated"
 
@@ -1870,6 +1875,9 @@ async def _capture_close_mock(pool, pick_id: int, kickoff_time: datetime,
     clv = _expected_clv_pct(odds_open, mock_new_odds)
     is_positive = mock_new_odds < odds_open
     expected_roi = (odds_open / mock_new_odds - 1.0) * 100.0
+    clv_src = ("POST_KICKOFF_INVALID"
+               if kickoff_time is not None and now >= kickoff_time
+               else "PRE_KICKOFF")
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -1881,12 +1889,13 @@ async def _capture_close_mock(pool, pick_id: int, kickoff_time: datetime,
                 close_late_capture = FALSE,
                 close_capture_minutes_before = $6,
                 expected_roi_pct = $7,
+                clv_source = $8,
                 updated_at = NOW()
-            WHERE id = $8;
+            WHERE id = $9;
             """,
             mock_new_odds, now, clv, is_positive,
             json.dumps([{"name": "Goals Over/Under", "values_count": 1}]),
-            minutes_before, expected_roi, pick_id,
+            minutes_before, expected_roi, clv_src, pick_id,
         )
     return {
         "now_utc": now.isoformat(),
