@@ -1,7 +1,12 @@
 """
 Fetch historical match data from football-data.co.uk for Dixon-Coles model.
-Covers 5 top European leagues, 2 seasons each (10 CSVs).
+Covers 5 top European leagues, 3 seasons each (15 CSVs).
 Results are cached for 24 hours.
+
+2025/26 lagt til 2026-08-19: dekker opprykkede lag som ellers ga
+fallback_used=True (Sunderland, Leeds, Espanyol, Elche m.fl.).
+Tidsvekting via dixon_coles_weights(xi=0.0018) i engine gir 2025/26
+ca. 0.82 relativ vekt vs. 0.44 for 2024/25.
 """
 import logging
 import time
@@ -14,14 +19,19 @@ logger = logging.getLogger("sesomnod.football_data")
 
 # ── CSV sources: (url, league_name) ──────────────────────────────────────────
 LEAGUE_URLS = [
+    ("https://www.football-data.co.uk/mmz4281/2526/E0.csv",  "EPL"),
     ("https://www.football-data.co.uk/mmz4281/2425/E0.csv",  "EPL"),
     ("https://www.football-data.co.uk/mmz4281/2324/E0.csv",  "EPL"),
+    ("https://www.football-data.co.uk/mmz4281/2526/SP1.csv", "LaLiga"),
     ("https://www.football-data.co.uk/mmz4281/2425/SP1.csv", "LaLiga"),
     ("https://www.football-data.co.uk/mmz4281/2324/SP1.csv", "LaLiga"),
+    ("https://www.football-data.co.uk/mmz4281/2526/D1.csv",  "Bundesliga"),
     ("https://www.football-data.co.uk/mmz4281/2425/D1.csv",  "Bundesliga"),
     ("https://www.football-data.co.uk/mmz4281/2324/D1.csv",  "Bundesliga"),
+    ("https://www.football-data.co.uk/mmz4281/2526/I1.csv",  "SerieA"),
     ("https://www.football-data.co.uk/mmz4281/2425/I1.csv",  "SerieA"),
     ("https://www.football-data.co.uk/mmz4281/2324/I1.csv",  "SerieA"),
+    ("https://www.football-data.co.uk/mmz4281/2526/F1.csv",  "Ligue1"),
     ("https://www.football-data.co.uk/mmz4281/2425/F1.csv",  "Ligue1"),
     ("https://www.football-data.co.uk/mmz4281/2324/F1.csv",  "Ligue1"),
 ]
