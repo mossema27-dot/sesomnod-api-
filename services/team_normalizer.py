@@ -89,6 +89,7 @@ NORMALIZATION_MAP: dict[str, str] = {
     "cd alaves": "Alaves",
     "cd leganes": "Leganes",
     "rcd espanyol": "Espanol",
+    "espanyol": "Espanol",
     "rc celta": "Celta",
     "rc celta de vigo": "Celta",
     "celta vigo": "Celta",
