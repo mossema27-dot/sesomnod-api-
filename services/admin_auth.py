@@ -23,6 +23,17 @@ PROTECTED_PREFIXES: tuple[str, ...] = (
     "/docs",
     "/redoc",
     "/openapi.json",
+    # Legacy sunset: pre-mai aggregater og in-sample backtest-tall.
+    # Trukket fra offentlig visning — /public/oraklion/* er eneste kilde.
+    # Merk: /dagens-kamp og /v3/dagens-kamp er BEVISST utelatt; de har
+    # 24t-freshness-gate og svarer ærlig med stale:true.
+    "/ladder-history",
+    "/dashboard/stats",
+    "/proof",
+    "/clv",
+    "/backtest",
+    "/v3/prism",
+    "/v3/swarm-intelligence",
 )
 
 
