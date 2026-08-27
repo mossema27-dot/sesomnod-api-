@@ -10158,10 +10158,24 @@ async def get_dagens_kamp_v3():
         # Reuse v2 data from scan_results + enhance
         async with db_state.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT picks_json, scan_date, total_scanned, total_approved FROM scan_results ORDER BY scan_date DESC LIMIT 1"
+                "SELECT picks_json, scan_date, created_at, total_scanned, total_approved "
+                "FROM scan_results ORDER BY scan_date DESC LIMIT 1"
             )
         if not row or not row["picks_json"]:
             return JSONResponse(content={"picks": [], "meta": {"source": "no_scan"}})
+
+        # Samme 24t-freshness-gate som /dagens-kamp. created_at er
+        # "timestamp without time zone" (naiv UTC) — sammenlign mot naiv
+        # UTC-now, aldri lokal tid. NULL = ukjent alder → stale.
+        created_at = row["created_at"]
+        last_scan_iso = f"{created_at.isoformat()}Z" if created_at is not None else None
+        naive_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=DAGENS_KAMP_MAX_AGE_HOURS)
+        if created_at is None or created_at < naive_cutoff:
+            logger.info(
+                "/v3/dagens-kamp stale-gate: siste scan %s er eldre enn %dt",
+                last_scan_iso or "ukjent", DAGENS_KAMP_MAX_AGE_HOURS,
+            )
+            return JSONResponse(content=_dagens_kamp_stale(last_scan_iso, "scan_results_older_than_24h"))
 
         raw = json.loads(row["picks_json"]) if isinstance(row["picks_json"], str) else row["picks_json"]
         total_scanned = row["total_scanned"] or 0
