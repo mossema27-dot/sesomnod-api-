@@ -7065,52 +7065,120 @@ async def debug_scan_results():
         return {"error": str(e)[:300]}
 
 
+# ── /dagens-kamp freshness-gate ──────────────────────────────────────────
+# scan_results.created_at er "timestamp without time zone"; scanneren skriver
+# naiv UTC (DB-serveren kjører Etc/UTC). Sammenligningen skjer derfor mot en
+# naiv UTC-now — aldri lokal tid — slik at vinduet er stabilt uansett host-TZ.
+DAGENS_KAMP_MAX_AGE_HOURS = 24
+
+
+def _dagens_kamp_stale(last_scan_iso: str | None, reason: str) -> dict:
+    """
+    Tom, ærlig tilstand når siste scan er eldre enn 24t (eller mangler).
+    Beholder status/data/count/meta slik at eksisterende konsumenter ser en
+    tom liste i stedet for å krasje — og aldri legacy-tall.
+    """
+    return {
+        "stale": True,
+        "last_scan": last_scan_iso,
+        "scanned": None,
+        "approved": None,
+        "rejected": None,
+        "picks": [],
+        "status": "ok",
+        "data": [],
+        "count": 0,
+        "meta": {
+            "source": "stale_gate",
+            "reason": reason,
+            "stale": True,
+            "last_scan": last_scan_iso,
+            "max_age_hours": DAGENS_KAMP_MAX_AGE_HOURS,
+        },
+    }
+
+
 @app.get("/dagens-kamp")
 async def get_dagens_kamp():
     """
     Returnerer dagens picks fra siste scanner-kjøring.
     Leser fra scan_results-tabellen. Mapper scanner-format til frontend-format.
-    Falls back to gamle dagens_kamp-tabellen hvis scan_results er tom.
+
+    Freshness-gate: er nyeste scan eldre enn 24t returneres {"stale": true, ...}
+    med tomme tall. Gaten dekker også legacy-fallbacken til dagens_kamp —
+    uten den ville pre-mai-rader fortsatt lekke ut som "LIVE".
     """
     if not db_state.connected or not db_state.pool:
         return JSONResponse(status_code=503, content={"status": "offline", "data": [], "error": "Database ikke tilgjengelig"})
     try:
+        # Naiv UTC for "timestamp without time zone", aware UTC for "with time zone".
+        naive_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=DAGENS_KAMP_MAX_AGE_HOURS)
+        aware_cutoff = datetime.now(timezone.utc) - timedelta(hours=DAGENS_KAMP_MAX_AGE_HOURS)
+        last_scan_iso: str | None = None
+
         # Prøv scan_results først (scanner v2 data med ekte modellprobs)
         async with db_state.pool.acquire() as conn:
             row = await conn.fetchrow("""
-                SELECT picks_json, scan_date, total_scanned, total_approved, avg_gap
+                SELECT picks_json, scan_date, created_at,
+                       total_scanned, total_approved, avg_gap
                 FROM scan_results
                 ORDER BY scan_date DESC
                 LIMIT 1
             """)
 
-        if row and row["picks_json"]:
-            raw_picks = json.loads(row["picks_json"]) if isinstance(row["picks_json"], str) else row["picks_json"]
-            total_scanned = row["total_scanned"] or 0
-            total_approved = row["total_approved"] or 0
+        if row is not None:
+            created_at = row["created_at"]
+            last_scan_iso = f"{created_at.isoformat()}Z" if created_at is not None else None
+            # NULL created_at = ukjent alder → behandles som stale (reversibelt valg).
+            if created_at is None or created_at < naive_cutoff:
+                logger.info(
+                    "/dagens-kamp stale-gate: siste scan %s er eldre enn %dt",
+                    last_scan_iso or "ukjent", DAGENS_KAMP_MAX_AGE_HOURS,
+                )
+                return _dagens_kamp_stale(last_scan_iso, "scan_results_older_than_24h")
 
-            total_rejected = total_scanned - total_approved
-            picks = [_map_scanner_pick(p, i, total_rejected) for i, p in enumerate(raw_picks)]
+            if row["picks_json"]:
+                raw_picks = json.loads(row["picks_json"]) if isinstance(row["picks_json"], str) else row["picks_json"]
+                total_scanned = row["total_scanned"] or 0
+                total_approved = row["total_approved"] or 0
 
-            return {
-                "status": "ok",
-                "data": picks,
-                "count": len(picks),
-                "meta": {
-                    "scan_date": str(row["scan_date"]),
-                    "total_scanned": total_scanned,
-                    "total_rejected": total_rejected,
-                    "total_approved": total_approved,
-                    "source": "scanner_v2",
+                total_rejected = total_scanned - total_approved
+                picks = [_map_scanner_pick(p, i, total_rejected) for i, p in enumerate(raw_picks)]
+
+                return {
+                    "status": "ok",
+                    "stale": False,
+                    "last_scan": last_scan_iso,
+                    "data": picks,
+                    "count": len(picks),
+                    "meta": {
+                        "scan_date": str(row["scan_date"]),
+                        "total_scanned": total_scanned,
+                        "total_rejected": total_rejected,
+                        "total_approved": total_approved,
+                        "source": "scanner_v2",
+                        "stale": False,
+                        "last_scan": last_scan_iso,
+                    }
                 }
-            }
 
-        # Fallback: gamle dagens_kamp-tabellen
+        # Fallback: gamle dagens_kamp-tabellen — timestamp er "with time zone".
         async with db_state.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM dagens_kamp ORDER BY timestamp DESC LIMIT 50"
+                "SELECT * FROM dagens_kamp WHERE timestamp >= $1 "
+                "ORDER BY timestamp DESC LIMIT 50",
+                aware_cutoff,
             )
-        return {"status": "ok", "data": [dict(r) for r in rows], "count": len(rows), "meta": {"source": "legacy_dagens_kamp"}}
+        if not rows:
+            return _dagens_kamp_stale(last_scan_iso, "no_fresh_scan")
+        return {
+            "status": "ok",
+            "stale": False,
+            "last_scan": last_scan_iso,
+            "data": [dict(r) for r in rows],
+            "count": len(rows),
+            "meta": {"source": "legacy_dagens_kamp", "stale": False},
+        }
     except Exception as e:
         logger.error(f"/dagens-kamp error: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "error": str(e)[:200]})
