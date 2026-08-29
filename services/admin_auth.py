@@ -34,6 +34,11 @@ PROTECTED_PREFIXES: tuple[str, ...] = (
     "/backtest",
     "/v3/prism",
     "/v3/swarm-intelligence",
+    # PII + interne driftsnotater: leser sniper_killswitch_audit.actor
+    # (operatørnavn) og .reason (fritekst med commit-referanser). Aldri
+    # offentlig. Prefikset treffer KUN telemetry — de øvrige
+    # /public/oraklion/*-aggregatene er upåvirket.
+    "/public/oraklion/telemetry",
 )
 
 
