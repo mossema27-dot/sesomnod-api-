@@ -12,3 +12,7 @@ node_modules/
 *.zip
 *.map
 proof/
+
+# Brain v2 lokal demo (tools/brain_local_demo.py)
+.brain_demo_pg/
+.brain_demo_venv/
