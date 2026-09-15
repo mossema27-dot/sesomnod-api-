@@ -136,6 +136,25 @@ def build_app(pool):
                        allow_methods=["GET"], allow_headers=["*"])
     app.include_router(api.router)
 
+    @app.get("/public/oraklion/state")
+    async def demo_state():
+        """Skallets TopBar leser dette (BRIEF-2 §8.1). Avledet fra den lokale demo-DB-en, aldri oppdiktet:
+        engine_paused=False fordi demo-tick-løkken kjører; leagues/scanned/sealed/chain fra brain-tabellene."""
+        async with pool.acquire() as conn:
+            leagues = await conn.fetchval("SELECT count(DISTINCT league) FROM sniper_bets_v1;")
+            scanned = await conn.fetchval(
+                "SELECT COALESCE(SUM(scanned_n), 0) FROM oraklion.brain_ticks"
+                " WHERE tick_utc::date = (NOW() AT TIME ZONE 'UTC')::date;")
+            sealed = await conn.fetchval(
+                "SELECT count(*) FROM oraklion.brain_events WHERE event_type = 'COMMIT'"
+                " AND ts_utc::date = (NOW() AT TIME ZONE 'UTC')::date;")
+            problems = await conn.fetchval("SELECT count(*) FROM oraklion.brain_verify_chain();")
+        return _demo_envelope({
+            "engine_paused": False, "paused_since": None,
+            "leagues_monitored": int(leagues or 0), "scanned_today": int(scanned or 0),
+            "sealed_today": int(sealed or 0), "chain_intact": (problems == 0),
+        })
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "mode": "DEMO", "brain_v2": "on", "production_writes": False, "telegram": False}
