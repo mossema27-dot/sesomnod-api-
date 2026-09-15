@@ -53,7 +53,10 @@ negativ grep (bookmaker/hostnavn/kroner/DSN) på begge responser: 0 treff.
 
 ## Nettleser-verifikasjon på Mac (2026-09-15 19:39 UTC, Chrome, `scripts/brain_demo_up.sh` kjørt av Don)
 - `http://localhost:5173/oraklion.html#/brain-v2` rendret: fanetittel `DEMO · SESOMNOD · Command Deck`; gult sticky DEMO-banner øverst; status RUNNING; HOLD · NO_MODEL_ROWS; DEMO HOME v DEMO AWAY, locked 1.950, p 61.0 %, EV +18.9 %, lock age 20 min, closing 1.850 @ T-5, CLV +5.41 %, Brier 0.152100, WIN; Results: settled 1, net +950 units, ROI 95.0 %, max DD 0. Chain head #4.
-- Forventet avvik (ikke feil i BrainV2): TopBar viser ENGINE STANDBY og `—` fordi demo-backenden kun serverer `/public/oraklion/brain*` — `/public/oraklion/state` gir 404 (én forespørsel, ingen retry, ingen krasj). Alt annet i skallet er uendret prod-kode.
+- C10 `cc97654`: demo-kjøreren serverer også `/public/oraklion/state` avledet fra lokal DB (engine_paused=false, leagues 1, scanned/sealed fra brain_ticks/brain_events, chain_intact fra brain_verify_chain) → TopBar RUNNING · 1 · 1 · 1 · INTACT, ingen 404. main.py urørt; prod uendret.
+- Playwright-verifikasjon (sky-Chromium, samme kode, 2026-09-15 21:43 UTC): 0 konsollfeil/-advarsler, alle API-kall 200 (`net::ERR_ABORTED` = React StrictMode dobbelt-mount i dev, deretter 200), banner synlig, 4 ledger-rader, desktop uten horisontal scroll. Skjermbilder: `brain-v2-demo-{desktop,mobile}-{viewport,full}.png` (levert i chat).
+- FUNN (pre-existing, gjelder alle /oraklion-sider inkl. prod): skallet har ingen responsive regler (`tokens.css` har kun én `@media prefers-reduced-motion`); sidebar er `position: sticky; height: 100vh` med fast bredde → på 390 px mobil tar sidebar ~halve skjermen og innholdet får horisontal scroll. Ikke BrainV2-spesifikt. Fiks = egen scope-godkjenning («responsivt skall»).
+- Brier (model) `—` i Results er korrekt: `stats.compute_flat` krever parret brier_market (M1-begrensning), mens beslutningskortet viser brier_model 0.152100.
 - Claude-in-Chrome-utvidelsen var ikke tilkoblet, og "Control Chrome"-MCP feilet på JS-eksekvering (`Google Chrome is not running`) → konsoll kunne ikke leses maskinelt; rendering verifisert via skjermbilde av Chrome-vinduet (lesetilgang).
 
 ## Utestående godkjenninger
