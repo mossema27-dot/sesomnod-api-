@@ -20,14 +20,28 @@ Ny sesjon leser denne først og fortsetter fra siste grønne commit. Aldri start
 - Backend skittent tre ved start (7 filer, bl.a. `M services/market_scanner.py`): ligger urørt, legges aldri til.
 - Frontend: `git status` var ødelagt av foreldreløs worktree `.claude/worktrees/friendly-ritchie`; `git worktree prune` kjørt og `.git`-filen i mappen omdøpt til `.git.orphaned-20260915` (reversibelt). 11 skitne filer ligger urørt.
 
-## Commits (M1)
-| C | Innhold | sha | Tester |
+## Commits (M1) — alle på feat/brain-v2, 2026-09-15
+| C | Innhold | sha | Tester (kjørt i Linux-VM på Don's Mac) |
 |---|---|---|---|
-| C1 | migrations up/down, docs | — | — |
-| C2 | canonical, ledger, rules, stats | — | test_brain_pure |
-| C3 | engine (scan/commit/settle/snapshot/heartbeat) | — | test_brain_db (krever DSN) |
-| C5 | api + main.py-hook bak flagg | — | py_compile |
-| C6 | frontend BrainV2 bak VITE_BRAIN_V2 | — | tsc + build |
+| C1 | migrations up/down, MIGRATION_HOWTO, STATE | `7d41c27` | — |
+| C2 | canonical, ledger, rules, stats + test_brain_pure | `839c6cb` | 14/14 grønne (stdlib) |
+| C3 | engine + test_brain_db | `99fecac` | 5/5 grønne mot lokal PostgreSQL 16 (pgserver): T1, T2/T15, T10, T11, T19 |
+| C5 | api, main.py (+31 linjer, 0 slettet), tools/verify_ledger.py | `9cf178c` | py_compile OK; router-ruter verifisert; engine_state-avledning testet |
+| C6 | frontend (sesomnod repo): BrainV2.tsx, brainQueries.ts, brainTypes.ts, App.tsx, nav.ts | `cc7b769` | `tsc -b` 0 feil; `vite build` grønn med flagg av/på; 0 nye tsc-feil (66 pre-existing på main, uendret) |
+| C7 | denne state-oppdateringen | (se git log) | rollback-drill: anker-worktree `py_compile main.py` OK; anker-worktree `vite build` OK |
+
+## Syntetisk M1-løp (lokal DB, dokumentert 2026-09-15)
+kandidat (sniper PENDING, p=0.61, odds 1.95, lock age 20 min) → TICK1 COMMIT seq=2 → kilde setter close 1.85 + WIN →
+TICK2 waiting (første observasjon) → TICK3 SETTLED (REVEAL seq=3) + HOLD(NO_MODEL_ROWS) →
+`/public/oraklion/brain`: engine RUNNING, n_settled=1, net +950, ROI 0.95, clv_odds +5.41 %, coverage 1.0, preliminary=true →
+`ledger.json`: [EPOCH_START, COMMIT, REVEAL, HOLD], `tools/verify_ledger.verify` OK, `brain_verify_chain()` 0 rader,
+negativ grep (bookmaker/hostnavn/kroner/DSN) på begge responser: 0 treff.
+
+## Kjente begrensninger i M1 (ærlig, ikke skjult)
+- `clv_fair_pct`, `p_fair_close`, `brier_market` = null: kilden lagrer ikke Under-odds ved close (`pinnacle_markets_at_close` = navn+antall). M2: utvide Sniper close-capture (ikke guard-fil, men egen scope-godkjenning).
+- Bootstrap-intervall, compound-simulering (kapitalbinding/R-CORR), deliveries/CHAIN_HEAD, decisions.csv, methodology-endepunkt: M2.
+- BrainV2-chunken bygges også med flagg av (lazy import), men ruten registreres ikke. Ingen demo-fixture finnes i M1.
+- Frontend `tsconfig.tsbuildinfo` (generert cache) ble tilbakestilt til HEAD under bygg-test; regenereres av `npm run build`.
 
 ## Utestående godkjenninger
 "godkjent ALTER oraklion v2" · "OK job" · "push feat/brain-v2" · "deploy frontend" · "M2"
