@@ -22,12 +22,39 @@ jsonf() { "$PY" -c "import sys,json; d=json.load(sys.stdin); print(eval(sys.argv
 
 if ! command -v node >/dev/null 2>&1; then [ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"; fi
 
+detect_pg_service() {  # finn Postgres-tjenestens navn i det linkede Railway-prosjektet (uten å skrive ut hemmeligheter)
+  railway status --json 2>/dev/null | "$PY" -c '
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+names = []
+def walk(o):
+    if isinstance(o, dict):
+        n = o.get("name")
+        if isinstance(n, str): names.append(n)
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(d)
+for n in names:
+    if re.search(r"postgres|pg", n, re.I): print(n); break
+' 2>/dev/null || true
+}
+
 pg_python() {  # kjør tools/brain_prod_migrate.py med prod-DSN injisert av Railway, uten å skrive ut DSN
   local mode="$1"
+  if [ -n "${BRAIN_PROD_DSN:-}" ]; then "$PY" "$API_ROOT/tools/brain_prod_migrate.py" "$mode"; return; fi
   if railway run -s "$PG_SERVICE" -- "$PY" "$API_ROOT/tools/brain_prod_migrate.py" "$mode"; then return 0; fi
+  local detected; detected="$(detect_pg_service)"
+  if [ -n "$detected" ] && [ "$detected" != "$PG_SERVICE" ]; then
+    say "prøver Postgres-tjeneste '$detected' (fra railway status)"; PG_SERVICE="$detected"
+    if railway run -s "$PG_SERVICE" -- "$PY" "$API_ROOT/tools/brain_prod_migrate.py" "$mode"; then return 0; fi
+  fi
   say "railway run feilet — prøver DATABASE_PUBLIC_URL fra 'railway variables' (verdien vises ikke)"
   local dsn; dsn="$(railway variables -s "$PG_SERVICE" --kv 2>/dev/null | sed -n 's/^DATABASE_PUBLIC_URL=//p' | head -1 || true)"
-  [ -n "$dsn" ] || die "fant ikke DATABASE_PUBLIC_URL for service '$PG_SERVICE'. Sett RAILWAY_PG_SERVICE=<navn> (railway service) eller BRAIN_PROD_DSN og kjør fasen på nytt."
+  [ -n "$dsn" ] || die "fant ikke DATABASE_PUBLIC_URL for service '$PG_SERVICE'. Alternativer: (a) RAILWAY_PG_SERVICE=<navn> bash scripts/brain_prod_release.sh $([ "$mode" = --up ] && echo migrate || echo preflight)  (b) BRAIN_PROD_DSN=<public postgres-url> ...  (c) psql-veien i docs/MIGRATION_HOWTO.md (railway connect)."
   BRAIN_PROD_DSN="$dsn" "$PY" "$API_ROOT/tools/brain_prod_migrate.py" "$mode"
 }
 
