@@ -5642,6 +5642,7 @@ async def lifespan(app: FastAPI):
                 replace_existing=True,
                 name="Oraklion Brain v2 tick (15 min)",
                 misfire_grace_time=300, max_instances=1, coalesce=True,
+                next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),  # første tick 90 s etter oppstart
             )
         logger.info("[Brain] BRAIN_V2_JOBS=on → oraklion_brain_tick registrert (15 min)")
     else:
