@@ -79,9 +79,13 @@ def compute_flat(decisions: list[dict], flat_stake: int, now: Optional[datetime]
     clv_odds_vals = [float(d["clv_odds_pct"]) for d in with_close if d.get("clv_odds_pct") is not None]
     clv_fair_vals = [float(d["clv_fair_pct"]) for d in with_fair]
 
-    brier_rows = [d for d in settled if d.get("brier_model") is not None and d.get("brier_market") is not None]
-    brier_model = mean(float(d["brier_model"]) for d in brier_rows) if brier_rows else None
+    # Modell-Brier beregnes over ALLE oppgjorte med brier_model (krever bare modellens p og utfall).
+    # Markeds-Brier og differansen krever parrede rader (brier_market fra closing-referansen).
+    brier_model_rows = [d for d in settled if d.get("brier_model") is not None]
+    brier_rows = [d for d in brier_model_rows if d.get("brier_market") is not None]
+    brier_model = mean(float(d["brier_model"]) for d in brier_model_rows) if brier_model_rows else None
     brier_market = mean(float(d["brier_market"]) for d in brier_rows) if brier_rows else None
+    brier_model_paired = mean(float(d["brier_model"]) for d in brier_rows) if brier_rows else None
 
     committed = [d["committed_utc"] for d in decisions if d.get("committed_utc")]
     settled_ts = [d["settled_utc"] for d in settled]
@@ -121,10 +125,12 @@ def compute_flat(decisions: list[dict], flat_stake: int, now: Optional[datetime]
         if clv_odds_vals else None,
         "brier": {
             "model": round(brier_model, 6) if brier_model is not None else None,
+            "n_model": len(brier_model_rows),
             "market": round(brier_market, 6) if brier_market is not None else None,
-            "diff": round(brier_model - brier_market, 6) if brier_rows else None,
-            "n": len(brier_rows),
+            "diff": round(brier_model_paired - brier_market, 6) if brier_rows else None,  # parret: samme rader
+            "n": len(brier_rows),  # n parrede (modell + marked)
             "coverage": round(len(brier_rows) / n_settled, 6) if n_settled else None,
+            "coverage_model": round(len(brier_model_rows) / n_settled, 6) if n_settled else None,
             "kind": "binary_on_selection",
         },
         "period": {"start_utc": period_start, "end_utc": period_end, "n_days": n_days},

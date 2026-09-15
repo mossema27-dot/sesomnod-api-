@@ -140,20 +140,28 @@ def build_app(pool):
     async def demo_state():
         """Skallets TopBar leser dette (BRIEF-2 §8.1). Avledet fra den lokale demo-DB-en, aldri oppdiktet:
         engine_paused=False fordi demo-tick-løkken kjører; leagues/scanned/sealed/chain fra brain-tabellene."""
-        async with pool.acquire() as conn:
-            leagues = await conn.fetchval("SELECT count(DISTINCT league) FROM sniper_bets_v1;")
-            scanned = await conn.fetchval(
-                "SELECT COALESCE(SUM(scanned_n), 0) FROM oraklion.brain_ticks"
-                " WHERE tick_utc::date = (NOW() AT TIME ZONE 'UTC')::date;")
-            sealed = await conn.fetchval(
-                "SELECT count(*) FROM oraklion.brain_events WHERE event_type = 'COMMIT'"
-                " AND ts_utc::date = (NOW() AT TIME ZONE 'UTC')::date;")
-            problems = await conn.fetchval("SELECT count(*) FROM oraklion.brain_verify_chain();")
-        return _demo_envelope({
-            "engine_paused": False, "paused_since": None,
-            "leagues_monitored": int(leagues or 0), "scanned_today": int(scanned or 0),
-            "sealed_today": int(sealed or 0), "chain_intact": (problems == 0),
-        })
+        try:
+            async with pool.acquire() as conn:
+                leagues = await conn.fetchval("SELECT count(DISTINCT league) FROM sniper_bets_v1;")
+                scanned = await conn.fetchval(
+                    "SELECT COALESCE(SUM(scanned_n), 0) FROM oraklion.brain_ticks"
+                    " WHERE tick_utc::date = (NOW() AT TIME ZONE 'UTC')::date;")
+                # "Sealed" = hash-forseglede forpliktelser (COMMIT før avspark) — IKKE oppgjorte beslutninger,
+                # og ikke et compound-mål. Samme semantikk som prod (oraklion_chain.sealed_at).
+                sealed = await conn.fetchval(
+                    "SELECT count(*) FROM oraklion.brain_events WHERE event_type = 'COMMIT'"
+                    " AND ts_utc::date = (NOW() AT TIME ZONE 'UTC')::date;")
+                problems = await conn.fetchval("SELECT count(*) FROM oraklion.brain_verify_chain();")
+            return _demo_envelope({
+                "engine_paused": False, "paused_since": None,
+                "leagues_monitored": int(leagues or 0), "scanned_today": int(scanned or 0),
+                "sealed_today": int(sealed or 0), "chain_intact": (problems == 0),
+            })
+        except Exception as e:  # noqa: BLE001 — samme degraded-kontrakt som prod-endepunktet
+            print(f"[demo] /public/oraklion/state feilet: {type(e).__name__}: {e}", flush=True)
+            return _demo_envelope({"engine_paused": None, "paused_since": None, "leagues_monitored": None,
+                                   "scanned_today": None, "sealed_today": None, "chain_intact": None},
+                                  degraded=True, source="error")
 
     @app.get("/health")
     async def health():

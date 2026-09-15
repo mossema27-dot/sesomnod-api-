@@ -149,6 +149,19 @@ class TestStats(unittest.TestCase):
         self.assertAlmostEqual(sum(fair.values()), 1.0, places=9)
         self.assertAlmostEqual(S.clv_fair_pct(2.00, fair["OVER"]), (2.0 * fair["OVER"] - 1) * 100, places=9)
 
+    def test_brier_model_without_market_reference(self):
+        """Modell-Brier vises når den kan beregnes; marked/diff krever parrede rader (n = parrede)."""
+        ds = [self._dec(1, "WIN", 2.0), self._dec(2, "LOSS", 2.0)]
+        f = S.compute_flat(ds, 1000, NOW)["brier"]
+        self.assertAlmostEqual(f["model"], 0.16)
+        self.assertEqual(f["n_model"], 2)
+        self.assertEqual(f["coverage_model"], 1.0)
+        self.assertIsNone(f["market"]); self.assertIsNone(f["diff"]); self.assertEqual(f["n"], 0)
+        ds[0]["brier_market"] = 0.20
+        f = S.compute_flat(ds, 1000, NOW)["brier"]
+        self.assertEqual(f["n"], 1); self.assertEqual(f["n_model"], 2)
+        self.assertAlmostEqual(f["market"], 0.20); self.assertAlmostEqual(f["diff"], 0.16 - 0.20)
+
     def test_serializable(self):
         f = S.compute_flat([self._dec(1, "WIN", 2.0)], 1000, NOW)
         json.dumps(f, default=str)
