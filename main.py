@@ -40,6 +40,7 @@ from datetime import datetime, timezone, timedelta
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 from fastapi import FastAPI, Request, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -5625,6 +5626,26 @@ async def lifespan(app: FastAPI):
             max_instances=1,
             coalesce=True,
         )
+
+    # ── ORAKLION BRAIN v2 (bak flagg; default off — brev v2.1 §1/§7, "OK job" før prod) ──
+    if os.environ.get("BRAIN_V2_JOBS", "off").strip().lower() == "on":
+        from services.oraklion_brain.engine import brain_tick_job as _brain_tick_job
+
+        async def _oraklion_brain_tick_job():
+            await _brain_tick_job(db_state)
+
+        if not scheduler.get_job("oraklion_brain_tick"):
+            scheduler.add_job(
+                _oraklion_brain_tick_job,
+                trigger=IntervalTrigger(minutes=15),
+                id="oraklion_brain_tick",
+                replace_existing=True,
+                name="Oraklion Brain v2 tick (15 min)",
+                misfire_grace_time=300, max_instances=1, coalesce=True,
+            )
+        logger.info("[Brain] BRAIN_V2_JOBS=on → oraklion_brain_tick registrert (15 min)")
+    else:
+        logger.info("[Brain] BRAIN_V2_JOBS=off → ingen Brain-job registrert")
 
     scheduler.start()
     # Expose scheduler to request handlers (read-only) and capture per-job execution history.
@@ -17446,3 +17467,13 @@ async def public_oraklion_telemetry():
     except Exception as e:
         logger.error(f"[/public/oraklion/telemetry] {e}", exc_info=True)
         return _oraklion_envelope({"events": []}, degraded=True, source="error")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ORAKLION BRAIN v2 — offentlige endepunkter (services/oraklion_brain/api.py)
+# /public/oraklion/brain og /public/oraklion/brain/ledger.json. Svarer
+# schema_missing/degraded til migreringen er kjørt ("godkjent ALTER oraklion v2").
+# ═══════════════════════════════════════════════════════════════
+from services.oraklion_brain import api as _oraklion_brain_api  # noqa: E402
+_oraklion_brain_api.configure(db_state)
+app.include_router(_oraklion_brain_api.router)
