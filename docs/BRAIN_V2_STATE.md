@@ -29,8 +29,8 @@ Ny sesjon leser denne først og fortsetter fra siste grønne commit. Aldri start
 | C5 | api, main.py (+31 linjer, 0 slettet), tools/verify_ledger.py | `9cf178c` | py_compile OK; router-ruter verifisert; engine_state-avledning testet |
 | C6 | frontend (sesomnod repo): BrainV2.tsx, brainQueries.ts, brainTypes.ts, App.tsx, nav.ts | `cc7b769` | `tsc -b` 0 feil; `vite build` grønn med flagg av/på; 0 nye tsc-feil (66 pre-existing på main, uendret) |
 | C7 | state-oppdatering | `5fee447` | rollback-drill: anker-worktree `py_compile main.py` OK; anker-worktree `vite build` OK |
-| C8 | lokal DEMO-kjører: `tools/brain_local_demo.py`, `scripts/brain_demo_up.sh`, `.gitignore` (+`.brain_demo_pg/`, `.brain_demo_venv/`), denne STATE | (se git log) | kjørt i VM mot pgserver: seed = [EPOCH_START, COMMIT, REVEAL, HOLD], `brain_verify_chain()` 0 rader, `/health` mode=DEMO |
-| C9 | frontend (sesomnod repo): DEMO-banner i `BrainV2.tsx` når `envelope.source` starter med `demo` (+ `document.title` prefiks) | (se git log i sesomnod) | `tsc -b` 0 feil (VM); `vite dev/build` må kjøres på Mac (rolldown darwin-binding) |
+| C8 | lokal DEMO-kjører: `tools/brain_local_demo.py`, `scripts/brain_demo_up.sh`, `.gitignore` (+`.brain_demo_pg/`, `.brain_demo_venv/`), STATE | `40e4a6a` | kjørt i VM mot pgserver: seed = [EPOCH_START, COMMIT, REVEAL, HOLD], `brain_verify_chain()` 0 rader, `/health` mode=DEMO |
+| C9 | frontend (sesomnod repo): DEMO-banner i `BrainV2.tsx` når `envelope.source` starter med `demo` (+ `document.title` prefiks) | `25bfb36` | `tsc -b` 0 feil (VM); `vite dev/build` må kjøres på Mac (rolldown darwin-binding) |
 
 ## Syntetisk M1-løp (lokal DB, dokumentert 2026-09-15)
 kandidat (sniper PENDING, p=0.61, odds 1.95, lock age 20 min) → TICK1 COMMIT seq=2 → kilde setter close 1.85 + WIN →
