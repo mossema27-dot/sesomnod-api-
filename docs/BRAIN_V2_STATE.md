@@ -51,5 +51,10 @@ negativ grep (bookmaker/hostnavn/kroner/DSN) på begge responser: 0 treff.
 - Kjør på Mac (én kommando): `bash /Users/don/sesomnod-api/scripts/brain_demo_up.sh` → åpne `http://localhost:5173/oraklion.html#/brain-v2`. Ctrl-C stopper begge.
 - Cowork-VM-begrensninger (viktig for neste sesjon): bakgrunnsprosesser dør når kallet avsluttes (bwrap --die-with-parent) → servere må startes på Mac av Don; `mnt/` tillater ikke unlink uten slette-tillatelse → `git status` etterlater `.git/index.lock` (bruk `git --no-optional-locks status`); `vite build/dev` feiler i VM (kun `binding-darwin-x64`), `tsc -b` går.
 
+## Nettleser-verifikasjon på Mac (2026-09-15 19:39 UTC, Chrome, `scripts/brain_demo_up.sh` kjørt av Don)
+- `http://localhost:5173/oraklion.html#/brain-v2` rendret: fanetittel `DEMO · SESOMNOD · Command Deck`; gult sticky DEMO-banner øverst; status RUNNING; HOLD · NO_MODEL_ROWS; DEMO HOME v DEMO AWAY, locked 1.950, p 61.0 %, EV +18.9 %, lock age 20 min, closing 1.850 @ T-5, CLV +5.41 %, Brier 0.152100, WIN; Results: settled 1, net +950 units, ROI 95.0 %, max DD 0. Chain head #4.
+- Forventet avvik (ikke feil i BrainV2): TopBar viser ENGINE STANDBY og `—` fordi demo-backenden kun serverer `/public/oraklion/brain*` — `/public/oraklion/state` gir 404 (én forespørsel, ingen retry, ingen krasj). Alt annet i skallet er uendret prod-kode.
+- Claude-in-Chrome-utvidelsen var ikke tilkoblet, og "Control Chrome"-MCP feilet på JS-eksekvering (`Google Chrome is not running`) → konsoll kunne ikke leses maskinelt; rendering verifisert via skjermbilde av Chrome-vinduet (lesetilgang).
+
 ## Utestående godkjenninger
 "godkjent ALTER oraklion v2" · "OK job" · "push feat/brain-v2" · "deploy frontend" · "M2"
