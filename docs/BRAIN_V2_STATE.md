@@ -3,9 +3,9 @@
 Ny sesjon leser denne først og fortsetter fra siste grønne commit. Aldri start forfra.
 
 ## Ankre
-- Backend git: `brain-v1-anchor` = `8c46de7` (lokal `main` HEAD 2026-08-29; **ikke bekreftet lik prod** — `/health` gir versjon `10.2.0-btts` uten sha; `PROD_BACKEND_SHA = UNKNOWN`)
+- Backend git: `brain-v1-anchor` = `8c46de7` (lokal `main`, 1 commit foran origin). **`PROD_BACKEND_SHA = ccbb6b1`** (verifisert 2026-09-15 22:35 UTC: `git ls-remote origin main` = ccbb6b1 og prod `/public/oraklion/telemetry` er fortsatt ugatet = 8c46de7 ikke deployet). Railway deployer ved push til `origin/main`.
 - Frontend git: `web-brain-v1-anchor` = `0e9af88` (lokal `main` HEAD 2026-08-29)
-- Frontend prod: `NETLIFY_PUBLISHED_DEPLOY_ID = NO_SOURCE_ACCESS` (hentes i Netlify → Deploys → Published før "deploy frontend")
+- Frontend prod: **Cloudflare Pages** (prosjekt `sesomnod`, wrangler fra `dist/`), IKKE Netlify (DEPLOY_POLICY 29. aug). Siste kjente deployment `46856178` = `0e9af88`. Rollback = bygg forrige commit + `wrangler pages deploy` (eller dashboard «Rollback to this deployment»).
 - Branch i begge repo: `feat/brain-v2`
 
 ## Baseline (2026-09-15 17:06 UTC, read-only)
@@ -67,5 +67,15 @@ negativ grep (bookmaker/hostnavn/kroner/DSN) på begge responser: 0 treff.
 - Playwright (sky-Chromium, prod-API read-only GET for deck/brain/eye/chain, demo-backend for brain-v2): 360/390/768/1440 × 5 sider → 0 horisontal sidescroll, 0 elementer utenfor viewport, 0 konsollfeil. Før: alle ≤768 hadde scrollWidth 1240. Bilder: `shell-before-*`, `shell-after-*` (levert i chat).
 - Sky-notat: pgserver-datamappe må ligge utenfor scratchpad (`/home/claude/pgdemo`) — scratchpad-rettigheter endres og PostgreSQL PANIC-er ved checkpoint.
 
+## PROD-RELEASE av M1 (autorisert av Don 2026-09-16 00:35 Oslo — samlet: ALTER + push + OK job + deploy frontend)
+- Verktøy (C14 `e673ca2`, `3c293bf`): `scripts/brain_prod_release.sh` (faser: preflight → push → wait-backend → migrate → activate → wait-tick → frontend → verify → status; hver fase idempotent), `tools/brain_prod_migrate.py` (asyncpg via `railway run -s Postgres`, DSN aldri skrevet ut; `--preflight` kun lesing: kolonnesjekk mot engine-feltene, kandidatvindu, oppgjørsfelter, duplikater, Sniper-helse; `--up` idempotent i transaksjon + verifisering; `--status`; `--down` nektes uten `--i-understand-ledger-loss`), `scripts/brain_prod_preflight.sql`. Testet i VM mot pgserver: preflight OK, up idempotent (6 tabeller, 19 config-nøkler, 0 kjedeproblemer), status OK, down nektet.
+- main.py C14: brain-jobben får `next_run_time = oppstart + 90 s` (første prod-skanning innen 2 min etter aktivering, deretter 15 min).
+- Frontend C15 `ef62381`: `.env.production` += `VITE_BRAIN_V2=true` (prod-bygg inkluderer ruten; `VITE_API_BASE` = prod-API).
+- Det som deployes = `origin/main ccbb6b1` + 8c46de7 (Don, 29. aug: telemetry bak operator-auth — frontend 0e9af88 sluttet å bruke den offentlig samme dag) + M1 C1–C14. 20 filer, kun additivt. Beskyttede filer urørt. `services/market_scanner.py` (M) pushes IKKE.
+- Kandidat-integritet i prod: `fetch_candidates` tar kun `result='PENDING'` med avspark i (nå, nå+48 t] uten eksisterende beslutning; regler krever lock age ≤ 90 min og ≥ 60 min til avspark → gamle Sniper-rader kan aldri bli «nye» Brain-valg. Ingen syntetiske rader i prod (demo-seed finnes kun i `tools/brain_local_demo.py`).
+- SOURCE-SLA: `source_last_fetch` leser `sniper_scan_log.max(scanned_at)` (finnes i prod — `/state.scanned_today=70`) → SOURCE_STALE kun hvis Sniper faktisk slutter å skanne.
+- Kundetilgang/betaling: sesomnod.com har ingen offentlig checkout/Whop/Stripe-lenke (grep 22:40 UTC) → ingenting å verifisere; ikke bygget nytt.
+- Kjør på Mac: `bash /Users/don/sesomnod-api/scripts/brain_prod_release.sh` (logg i `$TMPDIR/brain_release_*.log`). Stopper ved første feil; gammel deploy forblir live til ny er healthy (Railway healthcheck `/health`).
+
 ## Utestående godkjenninger
-"godkjent ALTER oraklion v2" · "OK job" · "push feat/brain-v2" · "deploy frontend" · "M2"
+~~"godkjent ALTER oraklion v2" · "OK job" · "push feat/brain-v2" · "deploy frontend"~~ → gitt samlet 2026-09-16 (se PROD-RELEASE). Gjenstår: "M2".
