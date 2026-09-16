@@ -1,7 +1,12 @@
 """
 Team name normalizer for mapping API team names to football-data.co.uk format.
 Supports EPL, La Liga, Bundesliga, Serie A, and Ligue 1.
+
+2026-09-16: diakritika-folding, ordbasert entydig matching (ingen delstreng), aliaser for 2026/27-opprykk.
 """
+import re
+import unicodedata
+
 
 NORMALIZATION_MAP: dict[str, str] = {
     # ── EPL ──────────────────────────────────────────────────────────
@@ -159,6 +164,36 @@ NORMALIZATION_MAP: dict[str, str] = {
     "le havre ac": "Le Havre",
     "toulouse fc": "Toulouse",
     "stade de reims": "Reims",
+    # ── 2026/27 opprykk + diakritiske varianter (incident 2026-09-16) ──
+    "coventry city": "Coventry",
+    "hull city": "Hull",
+    "deportivo la coruna": "La Coruna",
+    "deportivo de la coruna": "La Coruna",
+    "rc deportivo": "La Coruna",
+    "malaga cf": "Malaga",
+    "racing santander": "Santander",
+    "real racing club": "Santander",
+    "sv elversberg": "Elversberg",
+    "sc paderborn 07": "Paderborn",
+    "sc paderborn": "Paderborn",
+    "fc schalke 04": "Schalke 04",
+    "schalke": "Schalke 04",
+    "le mans fc": "Le Mans",
+    "estac troyes": "Troyes",
+    "es troyes ac": "Troyes",
+    "bayern munchen": "Bayern Munich",
+    "bayern munich": "Bayern Munich",
+    "1. fc koln": "FC Koln",
+    "fc koln": "FC Koln",
+    "koln": "FC Koln",
+    "atletico": "Ath Madrid",
+    "ipswich town": "Ipswich",
+    "leicester city": "Leicester",
+    "leeds united": "Leeds",
+    "real oviedo": "Oviedo",
+    "real valladolid": "Valladolid",
+    "sporting gijon": "Sp Gijon",
+    "hull": "Hull",
     # ── Champions League / Europa League common names ───────────────
     "club brugge kv": "Club Brugge",
     "psv eindhoven": "PSV",
@@ -173,12 +208,36 @@ NORMALIZATION_MAP: dict[str, str] = {
 }
 
 
+def _fold(s: str) -> str:
+    """Diakritika fjernes (Atlético → atletico, Köln → koln), små bokstaver, tegnsetting → mellomrom."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().replace("&", " ").replace("'", " ").replace("\u2019", " ")
+    s = re.sub(r"[.\-_/,()]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_FOLDED_MAP: dict[str, str] = {_fold(k): v for k, v in NORMALIZATION_MAP.items()}
+
+# Ord som får skille et innkommende navn fra datasettets kortform uten å gjøre treffet tvetydig
+# («Hull City» → Hull, «Deportivo La Coruna» → La Coruna). Alle andre ekstraord (f.eks. «Miami» i
+# «Inter Miami») gjør at treffet nektes: ingen vilkårlig match.
+GENERIC_TOKENS = frozenset({
+    "fc", "cf", "sc", "sv", "ac", "as", "us", "ss", "ssc", "cd", "ca", "ud", "rcd", "rc", "afc", "cfc", "bc",
+    "bk", "if", "fk", "sk", "kv", "hsc", "sco", "losc", "ogc", "aj", "tsg", "vfl", "vfb", "fsv", "bsc", "spvgg",
+    "club", "calcio", "borussia", "bayer", "eintracht", "estac", "olympique", "stade",
+    "1", "04", "05", "07", "09", "96", "98", "1846", "1848", "1899", "1904", "1907", "1909", "1913",
+})
+# Bevisst IKKE generiske (de skiller ekte klubber): real, deportivo, racing, sporting, athletic, city, town, united, utd,
+# de/la/le. «Real Santander», «Deportivo Español», «Coventry United», «Malaga City» får dermed ingen match; de kjente
+# Big5-formene dekkes av eksplisitte aliaser (hull city, coventry city, deportivo la coruna, racing santander, …).
+
+
 def normalize_team_name(name: str) -> str:
-    """Normalize team name to match football-data.co.uk format."""
+    """Normalize team name to match football-data.co.uk format (alias-oppslag med diakritika-folding)."""
     if not name:
         return name
-    cleaned = name.lower().strip()
-    return NORMALIZATION_MAP.get(cleaned, name)
+    return _FOLDED_MAP.get(_fold(name), name)
 
 
 def find_best_team_match(
@@ -186,25 +245,35 @@ def find_best_team_match(
     available_teams: list[str],
 ) -> str | None:
     """
-    Fuzzy match team name against available teams in dataset.
-    Uses exact match, then case-insensitive, then substring as fallback.
-    Returns None if no match found.
+    Entydig match mot lagene i datasettet. Rekkefølge: alias → eksakt (foldet) → alle datasett-ord finnes som
+    hele ord i navnet og resten er rene klubbtype-ord (fc, sc, 04, borussia …).
+    Aldri delstreng («Remo» matcher ikke «Cremonese», «Internacional» matcher ikke «Inter»), og aldri et
+    vilkårlig valg ved flere kandidater («Paris» → None når både Paris SG og Paris FC finnes).
+    Returns None if no unambiguous match found.
     """
+    if not name:
+        return None
     normalized = normalize_team_name(name)
-
-    # Exact match
     if normalized in available_teams:
         return normalized
-
-    # Case-insensitive match
-    name_lower = normalized.lower()
-    for team in available_teams:
-        if team.lower() == name_lower:
-            return team
-
-    # Substring match (both directions)
-    for team in available_teams:
-        if name_lower in team.lower() or team.lower() in name_lower:
-            return team
-
-    return None
+    fn = _fold(normalized)
+    if not fn:
+        return None
+    folded = {team: _fold(team) for team in available_teams}
+    exact = [team for team, f in folded.items() if f == fn]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None  # duplikat i datasettet — aldri vilkårlig valg
+    tokens = set(fn.split())
+    # A) datasett-navnets ord ⊆ innkommende navn, og alle ekstra ord er generiske
+    cands = []
+    for team, f in folded.items():
+        tt = set(f.split())
+        if tt and tt <= tokens and (tokens - tt) <= GENERIC_TOKENS:
+            cands.append((len(tt), team))
+    if cands:
+        best = max(n for n, _ in cands)
+        top = [team for n, team in cands if n == best]
+        return top[0] if len(top) == 1 else None
+    return None  # kortformer («Frankfurt», «Coruña») dekkes kun av eksplisitte aliaser, aldri gjetting

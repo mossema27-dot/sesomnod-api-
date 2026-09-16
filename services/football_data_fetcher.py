@@ -1,7 +1,12 @@
 """
 Fetch historical match data from football-data.co.uk for Dixon-Coles model.
-Covers 5 top European leagues, 3 seasons each (15 CSVs).
+Covers 5 top European leagues, 4 seasons each (20 CSVs).
 Results are cached for 24 hours.
+
+2026/27 lagt til 2026-09-16 (incident docs/incidents/2026-09-16-dc-season-coverage.md): 10 opprykkede lag
+(Coventry, Hull, La Coruna, Malaga, Santander, Elversberg, Paderborn, Schalke 04, Le Mans, Troyes) manglet i
+lagsettet og ga fallback_used=True for 24 % av Big5-kampene. Tidsvekting (xi=0.0018) gir inneværende sesong
+høyest vekt; lag med få kamper får støyende parametre de første ukene (dokumentert i incidenten).
 
 2025/26 lagt til 2026-08-19: dekker opprykkede lag som ellers ga
 fallback_used=True (Sunderland, Leeds, Espanyol, Elche m.fl.).
@@ -19,18 +24,23 @@ logger = logging.getLogger("sesomnod.football_data")
 
 # ── CSV sources: (url, league_name) ──────────────────────────────────────────
 LEAGUE_URLS = [
+    ("https://www.football-data.co.uk/mmz4281/2627/E0.csv",  "EPL"),
     ("https://www.football-data.co.uk/mmz4281/2526/E0.csv",  "EPL"),
     ("https://www.football-data.co.uk/mmz4281/2425/E0.csv",  "EPL"),
     ("https://www.football-data.co.uk/mmz4281/2324/E0.csv",  "EPL"),
+    ("https://www.football-data.co.uk/mmz4281/2627/SP1.csv", "LaLiga"),
     ("https://www.football-data.co.uk/mmz4281/2526/SP1.csv", "LaLiga"),
     ("https://www.football-data.co.uk/mmz4281/2425/SP1.csv", "LaLiga"),
     ("https://www.football-data.co.uk/mmz4281/2324/SP1.csv", "LaLiga"),
+    ("https://www.football-data.co.uk/mmz4281/2627/D1.csv",  "Bundesliga"),
     ("https://www.football-data.co.uk/mmz4281/2526/D1.csv",  "Bundesliga"),
     ("https://www.football-data.co.uk/mmz4281/2425/D1.csv",  "Bundesliga"),
     ("https://www.football-data.co.uk/mmz4281/2324/D1.csv",  "Bundesliga"),
+    ("https://www.football-data.co.uk/mmz4281/2627/I1.csv",  "SerieA"),
     ("https://www.football-data.co.uk/mmz4281/2526/I1.csv",  "SerieA"),
     ("https://www.football-data.co.uk/mmz4281/2425/I1.csv",  "SerieA"),
     ("https://www.football-data.co.uk/mmz4281/2324/I1.csv",  "SerieA"),
+    ("https://www.football-data.co.uk/mmz4281/2627/F1.csv",  "Ligue1"),
     ("https://www.football-data.co.uk/mmz4281/2526/F1.csv",  "Ligue1"),
     ("https://www.football-data.co.uk/mmz4281/2425/F1.csv",  "Ligue1"),
     ("https://www.football-data.co.uk/mmz4281/2324/F1.csv",  "Ligue1"),
@@ -105,7 +115,7 @@ def get_historical_data() -> pd.DataFrame:
 
     if not frames:
         raise FootballDataFetchError(
-            "All 10 CSV fetches failed. Cannot build Dixon-Coles model. "
+            "All CSV fetches failed. Cannot build Dixon-Coles model. "
             "Check network connectivity and football-data.co.uk availability."
         )
 
