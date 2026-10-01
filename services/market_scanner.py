@@ -1,7 +1,7 @@
 """
 services/market_scanner.py  — v2.0 PRODUCTION
 Market Inefficiency Scanner.
-Scans 500+ matches across 12 leagues daily.
+Scans 500+ matches across club + international leagues daily.
 Integrates Dixon-Coles real model probabilities.
 Returns top 10 picks ranked by value gap. All others rejected.
 
@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-LEAGUES = [
+# Default Odds API sport keys for /v2/run-full-scan (dagens-kamp).
+# Override at runtime without code change via Railway env:
+#   MARKET_SCANNER_LEAGUES=soccer_epl,soccer_uefa_nations_league,...
+_DEFAULT_LEAGUES = [
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_germany_bundesliga",
@@ -39,12 +42,25 @@ LEAGUES = [
     "soccer_france_ligue_one",
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
+    "soccer_uefa_nations_league",
+    "soccer_fifa_world_cup_qualifiers_europe",
     "soccer_netherlands_eredivisie",
     "soccer_portugal_primeira_liga",
     "soccer_turkey_super_league",
     "soccer_brazil_campeonato",
     "soccer_argentina_primera_division",
 ]
+
+
+def _load_leagues() -> list[str]:
+    import os
+    raw = os.environ.get("MARKET_SCANNER_LEAGUES", "").strip()
+    if not raw:
+        return list(_DEFAULT_LEAGUES)
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+LEAGUES = _load_leagues()
 
 SHARP_BOOKMAKERS = {
     "pinnacle", "betfair_ex_eu", "matchbook",
@@ -459,7 +475,7 @@ class MarketScanner:
 
     async def run_full_scan(self) -> dict:
         """
-        Full scan: 12 leagues, all today's fixtures.
+        Full scan: configured leagues (club + international), all today's fixtures.
         Returns top 10 by value gap. Logs to DB + Telegram + Notion.
         """
         logger.info("MarketScanner: starting full scan")
