@@ -99,6 +99,19 @@ SHADOW_GLOBAL_LEAGUES = {
 SHADOW_DAILY_CAP = 50
 SHADOW_TIERS = ("SHADOW_BIG5", "SHADOW_GLOBAL")
 
+# ── TYNT DATAGRUNNLAG (skyggeregel 2026-10-06) ──────────────────────────────
+# Big5-pick der ett av lagene har færre enn MIN_TEAM_MATCHES_FOR_PRIMARY kamper
+# i Dixon-Coles-datasettet (typisk nyopprykkede lag) lagres som SHADOW_THIN.
+# Raden får odds-snapshots, CLV og resultat som alle andre, men er aldri PRIMARY:
+# ingen Telegram, ingen /public/*, ikke Brain-kandidat, og utenfor Phase-/
+# protokoll-tellingene (de leser 'PRIMARY' eller PRIMARY ∪ SHADOW_BIG5).
+# SHADOW_THIN står bevisst IKKE i SHADOW_TIERS: den skal verken spise av eller
+# stoppes av SHADOW_DAILY_CAP.
+# GRENSEN ENDRES HER, ett sted.
+MIN_TEAM_MATCHES_FOR_PRIMARY = 10
+SHADOW_THIN_TIER = "SHADOW_THIN"
+THIN_RULE_TIERS = ("PRIMARY", "SHADOW_BIG5")
+
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 
 
@@ -650,6 +663,53 @@ def _classify_pick(league_id: int, edge: float) -> tuple[str, bool, str | None] 
     return None
 
 
+def _apply_thin_data_rule(
+    classification: tuple[str, bool, str | None],
+    home_matches: int | None,
+    away_matches: int | None,
+) -> tuple[str, bool, str | None]:
+    """
+    Skyggeregel for tynt datagrunnlag. Gjelder kun Big5-tierne (THIN_RULE_TIERS).
+
+    Ett av lagene under MIN_TEAM_MATCHES_FOR_PRIMARY kamper → SHADOW_THIN.
+    Ukjent antall (None) regnes som tynt: heller en skyggepick for mye enn en
+    PRIMARY-pick på ukjent grunnlag.
+    """
+    if classification[0] not in THIN_RULE_TIERS:
+        return classification
+    if home_matches is None or away_matches is None:
+        return (SHADOW_THIN_TIER, False, "TEAM_SAMPLE_UNKNOWN")
+    if min(home_matches, away_matches) < MIN_TEAM_MATCHES_FOR_PRIMARY:
+        return (SHADOW_THIN_TIER, False, "THIN_TEAM_DATA")
+    return classification
+
+
+def _team_match_counts() -> dict[str, int]:
+    """Antall kamper per lag i Dixon-Coles-datasettet (hjemme + borte, alle sesonger).
+    Synkron (pandas) — kalles via asyncio.to_thread. Datasettet er allerede cachet av motoren."""
+    from services.football_data_fetcher import get_historical_data
+
+    df = get_historical_data()
+    counts: dict[str, int] = {}
+    for col in ("HomeTeam", "AwayTeam"):
+        for team, n in df[col].value_counts().items():
+            counts[team] = counts.get(team, 0) + int(n)
+    return counts
+
+
+def _team_sample_size(name: str, counts: dict[str, int]) -> int | None:
+    """Kamper i datasettet for laget, matchet slik Dixon-Coles-motoren gjør det. None = ikke funnet."""
+    from services.team_normalizer import find_best_team_match
+
+    if not name:
+        return None
+    try:
+        matched = find_best_team_match(name, sorted(counts))
+    except Exception:
+        return None
+    return counts.get(matched) if matched else None
+
+
 async def _shadow_picks_today_count(pool) -> int:
     """Telle SHADOW-picks (begge tier) generert i dag UTC. Brukes for cap-check."""
     async with pool.acquire() as conn:
@@ -714,10 +774,12 @@ async def fetch_fixtures_for_leagues(date_str: str, season: int,
 # ── PICK GENERATION ─────────────────────────────────────────────────────────
 async def generate_picks(pool, days_ahead: int = 2) -> dict:
     """
-    Hovedjobb. Tre-tier pick generation:
+    Hovedjobb. Fire-tier pick generation:
       PRIMARY      — Big5 + edge ≥9% (urørt original logikk, calibrated)
       SHADOW_BIG5  — Big5 + 5% ≤ edge < 9% (calibrated, observer)
       SHADOW_GLOBAL — Top-15 ligaer utenfor Big5 + edge ≥9% (UNCALIBRATED)
+      SHADOW_THIN  — Big5-pick der et lag har < MIN_TEAM_MATCHES_FOR_PRIMARY
+                     kamper i datasettet (kun logging, se konstanten)
 
     SHADOW har dagligs cap 50 picks. PRIMARY er aldri cappet.
     Telegram-alerts kun for PRIMARY. Kill-switch leser kun PRIMARY.
@@ -759,6 +821,7 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
         "primary_created": 0,
         "shadow_big5_created": 0,
         "shadow_global_created": 0,
+        "shadow_thin_created": 0,
         "shadow_team_mismatches_logged": 0,
         "shadow_cap_skipped": 0,
         "shadow_today_initial": shadow_today_initial,
@@ -769,6 +832,9 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
     # Kombinert liga-map: PRIMARY + SHADOW_GLOBAL (PRIMARY-IDer overskriver
     # SHADOW-IDer om de skulle overlappe, så PRIMARY-klassifisering vinner).
     combined_leagues = {**SHADOW_GLOBAL_LEAGUES, **PRIMARY_LEAGUES}
+
+    # Kamper per lag for skyggeregelen — hentes først når en Big5-pick skal klassifiseres.
+    team_counts: dict[str, int] | None = None
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         for offset in range(days_ahead + 1):
@@ -887,6 +953,27 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                     continue
                 market_tier, is_calibrated, shadow_reason = classification
 
+                # ── TYNT DATAGRUNNLAG: Big5-pick med lag under grensen → SHADOW_THIN ──
+                if market_tier in THIN_RULE_TIERS:
+                    if team_counts is None:
+                        try:
+                            team_counts = await asyncio.to_thread(_team_match_counts)
+                        except Exception as e:
+                            # Tomt oppslag = ukjent for alle = SHADOW_THIN resten av skannet.
+                            logger.warning("[Sniper] team match counts unavailable: %s", e)
+                            team_counts = {}
+                    home_n = _team_sample_size(home_norm, team_counts)
+                    away_n = _team_sample_size(away_norm, team_counts)
+                    market_tier, is_calibrated, shadow_reason = _apply_thin_data_rule(
+                        classification, home_n, away_n,
+                    )
+                    if market_tier == SHADOW_THIN_TIER:
+                        logger.info(
+                            "[Sniper] SHADOW_THIN (%s): %s=%s vs %s=%s kamper, grense %d",
+                            shadow_reason, home_norm, home_n, away_norm, away_n,
+                            MIN_TEAM_MATCHES_FOR_PRIMARY,
+                        )
+
                 # Quarantine gjelder ALLE tiers (>30% edge = bug-signal)
                 if edge > EDGE_QUARANTINE:
                     logger.warning(
@@ -978,6 +1065,8 @@ async def generate_picks(pool, days_ahead: int = 2) -> dict:
                     elif market_tier == "SHADOW_GLOBAL":
                         stats["shadow_global_created"] += 1
                         shadow_today += 1
+                    elif market_tier == SHADOW_THIN_TIER:
+                        stats["shadow_thin_created"] += 1
 
     await _log_scan_stats(pool, stats, scan_start_dt, "generate_picks", days_ahead)
     return stats
