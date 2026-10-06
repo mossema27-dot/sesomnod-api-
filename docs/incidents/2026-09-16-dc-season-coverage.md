@@ -46,3 +46,15 @@ Big5 neste fredag/lørdag · ingen nye picks på lag med < 6 kamper uten eierens
 
 ## Rollback
 `git revert` av commiten på denne branchen + redeploy. Ingen persistent tilstand endres av rettelsen (modellen bygges om ved oppstart og hvert døgn).
+
+## Tillegg 2026-10-06 — stresstest før PR (rebaset på main 4e32348)
+- **Regresjon funnet og rettet.** Sniper skriver om «Lille» → «Lille OSC» (`sniper_live.TEAM_NORMALIZER`) før matcheren får navnet. Uten
+  delstreng-matching ga det None: alle Lille-kamper (5 av 250 hittil i sesongen) ville blitt uskårbare. Rettet med alias `lille osc` og to
+  tester som kjører alle 96 API-navn og alle Snipers omskrivinger gjennom hele kjeden (13 tester totalt). «0 tap» over gjaldt rånavn, ikke kjeden.
+- **Verifisert mot live data.** 20 av 20 CSV-er hentes, 5 506 kamper, 129 lag, modellfit 2,0 s (penaltyblog 1.13.1, pandas 3.0.6, Python 3.11),
+  1 752 prediksjoner uten ugyldige verdier. Testene krever Python ≥ 3.10 (`str | None`); `.brain_demo_venv` er 3.9 og kan ikke importere modulen.
+- **Restrisikoen er uendret, ikke mindre.** Landslagspause 21.9–6.10: ingen Big5-kamper siden 20.9. Opprykkslagene har 4–7 kamper
+  (Elversberg, Paderborn, Schalke 04: 4 · Coventry, Hull, Le Mans, Troyes: 5 · La Coruna, Malaga, Santander: 7).
+- **Replay av sesongen gjennom Snipers porter** (markedssnitt-odds som stedfortreder for Pinnacle; modellen bygget kun på kamper eldre enn to døgn):
+  dagens oppsett gir 2 PRIMARY til 10.9 og 0 i perioden 11.–20.9 (samsvarer med prod); med rettelsen 6 og 5. 8 av de 11 involverer et opprykkslag
+  med under 6 kamper. Eierbeslutningen om minstekrav på antall kamper bør tas før merge.

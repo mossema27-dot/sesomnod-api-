@@ -113,3 +113,35 @@ class TestProdNamesRegression(unittest.TestCase):
         self.assertEqual({lg: v for lg, v in unresolved.items() if v}, {})
         total = sum(len(v) for v in fx["leagues"].values())
         self.assertGreaterEqual(total, 90)
+
+
+class TestSniperPath(unittest.TestCase):
+    """Sniper skriver om lagnavn (sniper_live.TEAM_NORMALIZER, f.eks. «Lille» → «Lille OSC») FØR matcheren får dem.
+    Hele kjeden må løses, ikke bare rånavnet. Funnet i stresstest 2026-10-06: «Lille OSC» ga None uten delstreng-matching."""
+
+    @staticmethod
+    def _sniper_rewrite() -> dict:
+        import ast
+        src = (Path(__file__).resolve().parents[1] / "services" / "sniper_live.py").read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(src)):   # leses fra kildefilen: ingen import av sniper_live (nettverk/DB-avhengigheter)
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "TEAM_NORMALIZER" for t in node.targets):
+                return ast.literal_eval(node.value)
+        raise AssertionError("TEAM_NORMALIZER ikke funnet i services/sniper_live.py")
+
+    def test_every_big5_api_name_resolves_after_sniper_rewrite(self):
+        import json
+        rewrite = self._sniper_rewrite()
+        fx = json.loads((Path(__file__).resolve().parent / "fixtures" / "api_football_big5_names_2026-09.json").read_text(encoding="utf-8"))
+        wrong = {}
+        for names in fx["leagues"].values():
+            for n in names:
+                sent = rewrite.get(n, n)
+                if match(n, UNIVERSE) is None or match(sent, UNIVERSE) != match(n, UNIVERSE):
+                    wrong[n] = (sent, match(sent, UNIVERSE), match(n, UNIVERSE))
+        self.assertEqual(wrong, {})
+
+    def test_every_sniper_rewrite_target_resolves_like_its_source(self):
+        """Alt Sniper kan skrive om TIL må løses til samme lag som navnet det ble skrevet om FRA (når det er et kjent lag)."""
+        wrong = {src: (dst, match(dst, UNIVERSE), match(src, UNIVERSE)) for src, dst in self._sniper_rewrite().items()
+                 if match(src, UNIVERSE) is not None and match(dst, UNIVERSE) != match(src, UNIVERSE)}
+        self.assertEqual(wrong, {})

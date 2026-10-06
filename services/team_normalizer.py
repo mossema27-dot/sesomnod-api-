@@ -156,6 +156,7 @@ NORMALIZATION_MAP: dict[str, str] = {
     "as saint etienne": "St Etienne",
     "saint-etienne": "St Etienne",
     "losc lille": "Lille",
+    "lille osc": "Lille",  # sniper_live.TEAM_NORMALIZER skriver «Lille» → «Lille OSC»
     "stade brestois 29": "Brest",
     "stade brest": "Brest",
     "fc nantes": "Nantes",
