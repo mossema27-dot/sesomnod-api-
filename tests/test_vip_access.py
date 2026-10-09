@@ -95,3 +95,78 @@ class VipAccessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import os  # noqa: E402
+os.environ.setdefault("VIP_SESSION_SECRET", "x" * 40)
+
+
+class CodeConn:
+    def __init__(self, rows): self.rows = rows
+    async def fetch(self, q):
+        return [r for r in self.rows.values() if not r.get("revoked_at") and not r.get("code_revoked_at") and r.get("code_hash")]
+    async def fetchrow(self, q, email):
+        r = self.rows.get(email)
+        return r if r and not r.get("revoked_at") and not r.get("code_revoked_at") else None
+
+
+class CodeDB:
+    connected = True
+    def __init__(self, rows):
+        class P:
+            def acquire(_):
+                class C:
+                    async def __aenter__(_): return CodeConn(rows)
+                    async def __aexit__(_, *a): return False
+                return C()
+        self.pool = P()
+
+
+class VipCodeTests(unittest.TestCase):
+    def setUp(self):
+        V._attempts.clear()
+        self.code = V.generate_code()
+        self.rows = {VIP: {"email": VIP, "tier": V.TIER, "code_hash": V.hash_code(self.code)}}
+        V.configure(CodeDB(self.rows), verify_token=fake_verify)
+        app = FastAPI(); app.include_router(V.router)
+        self.c = TestClient(app)
+
+    def test_format(self):
+        import re
+        self.assertRegex(self.code, r"^VIP-[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}$")
+        self.assertFalse(re.search(r"[01OIL]", self.code[4:]))
+
+    def test_hash_not_plaintext_and_verify(self):
+        h = self.rows[VIP]["code_hash"]
+        self.assertNotIn(self.code[4:8], h)
+        self.assertTrue(V.verify_code(self.code.lower().replace("-", " "), h))
+        self.assertFalse(V.verify_code("VIP-AAAA-AAAA", h))
+
+    def test_correct_code_gives_long_session(self):
+        r = self.c.post("/vip/code", json={"code": self.code})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["source"], "VIP-kode — gratis, satt av Don, første VIP-kunde")
+        e = self.c.get("/vip/entitlement", headers={"Authorization": f"Bearer {r.json()['token']}"})
+        self.assertEqual(e.json()["tier"], "inner_circle")
+
+    def test_incorrect_code(self):
+        self.assertEqual(self.c.post("/vip/code", json={"code": "VIP-AAAA-AAAA"}).status_code, 401)
+
+    def test_revoked_code(self):
+        tok = self.c.post("/vip/code", json={"code": self.code}).json()["token"]
+        self.rows[VIP]["code_revoked_at"] = datetime.now(timezone.utc)
+        self.assertEqual(self.c.post("/vip/code", json={"code": self.code}).status_code, 401)
+        self.assertEqual(self.c.get("/vip/entitlement", headers={"Authorization": f"Bearer {tok}"}).status_code, 401)
+
+    def test_rate_limit(self):
+        for _ in range(V.RATE_MAX):
+            self.c.post("/vip/code", json={"code": "VIP-AAAA-AAAA"})
+        self.assertEqual(self.c.post("/vip/code", json={"code": self.code}).status_code, 429)
+
+    def test_tampered_session(self):
+        tok = V.issue_session(VIP)
+        self.assertIsNone(V.read_session(tok[:-2] + "xx"))
+        self.assertIsNone(V.read_session(V.issue_session(VIP, now=time.time() - 400 * 86400)))
+
+
+import time  # noqa: E402
