@@ -17478,3 +17478,9 @@ async def public_oraklion_telemetry():
 from services.oraklion_brain import api as _oraklion_brain_api  # noqa: E402
 _oraklion_brain_api.configure(db_state)
 app.include_router(_oraklion_brain_api.router)
+
+# VIP access (gratis Inner Circle, satt av Don) — kun montert når VIP_ACCESS_ENABLED=1.
+from services import vip_access as _vip_access  # noqa: E402
+if _vip_access.enabled():
+    _vip_access.configure(db_state)
+    app.include_router(_vip_access.router)
