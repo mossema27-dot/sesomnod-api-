@@ -7120,6 +7120,60 @@ def _dagens_kamp_stale(last_scan_iso: str | None, reason: str) -> dict:
     }
 
 
+# Ærlig "ingen kamp i dag"-oppsummering fra siste Oraklion-hjerne-skann.
+_BRAIN_REASON_NO = {
+    "TIER_NOT_ALLOWED": "ingen nådde kravet (Big5 og minst 9 % edge)",
+    "NO_MODEL_ROWS": "ingen kamper fra modellen å vurdere",
+    "NO_CANDIDATES": "ingen kamp nådde kravet",
+    "P_BELOW_MIN": "for lav modell-sannsynlighet",
+    "ODDS_OUT_OF_BAND": "odds utenfor tillatt intervall",
+    "EV_BELOW_MIN": "for lav forventet verdi",
+    "MARKET_NOT_ALLOWED": "marked som ikke er tillatt",
+    "KICKOFF_WINDOW": "avspark utenfor tidsvinduet",
+    "STALE_ODDS": "oddsen var for gammel",
+    "ODDS_TS_UNVERIFIED": "oddsens tidspunkt kunne ikke verifiseres",
+    "SOURCE_STALE": "datakilden er ikke oppdatert",
+    "API_CAP": "API-kvoten er brukt opp",
+    "OPEN_DECISION_EXISTS": "en tidligere beslutning er fortsatt åpen",
+}
+
+
+async def _dagens_kamp_brain_summary() -> dict | None:
+    """Siste skann fra oraklion.brain_ticks. Read-only; None ved feil."""
+    try:
+        async with db_state.pool.acquire() as conn:
+            r = await conn.fetchrow(
+                "SELECT tick_utc, reason, scanned_n, passed_n, skip_counts "
+                "FROM oraklion.brain_ticks ORDER BY tick_utc DESC LIMIT 1;")
+        if r is None:
+            return None
+        sc = r["skip_counts"]
+        sc = json.loads(sc) if isinstance(sc, str) else (sc or {})
+        reasons = [{"code": k, "count": int(v), "text": _BRAIN_REASON_NO.get(k, k)} for k, v in sc.items()]
+        if not reasons and r["reason"]:
+            reasons = [{"code": r["reason"], "count": None, "text": _BRAIN_REASON_NO.get(r["reason"], r["reason"])}]
+        scanned, passed = int(r["scanned_n"] or 0), int(r["passed_n"] or 0)
+        why = "; ".join(x["text"] for x in reasons) or "ukjent"
+        return {
+            "scan_utc": r["tick_utc"].astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "scanned_n": scanned,
+            "passed_n": passed,
+            "hold_reason": r["reason"],
+            "reasons": reasons,
+            "rule": "Big5-liga og minst 9 % edge (PRIMARY)",
+            "summary_no": f"Skannet {scanned} kamp{'er' if scanned != 1 else ''} i dag · {passed} godkjent · Hvorfor: {why}",
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"/dagens-kamp brain summary utilgjengelig: {type(e).__name__}")
+        return None
+
+
+async def _dagens_kamp_stale_with_brain(last_scan_iso: str | None, reason: str) -> dict:
+    out = _dagens_kamp_stale(last_scan_iso, reason)
+    out["brain_scan"] = await _dagens_kamp_brain_summary()
+    return out
+
+
 @app.get("/dagens-kamp")
 async def get_dagens_kamp():
     """
@@ -7157,7 +7211,7 @@ async def get_dagens_kamp():
                     "/dagens-kamp stale-gate: siste scan %s er eldre enn %dt",
                     last_scan_iso or "ukjent", DAGENS_KAMP_MAX_AGE_HOURS,
                 )
-                return _dagens_kamp_stale(last_scan_iso, "scan_results_older_than_24h")
+                return await _dagens_kamp_stale_with_brain(last_scan_iso, "scan_results_older_than_24h")
 
             if row["picks_json"]:
                 raw_picks = json.loads(row["picks_json"]) if isinstance(row["picks_json"], str) else row["picks_json"]
@@ -7192,7 +7246,7 @@ async def get_dagens_kamp():
                 aware_cutoff,
             )
         if not rows:
-            return _dagens_kamp_stale(last_scan_iso, "no_fresh_scan")
+            return await _dagens_kamp_stale_with_brain(last_scan_iso, "no_fresh_scan")
         return {
             "status": "ok",
             "stale": False,
