@@ -285,18 +285,20 @@ def cmd_source(a):
     pick = next((k for k in manual if k.split("-")[0] == lang.split("-")[0] and k != "live_chat"), None)
     kind = "manuell teksting"
     if not pick:
-        pick = next((k for k in (f"{lang}-orig", lang) if k in auto), None)
+        base_lang = lang.split("-")[0]  # f.eks. en-US -> en; "-orig" er ASR av originalsporet
+        pick = next((k for k in (f"{base_lang}-orig", f"{lang}-orig", base_lang, lang) if k in auto), None)
         kind = "automatisk teksting (ASR fra YouTube)"
     if pick:
-        q = run([sys.executable, "-m", "yt_dlp", "--skip-download", "--no-warnings", "--sub-format", "json3",
-                 "--sub-langs", pick, "--write-subs", "--write-auto-subs", "-o", str(kdir / "yt"),
-                 src["canonical_url"]])
-        files = list(kdir.glob("yt*.json3"))
-        if q.returncode == 0 and files:
-            lines = parse_json3(files[0])
+        # Tekstsporets signerte URL står allerede i svaret: ett YouTube-oppslag holder (flere utløser bot-sperre).
+        tracks = (manual if kind == "manuell teksting" else auto).get(pick) or []
+        url = next((t.get("url") for t in tracks if t.get("ext") == "json3"), None)
+        raw = kdir / f"yt.{pick}.json3"
+        if url and run(["curl", "-sS", "-f", "-m", "40", "-o", raw, url]).returncode == 0 and raw.stat().st_size > 0:
+            lines = parse_json3(raw)
             (kdir / "transkripsjon_kilde.txt").write_text(
                 "\n".join(f"[{t:7.2f}] {x}" for t, x in lines) + "\n", encoding="utf-8")
-            src["transcript_method"] = f"YouTube {kind}, spor '{pick}' - kontroller mot lyd"
+            src["transcript_method"] = (f"YouTube {kind}, spor '{pick}' - ikke kontrollert mot lyd "
+                                        "(lyd ligger på googlevideo-verter som ikke er tillatt)")
             set_step(job, "source", "done", f"{kind} hentet ({len(lines)} linjer)")
             save(jd, job)
             return print(f"Kilde hentet: «{src['title']}» ({src['channel']}), {src['duration_s']} s, {kind}.")

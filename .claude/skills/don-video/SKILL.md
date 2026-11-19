@@ -7,6 +7,7 @@ description: Lag norsk Don Moses-video fra en YouTube-lenke med Dons egen HeyGen
 
 Verktøy: `don-video/donvideo.py` (jobbmappe, kilde, teksting, eksport, kontroll).
 Generering: HeyGen via claude.ai-connector (OAuth). Alt annet er lokalt.
+Les `don-video/HEYGEN_FAKTA.md` før første HeyGen-kall: betalingsvei, kreditter per motor, verktøynavn og norsk-risikoen.
 
 ## Faste regler
 
@@ -21,8 +22,9 @@ Generering: HeyGen via claude.ai-connector (OAuth). Alt annet er lokalt.
 ## 1. Forhåndssjekk (stopp tidlig, én samlet beskjed)
 
 1. `ToolSearch "heygen"`. Finnes ingen HeyGen-verktøy, er connectoren ikke på i denne økten. Gi brukeren nøyaktig dette og fortsett med det som ikke krever HeyGen:
-   > Åpne claude.ai → Innstillinger → Connectors → «Add custom connector». Navn: HeyGen. URL: `https://mcp.heygen.com/mcp/v1/`. Logg inn med HeyGen-kontoen og godkjenn. Start deretter en **ny** økt (connectors leses ved oppstart) og skriv: «Lag norsk Don-video av denne: <lenke>».
-2. Kall brukerprofil-verktøyet (`get_current_user` eller tilsvarende). Krav: `billing_type = subscription`. Ved `usage_based` eller `wallet`: **stopp**, det kan gi ny belastning. Noter kredittsaldo og fornyelsesdato.
+   > Åpne claude.ai → **+** → Connectors → Manage connectors → «Add custom connector». Navn: HeyGen. URL: `https://mcp.heygen.com/mcp/v1/`. Trykk Connect, logg inn med HeyGen-kontoen og godkjenn. Start deretter en **ny** økt i miljøet «don-video» (connectors leses ved oppstart) og skriv: «Lag norsk Don-video av denne: <lenke>».
+2. Kall `get_current_user`. Krav: `billing_type = subscription`. Ved `usage_based` eller `wallet`: **stopp**, det kan gi ny belastning. Noter kredittsaldo og `resets_at` (mobilabonnement mister ubrukte kreditter ved fornyelse).
+   Nettverk: YouTube og HeyGens filverter er bare tillatt i miljøet «don-video». Kjører økten i et annet miljø: bytt med miljøverktøyene (én godkjenning).
 3. Profil: `don-video/profile/don_moses.json`. Mangler den (ny container): hent `don_moses.json` fra Drive-mappen «Don-video»; finnes den ikke, kopier `don_moses.example.json` og fyll inn fra HeyGen.
 4. Er `heygen.verified` false: list avatargrupper/looks og stemmer, velg ut fra navnehintene i profilen (`avatar_candidates…`, `voice_hint…`) **og** forhåndsvisning. Et navn alene er ikke nok. Er flere mulige og de ikke kan skilles sikkert: spør brukeren én gang. Skriv ID-er i profilen.
 
@@ -36,9 +38,11 @@ python3 don-video/donvideo.py status <jobb-id>
 
 Jobb-ID er `<dato>_<video-id>`; bruk hele ID-en (video-ID kan begynne med `-`).
 
-Kilderekkefølge når `source` blir blokkert:
-1. Proxy 403: YouTube er ikke tillatt i miljøets nettverk. Skyservere stoppes dessuten ofte av YouTubes bot-sperre.
-2. Higgsfield `video_analysis_create` med `youtube_url` (ca. 2,3 forhåndsbetalte kreditter; sjekk `balance` først). Gir scenebeskrivelse; behandle tale-teksten som ukontrollert mot lyd.
+`source` henter metadata og tekstsporet til originalspråket (`<språk>-orig`) fra `www.youtube.com`. Lyd og bilde ligger på `googlevideo`-verter som ikke kan tillates enkeltvis, så transkripsjonen blir ikke kontrollert mot lyd. Skriv det i `source.transcript_method`.
+
+Når `source` blir blokkert:
+1. Proxy 403: økten kjører ikke i miljøet «don-video».
+2. «Sign in to confirm you're not a bot»: YouTube struper IP-en etter få oppslag. Ikke gjenta kall. Ett oppslag er nok; tekstsporets signerte URL står i yt-dlp-svaret.
 3. Be om videofilen (lastes opp til Drive) → `donvideo.py source <jobb> --video-file <fil>`; transkriber lyden.
 
 Registrer med `donvideo.py set <jobb> source.title=... source.channel=... source.speaker=... source.speaker_is_don=true|false`.
@@ -68,12 +72,14 @@ Før hvert kredittbrukende kall: konto og tjeneste, saldo nå, motor og pris per
 
 ## 6. Prøveklipp (15–25 s fra sluttmanus), så full generering
 
-Kontroller: riktig avatar og stemme · forståelig norsk (ikke dansk/svensk — kjent risiko med klonede stemmer) · ingen utelatte/doble ord · naturlige pauser · troverdig ansikt og munn · utsnitt · stabil lyd · innstillingene holder for resten.
+**Norsk først.** Motoren HeyGen Voice har ikke norsk. Kall `get_video_voice_capabilities`, finn norsk, velg en motor og modell derfra og send alltid `voice_settings.engine_settings`. Prøv gjerne stemmen med `create_speech` før video (sjekk pris først). Står norsk ikke oppført for stemmen: stopp og rapporter.
+
+Kontroller: riktig avatar og stemme · forståelig norsk (ikke dansk/svensk) · ingen utelatte/doble ord · naturlige pauser · troverdig ansikt og munn · utsnitt · stabil lyd · innstillingene holder for resten.
 Endre én innstilling av gangen. Fungerer prøven: gå videre uten å vente på «godkjent». Regenerer bare klipp med dokumentert feil.
 
-Full generering: 9:16, be eksplisitt om 1080p, be om SRT som sidefil. `donvideo.py extjob <jobb> --kind final --id <video-id>` umiddelbart.
+Full generering: `aspect_ratio` 9:16, `resolution` 1080p, `engine` eksplisitt. SRT følger med som `subtitle_url`. `donvideo.py extjob <jobb> --kind final --id <video-id>` umiddelbart.
 
-Nedlasting krever at filvertene i `video_url` (typisk `files2.heygen.ai`, `resource2.heygen.ai`, `files.heygen.ai`) er tillatt i miljøets nettverk. Er de blokkert: foreslå nettverksendring med miljøverktøyene, én gang.
+Last ned `video_url` og `subtitle_url` med `curl` straks (signerte lenker utløper). Filvertene `files2.heygen.ai`, `resource2.heygen.ai` og `files.heygen.ai` er tillatt i miljøet «don-video». Dukker det opp en ny vert: foreslå den med miljøverktøyene, én gang.
 
 ## 7. Eksport og kontroll
 

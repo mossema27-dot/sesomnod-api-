@@ -12,8 +12,8 @@ Skillen `.claude/skills/don-video/SKILL.md` styrer resten. Den ligger på grenen
 
 ## Engangsoppsett
 
-1. claude.ai → Innstillinger → Connectors → «Add custom connector» → navn `HeyGen`, URL `https://mcp.heygen.com/mcp/v1/` → logg inn og godkjenn.
-2. Start en ny økt. Connectors leses bare ved oppstart.
+1. claude.ai → **+** → Connectors → Manage connectors → «Add custom connector» → navn `HeyGen`, URL `https://mcp.heygen.com/mcp/v1/` → Connect, logg inn og godkjenn.
+2. Start en ny økt i miljøet «don-video». Connectors leses bare ved oppstart, og bare dette miljøet slipper gjennom YouTube og HeyGens filservere.
 
 Ikke bruk HeyGen API-nøkkel: den trekker fra en separat lommebok, ikke fra abonnementet.
 
@@ -44,6 +44,8 @@ Repoet er offentlig. Profil, jobber og media lagres privat (Drive-mappen «Don-v
 
 ## Kjente begrensninger
 
-- YouTube blokkerer ofte skyservere («Sign in to confirm you're not a bot»). Da trengs videofilen.
+- YouTube struper skyservere etter få oppslag («Sign in to confirm you're not a bot»). Da trengs videofilen.
+- Kildens lyd og bilde kan ikke lastes ned i skyøkten. Transkripsjonen kommer fra YouTubes tekstspor og er ikke kontrollert mot lyd.
+- HeyGens egen stemmemotor har ikke norsk. Se `HEYGEN_FAKTA.md`.
 - Uten SRT eller ordtidsstempler estimeres tekstingens timing fra pauser i lyden. Kontroller visuelt.
 - Maskinell kontroll beviser ikke stemmelikhet eller leppesynk. Det må ses og høres.
