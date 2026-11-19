@@ -1,6 +1,6 @@
 # don-video
 
-Norsk video med Don Moses' egen avatar og stemme fra en YouTube-lenke. 0 kr i nye utgifter.
+Norsk video med eierens egen avatar og stemme fra en YouTube-lenke. 0 kr i nye utgifter.
 
 ## Slik starter du neste video
 
@@ -23,9 +23,11 @@ Ikke bruk HeyGen API-nøkkel: den trekker fra en separat lommebok, ikke fra abon
 python3 don-video/donvideo.py new "<youtube-lenke>"          # jobbmappe jobs/<dato>_<video-id>/
 python3 don-video/donvideo.py source <jobb>                  # metadata + teksting (eller --video-file / --transcript-file)
 python3 don-video/donvideo.py status <jobb>
-python3 don-video/donvideo.py extjob <jobb> --kind final --id <ekstern-id>
-python3 don-video/donvideo.py ledger <jobb> --what "..." --credits N [--estimated]
-python3 don-video/donvideo.py finish <jobb> --master <video.mp4> [--srt <fil.srt>] [--music <fil>]
+python3 don-video/donvideo.py step <jobb> <trinn> done --note "..."
+python3 don-video/donvideo.py set <jobb> source.title='"..."' settings.engine='"..."' billing.balance_before=N
+python3 don-video/donvideo.py extjob <jobb> --service heygen --kind final --id <ekstern-id> [--status <status>]
+python3 don-video/donvideo.py ledger <jobb> --service heygen --what "..." --credits N [--estimated]
+python3 don-video/donvideo.py finish <jobb> --master <video.mp4> [--srt <fil.srt> | --words <ord.json>] [--music <fil>]
 python3 don-video/donvideo.py verify <jobb>
 python3 don-video/selftest.py                                # beviser at teksting, eksport og kontroll virker her
 ```
@@ -40,7 +42,7 @@ Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` installeres ved behov.
 | `selftest.py` | selvtest på syntetisk media | ja |
 | `HEYGEN_FAKTA.md` | betalingsvei, kreditter, verktøy, norsk-risiko | ja |
 | `profile/don_moses.example.json` | profilmal | ja |
-| `profile/don_moses.json` | Dons avatar, stemme og innstillinger | **nei** |
+| `profile/don_moses.json` | avatar, stemme, innstillinger og filnavn-prefiks | **nei** |
 | `jobs/<id>/` | kilde, manus, jobbstatus, eksport, kontroll | **nei** |
 
 Repoet er offentlig. Profil, jobber og media lagres privat (Drive-mappen «Don-video»), ikke i git.

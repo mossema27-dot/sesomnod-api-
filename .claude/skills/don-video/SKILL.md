@@ -1,9 +1,9 @@
 ---
 name: don-video
-description: Lag norsk Don Moses-video fra en YouTube-lenke med Dons egen HeyGen-avatar og stemme, innenfor 0 kr i nye utgifter. Bruk når brukeren skriver «Lag norsk Don-video av denne: <lenke>», ber om norsk motivasjonsvideo med egen avatar/stemme, eller vil gjenoppta en påbegynt Don-videojobb.
+description: Lag norsk Don-video fra en YouTube-lenke med eierens egen avatar og stemme, innenfor 0 kr i nye utgifter. Bruk når brukeren skriver «Lag norsk Don-video av denne: <lenke>», ber om norsk motivasjonsvideo med egen avatar/stemme, eller vil gjenoppta en påbegynt Don-videojobb.
 ---
 
-# /don-video — norsk Don Moses-video fra YouTube-lenke
+# /don-video — norsk Don-video fra YouTube-lenke
 
 Verktøy: `don-video/donvideo.py` (jobbmappe, kilde, teksting, eksport, kontroll).
 Generering: HeyGen via claude.ai-connector (OAuth). Alt annet er lokalt.
@@ -37,6 +37,7 @@ python3 don-video/donvideo.py status <jobb-id>
 ```
 
 Jobb-ID er `<dato>_<video-id>`; bruk hele ID-en (video-ID kan begynne med `-`).
+Marker hvert trinn når det er gjort og kontrollert: `donvideo.py step <jobb> source|manus|budget|test_clip|generation done --note "..."`. `verify` melder fra om trinn som ikke er markert.
 
 `jobs/` ligger ikke i git. I en ny container: se etter Drive-mappen «Don-video/<jobb-id>» og legg `Manus_nb.txt`, `tilpasninger.md`, `proveklipp.txt`, `kilde/transkripsjon_kilde.txt` og `job.json` tilbake i `don-video/jobs/<jobb-id>/` før du gjør noe på nytt. Ferdige trinn gjenbrukes.
 Kjør `python3 don-video/selftest.py` én gang per container. Den skal ende med «SELVTEST BESTÅTT».
@@ -71,33 +72,35 @@ Lagre `jobs/<id>/Manus_nb.txt` (linjer med `#` og `[regi]` leses ikke opp og tek
 ## 5. Budsjettport
 
 Før hvert kredittbrukende kall: konto og tjeneste, saldo nå, motor og pris per minutt lest fra live-skjema/looken (send alltid `engine` eksplisitt, aldri stol på standard), estimat for prøve + sluttproduksjon, og at saldoen dekker det uten kjøp. Før det med
-`donvideo.py ledger <jobb> --what "..." --credits N [--estimated]`, og mål faktisk forbruk som saldo før/etter.
+`donvideo.py ledger <jobb> --service heygen --what "..." --credits N [--estimated]`, og mål faktisk forbruk som saldo før/etter.
 Skriv det som faktisk ble sett inn i jobben, ellers står det «ikke registrert» i produksjonsnotatet:
-`donvideo.py set <jobb> billing.billing_type=subscription billing.balance_before=N billing.balance_after=M billing.new_charges_nok='"0 kr"' settings.avatar_name=... settings.avatar_id=... settings.voice_name=... settings.voice_id=... settings.engine=... settings.new_lipsync=true settings.connection='"HeyGen MCP (OAuth)"'`
+`donvideo.py set <jobb> billing.billing_type=subscription billing.balance_before=N billing.balance_after=M settings.avatar_name=... settings.avatar_id=... settings.voice_name=... settings.voice_id=... settings.engine=... settings.new_lipsync=true settings.connection='"HeyGen MCP (OAuth)"'`
 
-Unngå Video Agent (dyrest). Minstebelastning per jobb er udokumentert: mål den på prøveklippet før du deler i segmenter.
+Sett `billing.new_charges_nok` først når saldo før og etter er sammenlignet og `billing_type` er `subscription`; skriv da hva som ble sett.
+
+Unngå Video Agent (dyrest). Generer hele manuset i ett opptak: verktøyet setter ikke sammen segmenter. Minstebelastning per jobb er udokumentert: mål den på prøveklippet.
 
 ## 6. Prøveklipp (15–25 s fra sluttmanus), så full generering
 
 **Norsk først.** Motoren HeyGen Voice har ikke norsk. Kall `get_video_voice_capabilities`, finn norsk, velg en motor og modell derfra og send alltid `voice_settings.engine_settings`. Prøv gjerne stemmen med `create_speech` før video (sjekk pris først). Står norsk ikke oppført for stemmen: stopp og rapporter.
 
 Kontroller: riktig avatar og stemme · forståelig norsk (ikke dansk/svensk) · ingen utelatte/doble ord · naturlige pauser · troverdig ansikt og munn · utsnitt · stabil lyd · innstillingene holder for resten.
-Claude hører ikke lyd. Bevis språk og ordlyd maskinelt: transkriber prøveklippet med Whisper (finnes i Higgsfield-sandkassen, 0 kreditter; last filen dit med `curl`) og les språkdeteksjonen (norsk mot dansk/svensk) og avvik mot manus. Se bilder fra klippet med Read for ansikt og utsnitt. Stemmelikhet og leppesynk kan bare brukeren bedømme: send prøveklippet til ham, men ikke stopp og vent når de maskinelle kontrollene er i orden.
+Claude hører ikke lyd. Språk og ordlyd bevises med lokal talegjenkjenning eller av brukeren. Send aldri klipp av Don til andre tjenester enn HeyGen. Se bilder fra klippet med Read for ansikt og utsnitt. Stemmelikhet og leppesynk kan bare brukeren bedømme: send prøveklippet til ham, men ikke stopp og vent når de maskinelle kontrollene er i orden.
 Endre én innstilling av gangen. Regenerer bare klipp med dokumentert feil.
 
-Full generering: `aspect_ratio` 9:16, `resolution` 1080p, `engine` eksplisitt. SRT følger med som `subtitle_url`. `donvideo.py extjob <jobb> --kind final --id <video-id>` umiddelbart.
+Full generering: `aspect_ratio` 9:16, `resolution` 1080p, `engine` eksplisitt. SRT følger med som `subtitle_url`. `donvideo.py extjob <jobb> --service heygen --kind final --id <video-id>` umiddelbart (`--status` oppdaterer samme ID senere).
 
 Last ned `video_url` og `subtitle_url` med `curl` straks (signerte lenker utløper). Filvertene `files2.heygen.ai`, `resource2.heygen.ai` og `files.heygen.ai` er tillatt i miljøet «don-video». Dukker det opp en ny vert: foreslå den med miljøverktøyene, én gang.
 
 ## 7. Eksport og kontroll
 
 ```bash
-python3 don-video/donvideo.py finish <jobb> --master <heygen.mp4> [--srt <heygen.srt>] [--music <fil>]
+python3 don-video/donvideo.py finish <jobb> --master <heygen.mp4> [--srt <heygen.srt> | --words <ord.json>] [--music <fil>]
 python3 don-video/donvideo.py verify <jobb>
 ```
 
-`finish` lager `Don_Moses_Norsk_Ren.mp4`, `Don_Moses_Norsk_Med_Tekst.mp4`, `Undertekster_nb.srt`, `Manus_nb.txt`, `Norsk_stemme.wav` fra samme master. Uten `--srt`/`--words` blir tekstingens timing **estimert fra pauser** og må kontrolleres visuelt.
-`verify` skriver `kontroll/verification.json`, kontrollbilder og `Produksjonsnotat.md`. Den feiler blant annet når lydsporet er stille, talen stopper midt i filmen, bildet står stille mens det snakkes, teksten ikke er synlig i bildet eller en tekstblokk vises uten lyd. Melder den «AVVIK: N manusord manglet», sier stemmen noe annet enn manus: rett `Manus_nb.txt` til det som faktisk sies, eller regenerer. Se bildene med Read (start, midt, slutt, segmentoverganger). Skriv ærlig hva som er sett og hørt: maskinell kontroll beviser ikke stemmelikhet eller leppesynk.
+`finish` lager `<prefiks>_Norsk_Ren.mp4`, `<prefiks>_Norsk_Med_Tekst.mp4`, `Undertekster_nb.srt`, `Manus_nb.txt`, `Norsk_stemme.wav` fra samme master (prefikset står i profilen). `--words` er en JSON-liste `[{"word": "Hei", "start": 0.42, "end": 0.61}]` i sekunder. Uten `--srt`/`--words` blir tekstingens timing **estimert fra pauser** og må kontrolleres visuelt.
+`verify` skriver `kontroll/verification.json`, kontrollbilder og `Produksjonsnotat.md`. Den feiler blant annet når lydsporet er stille, talen stopper midt i filmen, bildet står stille mens det snakkes, teksten ikke er synlig i bildet eller en tekstblokk vises uten lyd. Melder den «AVVIK: N manusord manglet», sier stemmen noe annet enn manus: rett `Manus_nb.txt` til det som faktisk sies, eller regenerer. Se bildene med Read (start, midt, slutt). `verify` nekter å kjøre på en avbrutt eksport eller på filer som er endret etter `finish`. Skriv ærlig hva som er sett og hørt: maskinell kontroll beviser ikke stemmelikhet eller leppesynk.
 
 ## 8. Leveranse og sluttrapport
 

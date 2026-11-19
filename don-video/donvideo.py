@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""donvideo - liten, gjenbrukbar arbeidsflyt for norske Don Moses-videoer.
+"""donvideo - liten, gjenbrukbar arbeidsflyt for norske avatarvideoer fra en YouTube-lenke.
 
 Dekker den lokale, deterministiske delen: jobbmappe, kildehenting, teksting,
 eksport og kontroll. Selve avatar-/stemmegenereringen skjer i HeyGen (MCP) og
@@ -10,8 +10,11 @@ Kun standardbibliotek + ffmpeg/ffprobe. yt-dlp brukes hvis den er installert.
 import argparse
 import datetime as dt
 import difflib
+import fcntl
+import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -19,17 +22,29 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-JOBS = ROOT / "jobs"
+JOBS = Path(os.environ.get("DONVIDEO_JOBS") or ROOT / "jobs")
 PROFILE = ROOT / "profile" / "don_moses.json"
 STEPS = ["source", "manus", "budget", "test_clip", "generation", "subs", "export", "verify"]
+
+
+def _file_prefix():
+    """Filnavn-prefiks står i den private profilen (ikke i git); uten profil brukes et nøytralt navn."""
+    try:
+        return json.loads(PROFILE.read_text(encoding="utf-8")).get("export", {}).get("file_prefix") or "Video"
+    except (OSError, ValueError):
+        return "Video"
+
+
+_P = _file_prefix()
 EXPORT_NAMES = {
-    "burned": "Don_Moses_Norsk_Med_Tekst.mp4",
-    "clean": "Don_Moses_Norsk_Ren.mp4",
+    "burned": f"{_P}_Norsk_Med_Tekst.mp4",
+    "clean": f"{_P}_Norsk_Ren.mp4",
     "srt": "Undertekster_nb.srt",
     "manus": "Manus_nb.txt",
     "voice": "Norsk_stemme.wav",
     "note": "Produksjonsnotat.md",
 }
+DELIVERABLES = ("clean", "burned", "srt", "manus", "voice")
 
 
 # ------------------------------------------------------------------ helpers
@@ -49,9 +64,9 @@ def die(msg):
 
 
 def video_id(url):
-    m = re.search(r"(?:shorts/|watch\?(?:.*&)?v=|youtu\.be/|embed/|live/)([A-Za-z0-9_-]{11})", url)
+    m = re.search(r"(?:youtube\.com/(?:shorts/|watch\?(?:.*&)?v=|embed/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", url)
     if not m:
-        die(f"Fant ingen YouTube-video-ID i: {url}")
+        die(f"Fant ingen YouTube-video-ID i: {url} (bare youtube.com- og youtu.be-lenker støttes)")
     return m.group(1)
 
 
@@ -60,8 +75,11 @@ def job_dir(ref):
     p = Path(ref)
     if p.is_dir() and (p / "job.json").exists():
         return p.resolve()
+    name = ref.rstrip("/").split("/")[-1]
+    if (JOBS / name / "job.json").exists():   # jobs/<id>, <id>/ og lignende
+        return (JOBS / name).resolve()
     vid = ref
-    if "/" in ref or "youtu" in ref:
+    if "youtu" in ref:
         vid = video_id(ref)
     hits = sorted(d for d in JOBS.glob("*") if d.is_dir() and (d.name == ref or d.name.endswith("_" + vid)))
     if not hits:
@@ -188,22 +206,33 @@ def cmd_step(a):
 
 
 def cmd_set(a):
-    """Sett felt i job.json, f.eks. source.title='...' eller production_mode=B."""
+    """Sett felt i job.json: source.*, settings.*, billing.* eller production_mode. Trinn settes med «step»."""
     jd = job_dir(a.job)
     job = load(jd)
+    done = []
     for pair in a.pairs:
-        key, _, val = pair.partition("=")
+        key, sep, val = pair.partition("=")
+        parts = key.split(".")
+        if not sep or not all(parts):
+            die(f"Ugyldig «{pair}». Bruk nøkkel=verdi, f.eks. source.title='\"Tittel\"'.")
+        if not (key == "production_mode" or (parts[0] in ("source", "settings", "billing") and len(parts) >= 2)):
+            die(f"«{key}» kan ikke settes her. Tillatt: source.*, settings.*, billing.*, production_mode. "
+                "Trinn settes med: donvideo.py step <jobb> <trinn> <status>.")
         try:
             val = json.loads(val)
         except json.JSONDecodeError:
             pass
         node = job
-        parts = key.split(".")
         for k in parts[:-1]:
-            node = node.setdefault(k, {})
+            if not isinstance(node.setdefault(k, {}), dict):
+                die(f"«{k}» i «{key}» er ikke en gruppe av felt.")
+            node = node[k]
+        if isinstance(node.get(parts[-1]), dict) and not isinstance(val, dict):
+            die(f"«{key}» er en gruppe av felt. Sett ett felt om gangen, f.eks. {key}.<felt>=verdi.")
         node[parts[-1]] = val
+        done.append(f"  {key} = {json.dumps(val, ensure_ascii=False)}")
     save(jd, job)
-    print("Oppdatert.")
+    print("Oppdatert:\n" + "\n".join(done))
 
 
 def cmd_extjob(a):
@@ -247,15 +276,18 @@ def cmd_source(a):
     src = job["source"]
     kdir = jd / "kilde"
     kdir.mkdir(exist_ok=True)
+    if a.transcript_file and a.video_file:
+        die("Velg enten --transcript-file eller --video-file, ikke begge.")
     if a.transcript_file:
-        shutil.copy(a.transcript_file, kdir / "transkripsjon_kilde.txt")
+        shutil.copy(Path(a.transcript_file).resolve(), kdir / "transkripsjon_kilde.txt")
         src["transcript_method"] = a.method or "levert som fil av bruker"
         set_step(job, "source", "done", "transkripsjon importert fra fil")
         save(jd, job)
         return print("Transkripsjon importert.")
     if a.video_file:
-        info = probe(a.video_file)
-        run(["ffmpeg", "-y", "-v", "error", "-i", a.video_file, "-vn", "-ac", "1", "-ar", "16000",
+        vfile = Path(a.video_file).resolve()   # tåler filnavn som begynner med bindestrek
+        info = probe(vfile)
+        run(["ffmpeg", "-y", "-v", "error", "-i", vfile, "-vn", "-ac", "1", "-ar", "16000",
              kdir / "kilde_lyd_16k.wav"], check=True)
         src["duration_s"] = round(info["duration"], 2)
         src["transcript_method"] = "lokal fil levert - lyd hentet ut, transkripsjon gjenstår"
@@ -269,16 +301,23 @@ def cmd_source(a):
              src["canonical_url"]])
     if p.returncode != 0:
         err = p.stderr.strip()
-        if "403" in err and ("proxy" in err.lower() or "tunnel" in err.lower()):
+        low, status = err.lower(), "blocked"
+        if "403" in err and ("proxy" in low or "tunnel" in low):
             reason = "blokkert av nettverksregel i miljøet (proxy 403 for youtube.com)"
-        elif "not a bot" in err or "Sign in" in err:
-            reason = "YouTube krever innlogging/bot-kontroll fra denne IP-adressen"
+        elif "not a bot" in low:
+            reason = "YouTube krever bot-kontroll fra denne IP-adressen"
+        elif "private video" in low:
+            reason, status = "videoen er privat", "failed"
+        elif "confirm your age" in low or "age-restricted" in low:
+            reason, status = "videoen er aldersbegrenset og krever innlogging", "failed"
+        elif "unavailable" in low or "removed" in low or "does not exist" in low:
+            reason, status = "videoen er utilgjengelig eller fjernet", "failed"
         else:
-            reason = "ukjent feil fra yt-dlp"
-        set_step(job, "source", "blocked", reason)
+            reason, status = "feil fra yt-dlp: " + (err.splitlines()[-1][:160] if err else "ukjent"), "failed"
+        set_step(job, "source", status, reason)
         (kdir / "ytdlp_feil.txt").write_text(err[-4000:], encoding="utf-8")
         save(jd, job)
-        print(f"BLOKKERT: {reason}\nDetaljer: {kdir / 'ytdlp_feil.txt'}\n"
+        print(f"{'BLOKKERT' if status == 'blocked' else 'FEILET'}: {reason}\nDetaljer: {kdir / 'ytdlp_feil.txt'}\n"
               "Alternativ: donvideo.py source <jobb> --video-file <fil> eller --transcript-file <fil>")
         sys.exit(2)
     meta = json.loads(p.stdout)
@@ -288,21 +327,35 @@ def cmd_source(a):
         ensure_ascii=False, indent=2), encoding="utf-8")
     src.update({"title": meta.get("title"), "channel": meta.get("channel") or meta.get("uploader"),
                 "duration_s": meta.get("duration"), "language": meta.get("language")})
-    lang = meta.get("language") or "en"
-    manual, auto = meta.get("subtitles") or {}, meta.get("automatic_captions") or {}
-    pick = next((k for k in manual if k.split("-")[0] == lang.split("-")[0] and k != "live_chat"), None)
-    kind = "manuell teksting"
-    if not pick:
+    manual = {k: v for k, v in (meta.get("subtitles") or {}).items() if k != "live_chat"}
+    auto = meta.get("automatic_captions") or {}
+    origs = [k for k in auto if k.endswith("-orig")]
+    lang = meta.get("language") or (origs[0][:-5] if len(origs) == 1 else None)
+    pick, kind, why_none = None, "manuell teksting", "ingen teksting funnet"
+    if lang:
         base_lang = lang.split("-")[0]  # f.eks. en-US -> en; "-orig" er ASR av originalsporet
-        pick = next((k for k in (f"{base_lang}-orig", f"{lang}-orig", base_lang, lang) if k in auto), None)
-        kind = "automatisk teksting (ASR fra YouTube)"
+        pick = next((k for k in manual if k.split("-")[0] == base_lang), None)
+        if not pick:
+            pick = next((k for k in (f"{base_lang}-orig", f"{lang}-orig", base_lang, lang) if k in auto), None)
+            kind = "automatisk teksting (ASR fra YouTube)"
+    elif len(manual) == 1:
+        pick = next(iter(manual))
+    else:
+        why_none = "originalspråket er ukjent - velger ikke et maskinoversatt spor"
     if pick:
         # Tekstsporets signerte URL står allerede i svaret: ett YouTube-oppslag holder (flere utløser bot-sperre).
         tracks = (manual if kind == "manuell teksting" else auto).get(pick) or []
         url = next((t.get("url") for t in tracks if t.get("ext") == "json3"), None)
         raw = kdir / f"yt.{pick}.json3"
-        if url and run(["curl", "-sS", "-f", "-m", "40", "-o", raw, url]).returncode == 0 and raw.stat().st_size > 0:
-            lines = parse_json3(raw)
+        got = run(["curl", "-sS", "-f", "-m", "40", "-o", raw, url]) if url else None
+        try:
+            lines = parse_json3(raw) if got and got.returncode == 0 else []
+        except (ValueError, OSError):
+            lines = []
+        if not lines:
+            why_none = (f"tekstsporet '{pick}' finnes, men kunne ikke lastes ned eller leses"
+                        + (f" ({got.stderr.strip()[:120]})" if got and got.stderr.strip() else ""))
+        else:
             (kdir / "transkripsjon_kilde.txt").write_text(
                 "\n".join(f"[{t:7.2f}] {x}" for t, x in lines) + "\n", encoding="utf-8")
             src["transcript_method"] = (f"YouTube {kind}, spor '{pick}' - ikke kontrollert mot lyd "
@@ -310,9 +363,9 @@ def cmd_source(a):
             set_step(job, "source", "done", f"{kind} hentet ({len(lines)} linjer)")
             save(jd, job)
             return print(f"Kilde hentet: «{src['title']}» ({src['channel']}), {src['duration_s']} s, {kind}.")
-    set_step(job, "source", "partial", "metadata hentet, men ingen teksting - trenger lyd + lokal transkripsjon")
+    set_step(job, "source", "partial", f"metadata hentet; {why_none} - trenger lyd + lokal transkripsjon")
     save(jd, job)
-    print("Metadata hentet, men ingen teksting funnet. Hent lyd og transkriber lokalt.")
+    print(f"Metadata hentet, men {why_none}. Hent lyd og transkriber lokalt.")
 
 
 # ------------------------------------------------------------------ subtitles
@@ -327,8 +380,12 @@ def tokens(text):
 
 def read_manus(path):
     """Talt tekst: kommentarlinjer (#) og [regi] fjernes."""
+    return read_manus_text(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def read_manus_text(content):
     lines = []
-    for raw in Path(path).read_text(encoding="utf-8-sig").splitlines():
+    for raw in content.splitlines():
         if raw.strip().startswith("#"):
             continue
         lines.append(re.sub(r"\[[^\]]*\]", " ", raw))
@@ -519,48 +576,55 @@ def align_by_pauses(words, media):
         die("Fant ingen tale i lydsporet.")
     total = sum(e - s for s, e in speech)
 
-    def at(sp):  # tale-sekunder -> tidslinje
-        acc = 0.0
-        for s, e in speech:
-            if sp <= acc + (e - s) + 1e-9:
-                return s + (sp - acc)
-            acc += e - s
-        return speech[-1][1]
-
-    def w8(w):
-        return len(norm(w)) + 2
+    def w8(w):  # tall leses lenger enn de skrives
+        n = norm(w)
+        return len(n) + 2 + 3 * sum(c.isdigit() for c in n)
     tot_w = sum(w8(w) for w in words)
-    # Setningsgrenser med forventet tidspunkt, festet til pauser i rekkefølge (dynamisk programmering).
+    # Fest setningsslutt til pauser. Kostnaden regnes fra forrige anker (taletid mot ordvekt med lokal talefart),
+    # så ett feilvektet ord forskyver ikke alt som kommer etter. En pause uten forklaring koster også.
     gaps = [(speech[i][1], speech[i + 1][0]) for i in range(len(speech) - 1)]
-    cand, acc = [], 0.0
+    S, acc = [], 0.0  # taletid før hver pause
+    for i in range(len(gaps)):
+        acc += speech[i][1] - speech[i][0]
+        S.append(acc)
+    cand, acc = [], 0.0  # (ordindeks, akkumulert vekt)
     for i, w in enumerate(words[:-1]):
         acc += w8(w)
         if sentence_end(w, words[i + 1]) or w.endswith(":"):
-            cand.append((i, at(total * acc / tot_w)))
-    K, M, SKIP, INF = len(cand), len(gaps), 0.9, float("inf")
-    cost = [[0.0 if k == 0 else INF for _ in range(M + 1)] for k in range(K + 1)]
-    back = [[None] * (M + 1) for _ in range(K + 1)]
-    for k in range(1, K + 1):
-        for j in range(M + 1):
-            best = (cost[k - 1][j] + SKIP, ("skip", j))
-            if j >= 1:
-                if cost[k][j - 1] < best[0]:
-                    best = (cost[k][j - 1], ("left", j - 1))
-                g = gaps[j - 1]
-                d = abs((g[0] + g[1]) / 2 - cand[k - 1][1])
-                if d <= 1.5 and cost[k - 1][j - 1] + d - 0.4 * min(g[1] - g[0], 1.0) < best[0]:
-                    best = (cost[k - 1][j - 1] + d - 0.4 * min(g[1] - g[0], 1.0), ("match", j - 1))
-            cost[k][j], back[k][j] = best
-    bounds, k, j = [], K, M
-    while k > 0:
-        op, pj = back[k][j]
-        if op == "match":
-            bounds.append((cand[k - 1][0], gaps[pj]))
-            k, j = k - 1, pj
-        elif op == "left":
-            j = pj
-        else:
-            k -= 1
+            cand.append((i, acc))
+    K, M, SKIP, INF, LK, LJ = len(cand), len(gaps), 0.9, float("inf"), 6, 12
+    cum = [0.0]
+    for g in gaps:
+        cum.append(cum[-1] + min(g[1] - g[0], 1.0))
+
+    def stretch(k0, j0, k, j):
+        w0, s0 = (cand[k0][1], S[j0]) if k0 >= 0 else (0.0, 0.0)
+        rate = (total - s0) / max(1e-9, tot_w - w0)
+        return (abs((S[j] - s0) - (cand[k][1] - w0) * rate) + SKIP * (k - k0 - 1) + (cum[j] - cum[j0 + 1])
+                - 0.4 * min(gaps[j][1] - gaps[j][0], 1.0))
+    f = [[INF] * M for _ in range(K)]
+    back = [[None] * M for _ in range(K)]
+    for k in range(K):
+        for j in range(M):
+            best, bp = (stretch(-1, -1, k, j), (-1, -1)) if k < LK else (INF, None)
+            for k0 in range(max(0, k - LK), k):
+                for j0 in range(max(0, j - LJ), j):
+                    if f[k0][j0] < INF:
+                        c = f[k0][j0] + stretch(k0, j0, k, j)
+                        if c < best:
+                            best, bp = c, (k0, j0)
+            f[k][j], back[k][j] = best, bp
+    best, end = SKIP * K + cum[M], None
+    for k in range(K):
+        for j in range(M):
+            if f[k][j] < INF:
+                c = f[k][j] + SKIP * (K - 1 - k) + (cum[M] - cum[j + 1])
+                if c < best:
+                    best, end = c, (k, j)
+    bounds = []
+    while end and end[0] >= 0:
+        bounds.append((cand[end[0]][0], gaps[end[1]]))
+        end = back[end[0]][end[1]]
     bounds.reverse()
     times, start_i, start_t = [None] * len(words), 0, speech[0][0]
     segs = [(i, g) for i, g in bounds] + [(len(words) - 1, (speech[-1][1], speech[-1][1]))]
@@ -648,17 +712,28 @@ def make_subs(jd, job, media, manus, srt=None, words_json=None):
         die(f"Manus er tomt: {manus}")
     info = probe(media)
     if words_json or srt:
-        timed = (json.loads(Path(words_json).read_text(encoding="utf-8")) if words_json
-                 else timed_words_from_srt(srt))
+        if words_json:
+            timed = json.loads(Path(words_json).read_text(encoding="utf-8"))
+            if not (isinstance(timed, list) and timed and all(
+                    isinstance(t, dict) and isinstance(t.get("word"), str) and isinstance(t.get("start"), (int, float))
+                    for t in timed)):
+                die('--words må være en JSON-liste: [{"word": "Hei", "start": 0.42, "end": 0.61}, ...] med sekunder.')
+            if max(t["start"] for t in timed) > info["duration"] + 2:
+                die("--words har tider utenfor filmens lengde. Tidene skal være i sekunder, ikke millisekunder.")
+        else:
+            timed = timed_words_from_srt(srt)
         times, cov, missing = align_to_timed(words, timed, info["duration"])
         src_name = "ordtidsstempler fra fil" if words_json else "tidskoder fra levert teksting"
         method = f"{src_name} ({cov:.0%} av manusordene traff)"
+        job["settings"].update({"subtitle_coverage": round(cov, 4), "subtitle_missing_words": missing,
+                                "subtitle_words": len(words)})
         if missing:
             method += f"; AVVIK: {missing} manusord manglet i tidsstemplene og er plassert ved interpolasjon"
             print(f"ADVARSEL: {missing} manusord finnes ikke i tidsstemplene. Sier stemmen noe annet enn manus? "
                   "Rett Manus_nb.txt til det som faktisk sies, eller regenerer.")
     else:
         times, anchors = align_by_pauses(words, media)
+        job["settings"].update({"subtitle_coverage": None, "subtitle_missing_words": None, "subtitle_words": len(words)})
         method = f"ESTIMERT fra pauser i lyden ({anchors} setningsgrenser festet) - må kontrolleres visuelt"
     profile = json.loads(PROFILE.read_text(encoding="utf-8")) if PROFILE.exists() else {}
     style = profile.get("subtitle_style", {})
@@ -701,8 +776,28 @@ def loudnorm_filter(path, target=-14.0):
             "linear=true"), d
 
 
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def cmd_finish(a):
     jd = job_dir(a.job)
+    try:
+        _finish(a, jd)
+    except BaseException:  # også die() og avbrudd: en halv eksport skal aldri se ferdig ut
+        job = load(jd)
+        if job["steps"].get("export", {}).get("status") != "done":
+            set_step(job, "export", "failed", "eksporten ble avbrutt - kjør finish på nytt")
+            job["settings"].pop("export_files", None)
+            save(jd, job)
+        raise
+
+
+def _finish(a, jd):
     job = load(jd)
     exp = jd / "eksport"
     exp.mkdir(exist_ok=True)
@@ -725,8 +820,10 @@ def cmd_finish(a):
     # Ny eksport gjør gammel kontroll og gammelt notat ugyldig.
     set_step(job, "export", "running")
     set_step(job, "verify", "pending")
-    for stale in (exp / EXPORT_NAMES["note"], jd / "kontroll" / "verification.json"):
+    for stale in (exp / EXPORT_NAMES["note"], jd / "kontroll" / "verification.json", exp / ".ny_ren.mp4",
+                  exp / ".ny_tekst.mp4"):
         stale.unlink(missing_ok=True)
+    job["settings"].pop("export_files", None)
     save(jd, job)
     w, h = info["video"]["width"], info["video"]["height"]
     scale, note = None, []
@@ -779,6 +876,8 @@ def cmd_finish(a):
     job["settings"].update({"master": str(master), "master_probe": info, "output_size": f"{ow}x{oh}",
                             "loudness_in_lufs": (measured or {}).get("input_i"), "notes": note,
                             "voice_wav_contains_music": False, "music": str(music) if music else None})
+    job["settings"]["export_files"] = {EXPORT_NAMES[k]: {"size": (exp / EXPORT_NAMES[k]).stat().st_size,
+                                                        "sha256": sha256(exp / EXPORT_NAMES[k])} for k in DELIVERABLES}
     set_step(job, "export", "done", f"{EXPORT_NAMES['clean']} + {EXPORT_NAMES['burned']}")
     save(jd, job)
     print(f"Eksportert til {exp}\n  Teksting: {len(timed)} blokker ({method})")
@@ -807,6 +906,14 @@ def cmd_verify(a):
     jd = job_dir(a.job)
     job = load(jd)
     exp = jd / "eksport"
+    # Kontroller bare en fullført eksport, og bare de filene den eksporten skrev (stopp før noe skrives).
+    if job["steps"].get("export", {}).get("status") != "done":
+        die("Eksporten er ikke fullført (status: " + str(job["steps"].get("export", {}).get("status"))
+            + "). Kjør finish på nytt før verify.")
+    for name, fp in (job["settings"].get("export_files") or {"": None}).items():
+        f = exp / name
+        if fp is None or not f.exists() or f.stat().st_size != fp["size"] or sha256(f) != fp["sha256"]:
+            die(f"Eksportfilen «{name or '?'}» mangler eller er endret etter finish. Kjør finish på nytt før verify.")
     kdir = jd / "kontroll"
     kdir.mkdir(exist_ok=True)
     for old in kdir.glob("*.jpg"):
@@ -860,7 +967,7 @@ def cmd_verify(a):
             tail = sdur - sil[-1][0] if sil and sil[-1][1] >= sdur - 0.05 else 0.0
             check("clean: tale kuttes ikke i starten", head >= 0.03, f"{head:.2f} s luft før første lyd", is_hard=False)
             check("clean: tale kuttes ikke i slutten", tail >= 0.10, f"{tail:.2f} s luft etter siste lyd", is_hard=False)
-            check("clean: talen stopper ikke midt i filmen", tail <= max(4.0, 0.2 * sdur),
+            check("clean: talen stopper ikke midt i filmen", tail <= 4.0,
                   f"{tail:.1f} s stillhet til slutt")
             long_sil = [(round(s, 2), round(e, 2)) for s, e in sil if e - s > 2.5 and s > 0.1 and e < sdur - 0.1]
             check("clean: ingen lange stille hull", not long_sil, f"{long_sil}" if long_sil else "ingen > 2,5 s", is_hard=False)
@@ -914,6 +1021,14 @@ def cmd_verify(a):
         outside = [(round(s, 2), t) for s, e, t in cues
                    if speech and sum(max(0.0, min(e, b) - max(s, x)) for x, b in speech) < 0.05]
         check("teksting: hver blokk vises mens det er lyd", not outside, f"{outside[:3]}" if outside else "alle overlapper tale")
+        if cues and speech:
+            over = cues[-1][1] - speech[-1][1]
+            check("teksting: siste blokk slutter ikke lenge etter siste lyd", over <= 1.5,
+                  f"siste blokk slutter {max(0.0, over):.2f} s etter siste lyd")
+        cov, miss, nw = (job["settings"].get(k) for k in ("subtitle_coverage", "subtitle_missing_words", "subtitle_words"))
+        if cov is not None:
+            check("teksting: talen dekker manus", miss <= max(2, round(0.05 * nw)) and cov >= 0.85,
+                  f"{miss} av {nw} manusord fantes ikke i tidsstemplene ({cov:.0%} traff)")
         longest = max((len(line) for _, _, t in parse_srt_raw(srt) for line in t.split("\n")), default=0)
         check("teksting: korte linjer", longest <= 26, f"lengste linje {longest} tegn", is_hard=False)
         if cues and clean.exists() and burned.exists():
@@ -926,6 +1041,10 @@ def cmd_verify(a):
               f"første blokk {cues[0][0]:.2f} s: «{cues[0][2]}» / siste: «{cues[-1][2]}»" if cues else "-", is_hard=False)
     else:
         check("teksting: filer finnes", False, "mangler SRT eller manus")
+    todo = [n for n in STEPS[:5] if job["steps"].get(n, {}).get("status") != "done"]
+    check("arbeidsflyt: tidligere trinn er markert ferdige", not todo,
+          "ikke markert ferdig: " + ", ".join(todo) if todo else "kilde, manus, budsjett, prøve og generering er ferdige",
+          is_hard=False)
     report["passed"] = not hard
     report["subtitle_timing"] = job["settings"].get("subtitle_timing")
     report["human_review_required"] = [
@@ -999,10 +1118,10 @@ def main():
     p = sub.add_parser("set", help="sett felt i job.json (nøkkel=verdi)")
     p.add_argument("job"); p.add_argument("pairs", nargs="+"); p.set_defaults(f=cmd_set)
     p = sub.add_parser("extjob", help="lagre ekstern jobb-ID")
-    p.add_argument("job"); p.add_argument("--service", default="heygen"); p.add_argument("--kind", required=True)
+    p.add_argument("job"); p.add_argument("--service", required=True); p.add_argument("--kind", required=True)
     p.add_argument("--id", required=True); p.add_argument("--status"); p.add_argument("--note"); p.set_defaults(f=cmd_extjob)
     p = sub.add_parser("ledger", help="før ressursbruk")
-    p.add_argument("job"); p.add_argument("--service", default="heygen"); p.add_argument("--what", required=True)
+    p.add_argument("job"); p.add_argument("--service", required=True); p.add_argument("--what", required=True)
     p.add_argument("--credits", type=float, required=True); p.add_argument("--estimated", action="store_true")
     p.set_defaults(f=cmd_ledger)
     p = sub.add_parser("subs", help="lag SRT/ASS som følger ferdig tale")
@@ -1014,7 +1133,12 @@ def main():
     p.set_defaults(f=cmd_finish)
     p = sub.add_parser("verify", help="kontroller de eksporterte filene"); p.add_argument("job"); p.set_defaults(f=cmd_verify)
     a = ap.parse_args()
-    a.f(a)
+    # Én kommando om gangen per jobb: samtidige kall skal ikke overskrive hverandres endringer i job.json.
+    JOBS.mkdir(exist_ok=True)
+    lock_dir = job_dir(a.job) if hasattr(a, "job") else JOBS
+    with open(lock_dir / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        a.f(a)
 
 
 if __name__ == "__main__":

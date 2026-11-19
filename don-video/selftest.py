@@ -28,16 +28,19 @@ def check(name, ok, detail=""):
 def synth(tmp, text=TEXT):
     """Lag «tale» som tonestøt med kjente ordtider + 720x1280 testvideo."""
     sr, t, samples, truth = 48000, 0.6, [0.0] * int(48000 * 0.6), []
-    for w in text.split():
-        dur = 0.05 + 0.055 * len(w.strip(".,!?"))
+    for w in d.tokens(text):
+        core = w.strip(".,!?")
+        dur = 0.05 + 0.055 * (len(core) + 4 * sum(c.isdigit() for c in core))  # tall tar lengre tid å si
         truth.append({"word": w, "start": round(t, 3), "end": round(t + dur, 3)})
         n = int(sr * dur)
         samples += [0.3 * min(1, i / (sr * 0.01), (n - i) / (sr * 0.01)) * math.sin(2 * math.pi * (180 + 7 * len(w)) * i / sr)
                     for i in range(n)]
+        # mellomrom inne i en setning er kortere enn stillhetsgrensen, så bare tegnsetting gir pauser
         gap = 0.55 if w[-1] in ".!?" else (0.28 if w[-1] == "," else 0.04)
         samples += [0.0] * int(sr * gap)
         t += dur + gap
     samples += [0.0] * int(sr * 0.4)
+    tmp.mkdir(parents=True, exist_ok=True)
     with wave.open(str(tmp / "voice.wav"), "w") as f:
         f.setnchannels(1)
         f.setsampwidth(2)
@@ -94,6 +97,13 @@ def main():
         err = [abs(times[i][0] - truth[i]["start"]) for i in range(len(words))]
         check("pause-reserve treffer", sum(err) / len(err) < 0.15 and max(err) < 0.6,
               f"snitt {sum(err) / len(err):.3f} s, maks {max(err):.3f} s, {anchors} ankre")
+        num_text = ("Hør her. Hver eneste dag får du 86 400 sekunder. Hva bruker du dem på? Bekymring? Frykt? "
+                    "Eller handling? Jeg har sett mennesker miste alt, og reise seg igjen. Så reis deg. Begynn nå!")
+        ntruth, _ = synth(tmp / "tall", d.read_manus_text(num_text))
+        nwords = [t["word"] for t in ntruth]
+        ntimes, _ = d.align_by_pauses(nwords, str(tmp / "tall" / "master.mp4"))
+        nerr = [abs(ntimes[i][0] - ntruth[i]["start"]) for i in range(len(nwords))]
+        check("pause-reserve tåler tall i manus", max(nerr) < 0.6, f"maks {max(nerr):.3f} s")
         srt_from(truth, tmp / "full.srt")
         times, cov, missing = d.align_to_timed(words, d.timed_words_from_srt(tmp / "full.srt"), total)
         err = [abs(times[i][0] - truth[i]["start"]) for i in range(len(words))]
@@ -116,6 +126,22 @@ def main():
         job = next(d.JOBS.iterdir())
         shutil.copy(tmp / "manus.txt", job / "Manus_nb.txt")
         ns = dict(job=str(job), master=master, manus=None, words=None, music=None, music_db=-24.0)
+        try:
+            d.cmd_verify(types.SimpleNamespace(job=str(job)))
+            check("verify nekter når eksporten ikke er fullført", False)
+        except SystemExit as e:
+            check("verify nekter når eksporten ikke er fullført", e.code not in (0, None))
+        for step in d.STEPS[:5]:
+            d.cmd_step(types.SimpleNamespace(job=str(job), name=step, status="done", note=None))
+        cli = [sys.executable, str(Path(d.__file__)), ]
+        procs = [subprocess.Popen(cli + c, stdout=subprocess.DEVNULL, env={**__import__("os").environ, "DONVIDEO_JOBS": str(d.JOBS)})
+                 for i in range(6) for c in (["extjob", str(job), "--service", "test", "--kind", "k", "--id", f"id{i}"],
+                                             ["ledger", str(job), "--service", "test", "--what", f"w{i}", "--credits", "1"])]
+        for pr in procs:
+            pr.wait()
+        state = json.loads((job / "job.json").read_text())
+        check("samtidige kall mister ingen endringer", len(state["external_jobs"]) == 6 and len(state["resources"]) == 6,
+              f"{len(state['external_jobs'])} jobber, {len(state['resources'])} ressurslinjer")
         d.cmd_finish(types.SimpleNamespace(srt=str(tmp / "full.srt"), **ns))
         try:
             d.cmd_verify(types.SimpleNamespace(job=str(job)))
@@ -131,7 +157,14 @@ def main():
             pass
         rep = json.loads((job / "kontroll" / "verification.json").read_text())
         flagged = [c["check"] for c in rep["checks"] if not c["ok"]]
-        check("verify varsler når talen ikke dekker manus", any("timing" in f for f in flagged), ", ".join(flagged))
+        check("verify feiler når talen ikke dekker manus", "teksting: talen dekker manus" in flagged and not rep["passed"],
+              ", ".join(flagged))
+        (job / "eksport" / d.EXPORT_NAMES["srt"]).write_text("1\n00:00:00,000 --> 00:00:01,000\nendret\n", encoding="utf-8")
+        try:
+            d.cmd_verify(types.SimpleNamespace(job=str(job)))
+            check("verify nekter filer som er endret etter finish", False)
+        except SystemExit as e:
+            check("verify nekter filer som er endret etter finish", e.code not in (0, None))
         for name in d.EXPORT_NAMES.values():
             check(f"leveransefil {name}", (job / "eksport" / name).exists())
     finally:
