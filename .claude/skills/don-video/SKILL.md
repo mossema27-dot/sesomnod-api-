@@ -73,14 +73,17 @@ Lagre `jobs/<id>/Manus_nb.txt` (linjer med `#` og `[regi]` leses ikke opp og tek
 Før hvert kredittbrukende kall: konto og tjeneste, saldo nå, motor og pris per minutt lest fra live-skjema/looken (send alltid `engine` eksplisitt, aldri stol på standard), estimat for prøve + sluttproduksjon, og at saldoen dekker det uten kjøp. Før det med
 `donvideo.py ledger <jobb> --what "..." --credits N [--estimated]`, og mål faktisk forbruk som saldo før/etter.
 Skriv det som faktisk ble sett inn i jobben, ellers står det «ikke registrert» i produksjonsnotatet:
-`donvideo.py set <jobb> billing.billing_type=subscription billing.balance_before=N billing.balance_after=M billing.new_charges_nok='"0 kr"' settings.avatar_name=... settings.avatar_id=... settings.voice_name=... settings.voice_id=... settings.engine=... settings.new_lipsync=true settings.connection='"HeyGen MCP (OAuth)"'` Unngå Video Agent (dyrest). Minstebelastning per jobb er udokumentert: mål den på prøveklippet før du deler i segmenter.
+`donvideo.py set <jobb> billing.billing_type=subscription billing.balance_before=N billing.balance_after=M billing.new_charges_nok='"0 kr"' settings.avatar_name=... settings.avatar_id=... settings.voice_name=... settings.voice_id=... settings.engine=... settings.new_lipsync=true settings.connection='"HeyGen MCP (OAuth)"'`
+
+Unngå Video Agent (dyrest). Minstebelastning per jobb er udokumentert: mål den på prøveklippet før du deler i segmenter.
 
 ## 6. Prøveklipp (15–25 s fra sluttmanus), så full generering
 
 **Norsk først.** Motoren HeyGen Voice har ikke norsk. Kall `get_video_voice_capabilities`, finn norsk, velg en motor og modell derfra og send alltid `voice_settings.engine_settings`. Prøv gjerne stemmen med `create_speech` før video (sjekk pris først). Står norsk ikke oppført for stemmen: stopp og rapporter.
 
 Kontroller: riktig avatar og stemme · forståelig norsk (ikke dansk/svensk) · ingen utelatte/doble ord · naturlige pauser · troverdig ansikt og munn · utsnitt · stabil lyd · innstillingene holder for resten.
-Endre én innstilling av gangen. Fungerer prøven: gå videre uten å vente på «godkjent». Regenerer bare klipp med dokumentert feil.
+Claude hører ikke lyd. Bevis språk og ordlyd maskinelt: transkriber prøveklippet med Whisper (finnes i Higgsfield-sandkassen, 0 kreditter; last filen dit med `curl`) og les språkdeteksjonen (norsk mot dansk/svensk) og avvik mot manus. Se bilder fra klippet med Read for ansikt og utsnitt. Stemmelikhet og leppesynk kan bare brukeren bedømme: send prøveklippet til ham, men ikke stopp og vent når de maskinelle kontrollene er i orden.
+Endre én innstilling av gangen. Regenerer bare klipp med dokumentert feil.
 
 Full generering: `aspect_ratio` 9:16, `resolution` 1080p, `engine` eksplisitt. SRT følger med som `subtitle_url`. `donvideo.py extjob <jobb> --kind final --id <video-id>` umiddelbart.
 
