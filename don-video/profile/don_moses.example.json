@@ -1,0 +1,28 @@
+{
+  "_comment": "Mal. Den ekte profilen heter don_moses.json, ligger utenfor git (repoet er offentlig) og lagres privat i Google Drive-mappen 'Don-video'.",
+  "name": "Don Moses",
+  "updated": "YYYY-MM-DD",
+  "connection": "HeyGen remote MCP (OAuth) via claude.ai-connector, URL https://mcp.heygen.com/mcp/v1/",
+  "heygen": {
+    "verified": false,
+    "billing_type_seen": null,
+    "avatar_group_id": null,
+    "avatar_name": null,
+    "avatar_id": null,
+    "look_note": null,
+    "voice_name": null,
+    "voice_id": null,
+    "engine": null,
+    "norwegian_locale": null,
+    "settings_that_work": {}
+  },
+  "speech": {
+    "language": "norsk bokmål",
+    "delivery": "varm, tydelig, overbevisende; pauser ved setningsslutt; følg stemmeklonens egen talemåte, ingen påtvunget dialekt",
+    "pronunciation_notes": []
+  },
+  "export": { "aspect": "9:16", "size": "1080x1920", "video": "H.264 high, crf 18, yuv420p, faststart", "audio": "AAC 192k, -14 LUFS" },
+  "subtitle_style": { "font": "Inter", "size": 66, "outline": 5, "shadow": 2, "margin_bottom": 430, "margin_x": 100, "max_chars": 42, "max_line": 22 },
+  "last_successful_test": null,
+  "identity_sources": []
+}

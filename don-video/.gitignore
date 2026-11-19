@@ -1,0 +1,10 @@
+# Repoet er OFFENTLIG: identitetsprofil, jobbdata og media skal aldri i git.
+profile/don_moses.json
+jobs/
+_test/
+__pycache__/
+*.mp4
+*.mov
+*.wav
+*.m4a
+*.mp3
