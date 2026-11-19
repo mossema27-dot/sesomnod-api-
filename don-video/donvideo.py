@@ -761,6 +761,65 @@ def cmd_subs(a):
     print(f"{len(timed)} tekstblokker skrevet. Timing: {method}")
 
 
+# ------------------------------------------------------------------ asr
+def cmd_asr(a):
+    """Lokal talegjenkjenning: hvilket språk snakkes, hva sies, og når (ordtider til --words)."""
+    jd = job_dir(a.job)
+    media = Path(a.media).resolve()
+    if not media.exists():
+        die(f"Finner ikke filen: {media}")
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("faster-whisper mangler - installerer (PyPI)...")
+        run([sys.executable, "-m", "pip", "install", "-q", "faster-whisper"], check=True)
+        from faster_whisper import WhisperModel
+    try:
+        model = WhisperModel(a.model, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)
+    except Exception as e:  # modellen hentes fra huggingface.co første gang
+        die(f"Kunne ikke laste Whisper-modellen «{a.model}»: {str(e)[:200]}\n"
+            "Modellen lastes ned fra huggingface.co, som bare er tillatt i miljøet «don-video».")
+    import numpy as np  # følger med faster-whisper
+    pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", str(media), "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                         capture_output=True)  # egen dekoding: uavhengig av PyAV-versjonen
+    if pcm.returncode != 0 or not pcm.stdout:
+        die(f"Kunne ikke lese lyd fra {media}: {pcm.stderr.decode(errors='replace')[:200]}")
+    audio = np.frombuffer(pcm.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    _, info = model.transcribe(audio, language=None)
+    probs = sorted(info.all_language_probs or [], key=lambda x: -x[1])[:4]
+    lang = a.language or info.language
+    segments, _ = model.transcribe(audio, language=lang, word_timestamps=True, vad_filter=True,
+                                   condition_on_previous_text=False)
+    words = [{"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)}
+             for seg in segments for w in (seg.words or []) if w.word.strip()]
+    out = jd / "asr"
+    out.mkdir(exist_ok=True)
+    (out / f"{media.stem}.words.json").write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
+    heard = " ".join(w["word"] for w in words)
+    (out / f"{media.stem}.txt").write_text(heard + "\n", encoding="utf-8")
+    result = {"media": str(media), "model": a.model, "detected_language": info.language,
+              "detected_probability": round(info.language_probability, 3),
+              "top_languages": [[k, round(v, 3)] for k, v in probs], "transcribed_as": lang, "words": len(words)}
+    print(f"Oppdaget språk: {info.language} ({info.language_probability:.0%}). Mest sannsynlige: "
+          + ", ".join(f"{k} {v:.0%}" for k, v in probs))
+    print(f"Hørt ({len(words)} ord): {heard[:400]}{'...' if len(heard) > 400 else ''}")
+    ref_path = Path(a.manus) if a.manus else jd / EXPORT_NAMES["manus"]
+    if ref_path.exists():
+        ref = [norm(w) for w in tokens(read_manus(ref_path)) if norm(w)]
+        hyp = [norm(w["word"]) for w in words if norm(w["word"])]
+        sm = difflib.SequenceMatcher(None, ref, hyp, autojunk=False)
+        same = sum(i2 - i1 for tag, i1, i2, _, _ in sm.get_opcodes() if tag == "equal")
+        diffs = [(tag, " ".join(ref[i1:i2]), " ".join(hyp[j1:j2])) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
+        result.update({"manus_words": len(ref), "matched": same, "match_share": round(same / max(1, len(ref)), 3),
+                       "differences": diffs[:60]})
+        print(f"Mot manus: {same} av {len(ref)} ord gjenkjent ({same / max(1, len(ref)):.0%}). Avvik (manus -> hørt):")
+        for tag, r, h in diffs[:15]:
+            print(f"  {'mangler' if tag == 'delete' else 'ekstra' if tag == 'insert' else 'ulikt'}: «{r}» -> «{h}»")
+        print("NB: talegjenkjenning gjør egne feil. Avvik er noe å lytte etter, ikke bevis på feil i talen.")
+    (out / f"{media.stem}.asr.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Ordtider: {out / (media.stem + '.words.json')}  (kan brukes med finish --words)")
+
+
 # ------------------------------------------------------------------ finish
 def loudnorm_filter(path, target=-14.0):
     p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-vn", "-af",
@@ -1127,6 +1186,11 @@ def main():
     p = sub.add_parser("subs", help="lag SRT/ASS som følger ferdig tale")
     p.add_argument("job"); p.add_argument("--media", required=True); p.add_argument("--manus"); p.add_argument("--srt")
     p.add_argument("--words"); p.set_defaults(f=cmd_subs)
+    p = sub.add_parser("asr", help="lokal talegjenkjenning: språk, ordlyd og ordtider")
+    p.add_argument("job"); p.add_argument("--media", required=True); p.add_argument("--model", default="medium")
+    p.add_argument("--language", help="tving språk, f.eks. no; ellers brukes det som oppdages")
+    p.add_argument("--manus", help="sammenlign mot denne teksten (standard: jobbens Manus_nb.txt)")
+    p.set_defaults(f=cmd_asr)
     p = sub.add_parser("finish", help="eksporter ren + tekstet versjon, SRT, WAV fra godkjent master")
     p.add_argument("job"); p.add_argument("--master", required=True); p.add_argument("--manus"); p.add_argument("--srt")
     p.add_argument("--words"); p.add_argument("--music"); p.add_argument("--music-db", type=float, default=-24.0)

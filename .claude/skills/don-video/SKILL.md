@@ -85,7 +85,14 @@ Unngå Video Agent (dyrest). Generer hele manuset i ett opptak: verktøyet sette
 **Norsk først.** Motoren HeyGen Voice har ikke norsk. Kall `get_video_voice_capabilities`, finn norsk, velg en motor og modell derfra og send alltid `voice_settings.engine_settings`. Prøv gjerne stemmen med `create_speech` før video (sjekk pris først). Står norsk ikke oppført for stemmen: stopp og rapporter.
 
 Kontroller: riktig avatar og stemme · forståelig norsk (ikke dansk/svensk) · ingen utelatte/doble ord · naturlige pauser · troverdig ansikt og munn · utsnitt · stabil lyd · innstillingene holder for resten.
-Claude hører ikke lyd. Språk og ordlyd bevises med lokal talegjenkjenning eller av brukeren. Send aldri klipp av Don til andre tjenester enn HeyGen. Se bilder fra klippet med Read for ansikt og utsnitt. Stemmelikhet og leppesynk kan bare brukeren bedømme: send prøveklippet til ham, men ikke stopp og vent når de maskinelle kontrollene er i orden.
+Claude hører ikke lyd. Bevis språk og ordlyd med lokal talegjenkjenning:
+
+```bash
+python3 don-video/donvideo.py asr <jobb> --media <klipp.mp4>     # Whisper «medium», ca. 1,5 GB første gang
+```
+
+Den melder hvilket språk som faktisk snakkes (norsk `no` mot dansk `da` / svensk `sv`), hva som ble hørt, avvik mot manus, og skriver ordtider som kan gis til `finish --words`. Ikke tving `--language`: da forsvinner språkbeviset. Oppdages ikke norsk, eller mangler hele setninger: bytt stemmemotor eller regenerer. Talegjenkjenning gjør egne feil, så enkeltord som avviker er noe å lytte etter, ikke bevis.
+Send aldri klipp av Don til andre tjenester enn HeyGen. Se bilder fra klippet med Read for ansikt og utsnitt. Stemmelikhet og leppesynk kan bare brukeren bedømme: send prøveklippet til ham, men ikke stopp og vent når de maskinelle kontrollene er i orden.
 Endre én innstilling av gangen. Regenerer bare klipp med dokumentert feil.
 
 Full generering: `aspect_ratio` 9:16, `resolution` 1080p, `engine` eksplisitt. SRT følger med som `subtitle_url`. `donvideo.py extjob <jobb> --service heygen --kind final --id <video-id>` umiddelbart (`--status` oppdaterer samme ID senere).

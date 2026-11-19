@@ -27,12 +27,13 @@ python3 don-video/donvideo.py step <jobb> <trinn> done --note "..."
 python3 don-video/donvideo.py set <jobb> source.title='"..."' settings.engine='"..."' billing.balance_before=N
 python3 don-video/donvideo.py extjob <jobb> --service heygen --kind final --id <ekstern-id> [--status <status>]
 python3 don-video/donvideo.py ledger <jobb> --service heygen --what "..." --credits N [--estimated]
+python3 don-video/donvideo.py asr <jobb> --media <klipp.mp4>                # lokal talegjenkjenning: språk, ordlyd, ordtider
 python3 don-video/donvideo.py finish <jobb> --master <video.mp4> [--srt <fil.srt> | --words <ord.json>] [--music <fil>]
 python3 don-video/donvideo.py verify <jobb>
 python3 don-video/selftest.py                                # beviser at teksting, eksport og kontroll virker her
 ```
 
-Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` installeres ved behov.
+Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` og `faster-whisper` installeres ved behov. Whisper-modellen hentes fra huggingface.co, som er tillatt i miljøet «don-video».
 
 ## Hva som ligger hvor
 
