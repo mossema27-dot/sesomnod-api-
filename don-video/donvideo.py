@@ -86,6 +86,8 @@ def set_step(job, name, status, note=None):
     st["at"] = now()
     if note:
         st["note"] = note
+    else:
+        st.pop("note", None)  # et gammelt notat skal ikke bli hengende ved ny status
 
 
 def probe(path):
@@ -108,21 +110,27 @@ def probe(path):
     return info
 
 
+def audio_duration(path):
+    """Lydsporets egen lengde (ikke beholderens: video kan vare lenger enn lyden)."""
+    info = probe(path)
+    return (info["audio"] or {}).get("duration") or info["duration"]
+
+
 def silences(path, noise_db=-35, min_d=0.18):
     """Stille partier [(start, slutt)] i lydsporet."""
     p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-vn", "-af",
              f"silencedetect=noise={noise_db}dB:d={min_d}", "-f", "null", "-"])
     out, start = [], None
     for line in p.stderr.splitlines():
-        m = re.search(r"silence_start: (-?[\d.]+)", line)
+        m = re.search(r"silence_start: (-?[\d.]+(?:e[-+]?\d+)?)", line)
         if m:
             start = max(0.0, float(m.group(1)))
-        m = re.search(r"silence_end: (-?[\d.]+)", line)
+        m = re.search(r"silence_end: (-?[\d.]+(?:e[-+]?\d+)?)", line)
         if m and start is not None:
             out.append((start, float(m.group(1))))
             start = None
     if start is not None:
-        out.append((start, probe(path)["duration"]))
+        out.append((start, audio_duration(path)))
     return out
 
 
@@ -217,7 +225,7 @@ def cmd_ledger(a):
     jd = job_dir(a.job)
     job = load(jd)
     job["resources"].append({"service": a.service, "what": a.what, "credits": a.credits,
-                             "estimated": bool(a.estimated), "new_payment_nok": 0, "at": now()})
+                             "estimated": bool(a.estimated), "at": now()})
     save(jd, job)
     print("Ressursbruk ført.")
 
@@ -308,21 +316,43 @@ def cmd_source(a):
 
 
 # ------------------------------------------------------------------ subtitles
-WORD_RE = re.compile(r"\S+")
+WORD_RE = re.compile(r"[^ ]+")  # deler bare på vanlig mellomrom; tallgrupper holdes samlet med hardt mellomrom
+ABBREV = {"bl.a.", "f.eks.", "ca.", "osv.", "nr.", "dvs.", "kl.", "jf.", "mv.", "evt.", "inkl.", "ekskl.", "pga.",
+          "mht.", "m.m.", "o.l.", "e.l.", "t.o.m.", "f.o.m.", "dr.", "prof.", "st.", "tlf.", "etc.", "vs."}
+
+
+def tokens(text):
+    return WORD_RE.findall(re.sub(r"[\n\t\r]+", " ", text))
 
 
 def read_manus(path):
     """Talt tekst: kommentarlinjer (#) og [regi] fjernes."""
     lines = []
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+    for raw in Path(path).read_text(encoding="utf-8-sig").splitlines():
         if raw.strip().startswith("#"):
             continue
         lines.append(re.sub(r"\[[^\]]*\]", " ", raw))
-    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+    text = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    text = re.sub(r" +([,.;:!?…])", r"\1", text)                 # ingen løse skilletegn etter fjernet [regi]
+    return re.sub(r"(?<=\d) (?=\d{3}(?!\d))", "\u00a0", text)   # «10 000» holdes samlet
 
 
 def norm(w):
     return re.sub(r"[^\wæøåÆØÅ]", "", w.lower())
+
+
+def sentence_end(w, nxt=None):
+    """Ekte setningsslutt? Ordenstall (17. mai), forkortelser (f.eks.) og initialer teller ikke."""
+    if not re.search(r"[.!?…][\"»”)]*$", w):
+        return False
+    if re.search(r"[!?…][\"»”)]*$", w):
+        return True
+    core = w.lower().strip("\"»«”“()")
+    if re.fullmatch(r"\d+\.", core):
+        return nxt is None or not nxt[:1].islower()
+    if core in ABBREV or re.fullmatch(r"[a-zæøå]\.", core):
+        return nxt is None
+    return True
 
 
 FUNC_WORDS = r"^(og|i|på|til|av|en|et|ei|å|som|er|for|med|at|det|den|de|du|jeg|vi|men|så|om|fra|har|kan|skal|vil|ikke)$"
@@ -351,8 +381,10 @@ def split_balanced(idx, words, max_chars):
                     if ln > max_chars and j - i > 1:
                         continue
                     c = cost[parts - 1][i] + (ln - target) ** 2
-                    if j < m and re.match(FUNC_WORDS, norm(words[idx[j - 1]]), re.I):
-                        c += 60
+                    last = words[idx[j - 1]]
+                    if j < m and (re.match(FUNC_WORDS, norm(last), re.I) or last.lower() in ABBREV
+                                  or re.fullmatch(r"\d+\.", last)):
+                        c += 60  # ikke la en blokk ende på småord, forkortelse eller ordenstall
                     if c < cost[parts][j]:
                         cost[parts][j], back[parts][j] = c, i
         if cost[n][m] < INF:
@@ -372,7 +404,7 @@ def build_cues(words, max_chars=42, max_line=22):
     for i, w in enumerate(words):
         cur.append(i)
         text = " ".join(words[j] for j in cur)
-        hard = re.search(r"[.!?…][\"»”)]*$", w) is not None
+        hard = sentence_end(w, words[i + 1] if i + 1 < len(words) else None)
         soft = re.search(r"[,;:–—]$", w) is not None and len(text) >= 14
         if hard or soft or i == len(words) - 1:
             segs.append(cur)
@@ -382,9 +414,9 @@ def build_cues(words, max_chars=42, max_line=22):
 
 
 def wrap(text, max_line):
-    if len(text) <= max_line:
-        return text
     ws = text.split(" ")
+    if len(text) <= max_line or len(ws) < 2:
+        return text
     best, best_score = None, None
     for k in range(1, len(ws)):
         l1, l2 = " ".join(ws[:k]), " ".join(ws[k:])
@@ -423,8 +455,10 @@ def timed_words_from_srt(path):
     return out
 
 
-def align_to_timed(words, timed):
+def align_to_timed(words, timed, dur):
     """Legg manusord på tidsstemplede ord (fra tjenestens teksting eller ASR)."""
+    def end_of(t):
+        return t.get("end", t["start"] + 0.25)
     a, b = [norm(w) for w in words], [norm(t["word"]) for t in timed]
     times = [None] * len(words)
     sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
@@ -432,33 +466,47 @@ def align_to_timed(words, timed):
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
-                times[i1 + k] = (timed[j1 + k]["start"], timed[j1 + k]["end"])
+                times[i1 + k] = (timed[j1 + k]["start"], end_of(timed[j1 + k]))
                 matched += 1
-        elif tag == "replace" and j2 > j1:
-            st, en = timed[j1]["start"], timed[j2 - 1]["end"]
+        elif tag == "replace":  # avvikende ordlyd: del tidsrommet til de erstattede ordene
+            st, en = timed[j1]["start"], end_of(timed[j2 - 1])
             n = i2 - i1
             for k in range(n):
                 times[i1 + k] = (st + (en - st) * k / n, st + (en - st) * (k + 1) / n)
-    # interpoler ord uten treff
-    known = [i for i, t in enumerate(times) if t]
-    if not known:
-        die("Ingen ord i manus kunne plasseres på tidsstemplene - feil fil?")
-    for i in range(len(times)):
+    cov = matched / max(1, len(words))
+    if cov < 0.5:
+        die(f"Bare {cov:.0%} av manusordene finnes i tidsstemplene - feil fil, eller talen følger ikke manus.")
+    # Manusord uten treff: del tid med naboene, slik at ingen ord får null eller negativ varighet.
+    i, missing = 0, 0
+    while i < len(times):
         if times[i]:
+            i += 1
             continue
-        prev = max((k for k in known if k < i), default=None)
-        nxt = min((k for k in known if k > i), default=None)
-        t0 = times[prev][1] if prev is not None else 0.0
-        t1 = times[nxt][0] if nxt is not None else t0 + 0.3 * (i - (prev or 0))
-        span = (nxt if nxt is not None else i + 1) - (prev if prev is not None else -1)
-        pos = i - (prev if prev is not None else -1)
-        times[i] = (t0 + (t1 - t0) * (pos - 1) / max(1, span - 1), t0 + (t1 - t0) * pos / max(1, span - 1))
-    return times, matched / max(1, len(words))
+        j = i
+        while j < len(times) and not times[j]:
+            j += 1
+        missing += j - i
+        lo, hi = (i - 1 if i > 0 else None), (j if j < len(times) else None)
+        need = 0.22 * (j - i)
+        start = times[lo][0] if lo is not None else max(0.0, times[hi][0] - need)
+        end = times[hi][1] if hi is not None else min(dur, times[lo][1] + need)
+        grp = list(range(lo if lo is not None else i, (hi if hi is not None else j - 1) + 1))
+        if end - start < 0.12 * len(grp):
+            end = min(dur, start + 0.12 * len(grp))
+            start = max(0.0, end - 0.12 * len(grp))
+        tot = sum(len(norm(words[k])) + 2 for k in grp)
+        acc = 0.0
+        for k in grp:
+            wgt = len(norm(words[k])) + 2
+            times[k] = (start + (end - start) * acc / tot, start + (end - start) * (acc + wgt) / tot)
+            acc += wgt
+        i = j
+    return times, cov, missing
 
 
 def align_by_pauses(words, media):
     """Reserve uten tidsstempler: fordel ord over tale, og fest setningsslutt til reelle pauser."""
-    dur = probe(media)["duration"]
+    dur = audio_duration(media)
     sil = silences(media)
     speech, t = [], 0.0
     for s, e in sil:
@@ -482,17 +530,38 @@ def align_by_pauses(words, media):
     def w8(w):
         return len(norm(w)) + 2
     tot_w = sum(w8(w) for w in words)
-    # forventede setningsgrenser, festet til nærmeste pause
+    # Setningsgrenser med forventet tidspunkt, festet til pauser i rekkefølge (dynamisk programmering).
     gaps = [(speech[i][1], speech[i + 1][0]) for i in range(len(speech) - 1)]
-    bounds, acc = [], 0.0
+    cand, acc = [], 0.0
     for i, w in enumerate(words[:-1]):
         acc += w8(w)
-        if re.search(r"[.!?…:][\"»”)]*$", w):
-            exp = at(total * acc / tot_w)
-            near = min(gaps, key=lambda g: abs((g[0] + g[1]) / 2 - exp), default=None)
-            if near and abs((near[0] + near[1]) / 2 - exp) <= 0.9 and near not in [b[1] for b in bounds]:
-                bounds.append((i, near))
-    bounds.sort(key=lambda b: b[1][0])
+        if sentence_end(w, words[i + 1]) or w.endswith(":"):
+            cand.append((i, at(total * acc / tot_w)))
+    K, M, SKIP, INF = len(cand), len(gaps), 0.9, float("inf")
+    cost = [[0.0 if k == 0 else INF for _ in range(M + 1)] for k in range(K + 1)]
+    back = [[None] * (M + 1) for _ in range(K + 1)]
+    for k in range(1, K + 1):
+        for j in range(M + 1):
+            best = (cost[k - 1][j] + SKIP, ("skip", j))
+            if j >= 1:
+                if cost[k][j - 1] < best[0]:
+                    best = (cost[k][j - 1], ("left", j - 1))
+                g = gaps[j - 1]
+                d = abs((g[0] + g[1]) / 2 - cand[k - 1][1])
+                if d <= 1.5 and cost[k - 1][j - 1] + d - 0.4 * min(g[1] - g[0], 1.0) < best[0]:
+                    best = (cost[k - 1][j - 1] + d - 0.4 * min(g[1] - g[0], 1.0), ("match", j - 1))
+            cost[k][j], back[k][j] = best
+    bounds, k, j = [], K, M
+    while k > 0:
+        op, pj = back[k][j]
+        if op == "match":
+            bounds.append((cand[k - 1][0], gaps[pj]))
+            k, j = k - 1, pj
+        elif op == "left":
+            j = pj
+        else:
+            k -= 1
+    bounds.reverse()
     times, start_i, start_t = [None] * len(words), 0, speech[0][0]
     segs = [(i, g) for i, g in bounds] + [(len(words) - 1, (speech[-1][1], speech[-1][1]))]
     last_i = -1
@@ -535,18 +604,26 @@ def write_subs(cues, times, dur, srt_path, ass_path, width, height, style):
     for c in cues:
         st, en = times[c["idx"][0]][0], times[c["idx"][-1]][1] + 0.10
         timed.append([st, en, c["text"]])
+    for i, c in enumerate(timed):              # starttider strengt stigende og innenfor filmen
+        floor = timed[i - 1][0] + 0.2 if i else 0.0
+        c[0] = max(0.0, min(max(c[0], floor), dur - 0.1))
     for i, c in enumerate(timed):
         nxt = timed[i + 1][0] if i + 1 < len(timed) else dur
         c[1] = max(c[1], c[0] + 0.55)          # minste lesetid
         if nxt - c[1] < 0.30:                  # lukk små hull, aldri overlapp
             c[1] = nxt
         c[1] = min(c[1], nxt, dur)
+        if c[1] <= c[0]:
+            c[1] = min(dur, c[0] + 0.1)
     srt = "".join(f"{i}\n{fmt_srt(s)} --> {fmt_srt(e)}\n{t}\n\n" for i, (s, e, t) in enumerate(timed, 1))
     Path(srt_path).write_text(srt, encoding="utf-8")
     k = height / 1920.0
     font = style.get("font", "Inter")
-    if run(["fc-match", "-f", "%{family}", f"{font}:bold"]).stdout.split(",")[0].strip().lower() != font.lower():
-        font = "DejaVu Sans"
+    try:
+        if run(["fc-match", "-f", "%{family}", f"{font}:bold"]).stdout.split(",")[0].strip().lower() != font.lower():
+            font = "DejaVu Sans"
+    except FileNotFoundError:  # fontconfig mangler: libass velger selv en reservefont
+        pass
     head = (
         "[Script Info]\nScriptType: v4.00+\nWrapStyle: 2\nScaledBorderAndShadow: yes\n"
         f"PlayResX: {width}\nPlayResY: {height}\n\n[V4+ Styles]\n"
@@ -566,19 +643,20 @@ def write_subs(cues, times, dur, srt_path, ass_path, width, height, style):
 
 def make_subs(jd, job, media, manus, srt=None, words_json=None):
     text = read_manus(manus)
-    words = WORD_RE.findall(text)
+    words = tokens(text)
     if not words:
         die(f"Manus er tomt: {manus}")
     info = probe(media)
-    if words_json:
-        timed = json.loads(Path(words_json).read_text(encoding="utf-8"))
-        times, cov = align_to_timed(words, timed)
-        method = f"ordtidsstempler fra fil ({cov:.0%} av manusordene traff)"
-    elif srt:
-        times, cov = align_to_timed(words, timed_words_from_srt(srt))
-        method = f"tidskoder fra levert teksting ({cov:.0%} av manusordene traff)"
-        if cov < 0.85:
-            print(f"ADVARSEL: bare {cov:.0%} av manusordene finnes i levert teksting - talen avviker fra manus?")
+    if words_json or srt:
+        timed = (json.loads(Path(words_json).read_text(encoding="utf-8")) if words_json
+                 else timed_words_from_srt(srt))
+        times, cov, missing = align_to_timed(words, timed, info["duration"])
+        src_name = "ordtidsstempler fra fil" if words_json else "tidskoder fra levert teksting"
+        method = f"{src_name} ({cov:.0%} av manusordene traff)"
+        if missing:
+            method += f"; AVVIK: {missing} manusord manglet i tidsstemplene og er plassert ved interpolasjon"
+            print(f"ADVARSEL: {missing} manusord finnes ikke i tidsstemplene. Sier stemmen noe annet enn manus? "
+                  "Rett Manus_nb.txt til det som faktisk sies, eller regenerer.")
     else:
         times, anchors = align_by_pauses(words, media)
         method = f"ESTIMERT fra pauser i lyden ({anchors} setningsgrenser festet) - må kontrolleres visuelt"
@@ -629,6 +707,13 @@ def cmd_finish(a):
     exp = jd / "eksport"
     exp.mkdir(exist_ok=True)
     master = Path(a.master).resolve()
+    if not master.exists():
+        die(f"Finner ikke master: {master}")
+    if master.parent == exp.resolve() and master.name in EXPORT_NAMES.values():
+        die("Master kan ikke være en av eksportfilene. Bruk den originale filen fra genereringen.")
+    music = Path(a.music).resolve() if a.music else None
+    if music and not music.exists():
+        die(f"Finner ikke musikkfilen: {music}")
     manus = Path(a.manus) if a.manus else jd / EXPORT_NAMES["manus"]
     if not manus.exists():
         die(f"Mangler manus: {manus}")
@@ -637,6 +722,12 @@ def cmd_finish(a):
     info = probe(master)
     if not info["video"] or not info["audio"]:
         die("Master mangler video- eller lydstrøm.")
+    # Ny eksport gjør gammel kontroll og gammelt notat ugyldig.
+    set_step(job, "export", "running")
+    set_step(job, "verify", "pending")
+    for stale in (exp / EXPORT_NAMES["note"], jd / "kontroll" / "verification.json"):
+        stale.unlink(missing_ok=True)
+    save(jd, job)
     w, h = info["video"]["width"], info["video"]["height"]
     scale, note = None, []
     if abs(w / h - 9 / 16) < 0.02:
@@ -649,6 +740,11 @@ def cmd_finish(a):
         if (ow, oh) != (w, h):
             scale = f"scale={ow}:{oh}"
         note.append(f"Master er {w}x{h} (ikke 9:16). Beholdt format for å unngå tilfeldig beskjæring.")
+    vdur, adur = info["video"]["duration"], info["audio"]["duration"]
+    target = max(vdur, adur)  # aldri kutt tale; fyll heller ut det korteste sporet
+    pad_v = target - vdur if target - vdur > 0.05 else 0.0
+    if abs(vdur - adur) > 0.15:
+        note.append(f"Master hadde ulik lengde på bilde ({vdur:.2f} s) og lyd ({adur:.2f} s); korteste spor er fylt ut.")
     # 1) ren talelyd (før eventuell musikk)
     run(["ffmpeg", "-y", "-v", "error", "-i", master, "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
          exp / EXPORT_NAMES["voice"]], check=True)
@@ -656,30 +752,33 @@ def cmd_finish(a):
     timed, method = make_subs(jd, job, master, manus, a.srt, a.words)
     # 3) lydkjede: skånsom lydstyrke-normalisering, ingen støyfjerning
     ln, measured = loudnorm_filter(master)
-    inputs, amap = ["-i", master], f"[0:a]{ln},aresample=48000[a]"
-    if a.music:
-        inputs += ["-stream_loop", "-1", "-i", a.music]
-        fade = max(0.0, info["duration"] - 1.5)
-        amap = (f"[0:a]{ln},aresample=48000[v];[1:a]volume={a.music_db}dB,afade=t=in:d=1,"
+    inputs, amap = ["-i", master], f"[0:a]{ln},aresample=48000,apad[a]"
+    if music:
+        inputs += ["-stream_loop", "-1", "-i", music]
+        fade = max(0.0, target - 1.5)
+        amap = (f"[0:a]{ln},aresample=48000,apad[v];[1:a]volume={a.music_db}dB,afade=t=in:d=1,"
                 f"afade=t=out:st={fade:.2f}:d=1.5,aresample=48000[m];[v][m]amix=inputs=2:duration=first:normalize=0[a]")
-        note.append(f"Bakgrunnsmusikk mikset på {a.music_db} dB under talen: {Path(a.music).name}")
-    aenc = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-t", f"{info['duration']:.3f}"]
+        note.append(f"Bakgrunnsmusikk mikset på {a.music_db} dB under talen: {music.name}")
+    aenc = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-t", f"{target:.3f}"]
     venc = ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high"]
-    pre = f"{scale}," if scale else ""
-    copy_ok = not scale and info["video"]["codec"] == "h264" and info["video"]["pix_fmt"] == "yuv420p"
+    pre = (f"{scale}," if scale else "") + (f"tpad=stop_mode=clone:stop_duration={pad_v:.3f}," if pad_v else "")
+    copy_ok = not pre and info["video"]["codec"] == "h264" and info["video"]["pix_fmt"] == "yuv420p"
+    tmp_clean, tmp_burned = ".ny_ren.mp4", ".ny_tekst.mp4"  # byttes inn først når begge er ferdige
     if copy_ok:  # ren versjon: originalt videospor urørt, bare lyden normaliseres
         run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", amap, "-map", "0:v:0", "-map", "[a]",
-             "-c:v", "copy", *aenc, EXPORT_NAMES["clean"]], cwd=exp, check=True)
+             "-c:v", "copy", *aenc, tmp_clean], cwd=exp, check=True)
         note.append("Ren versjon: videosporet er kopiert uendret fra master (ingen ny komprimering).")
     else:
         run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", f"[0:v]{pre}format=yuv420p[vo];{amap}",
-             "-map", "[vo]", "-map", "[a]", *venc, *aenc, EXPORT_NAMES["clean"]], cwd=exp, check=True)
+             "-map", "[vo]", "-map", "[a]", *venc, *aenc, tmp_clean], cwd=exp, check=True)
     run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex",
          f"[0:v]{pre}ass=undertekster.ass,format=yuv420p[vo];{amap}",
-         "-map", "[vo]", "-map", "[a]", *venc, *aenc, EXPORT_NAMES["burned"]], cwd=exp, check=True)
+         "-map", "[vo]", "-map", "[a]", *venc, *aenc, tmp_burned], cwd=exp, check=True)
+    (exp / tmp_clean).replace(exp / EXPORT_NAMES["clean"])
+    (exp / tmp_burned).replace(exp / EXPORT_NAMES["burned"])
     job["settings"].update({"master": str(master), "master_probe": info, "output_size": f"{ow}x{oh}",
                             "loudness_in_lufs": (measured or {}).get("input_i"), "notes": note,
-                            "voice_wav_contains_music": False, "music": a.music})
+                            "voice_wav_contains_music": False, "music": str(music) if music else None})
     set_step(job, "export", "done", f"{EXPORT_NAMES['clean']} + {EXPORT_NAMES['burned']}")
     save(jd, job)
     print(f"Eksportert til {exp}\n  Teksting: {len(timed)} blokker ({method})")
@@ -688,11 +787,20 @@ def cmd_finish(a):
 
 
 # ------------------------------------------------------------------ verify
-def detect(path, vf=None, af=None, pattern=""):
-    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", path]
-    cmd += ["-vf", vf, "-an"] if vf else ["-af", af, "-vn"]
-    p = run(cmd + ["-f", "null", "-"])
+def detect(path, vf, pattern):
+    p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-vf", vf, "-an", "-f", "null", "-"])
     return re.findall(pattern, p.stderr)
+
+
+def band_psnr(burned, clean, t):
+    """Likhet i tekstfeltet (nedre midtre del) mellom tekstet og ren versjon. Høy verdi = ingen synlig tekst."""
+    crop = "crop=iw:ih*0.35:0:ih*0.5"
+    p = run(["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{t:.2f}", "-i", burned, "-ss", f"{t:.2f}", "-i", clean,
+             "-frames:v", "1", "-lavfi", f"[0:v]{crop}[a];[1:v]{crop}[b];[a][b]psnr", "-f", "null", "-"])
+    m = re.search(r"average:(\S+)", p.stderr)
+    if not m:
+        return None
+    return float("inf") if m.group(1) == "inf" else float(m.group(1))
 
 
 def cmd_verify(a):
@@ -701,14 +809,17 @@ def cmd_verify(a):
     exp = jd / "eksport"
     kdir = jd / "kontroll"
     kdir.mkdir(exist_ok=True)
+    for old in kdir.glob("*.jpg"):
+        old.unlink()
     report, hard = {"at": now(), "files": {}, "checks": []}, []
 
     def check(name, ok, detail, is_hard=True):
-        report["checks"].append({"check": name, "ok": bool(ok), "detail": detail})
+        report["checks"].append({"check": name, "ok": bool(ok), "detail": detail, "hard": is_hard})
         if not ok and is_hard:
             hard.append(name)
         print(f"  [{'OK ' if ok else 'FEIL' if is_hard else 'OBS'}] {name}: {detail}")
 
+    speech = []
     for key in ("clean", "burned"):
         f = exp / EXPORT_NAMES[key]
         print(f"{f.name}")
@@ -721,73 +832,119 @@ def cmd_verify(a):
         check(f"{key}: strømmer", bool(v and au), f"video={v and v['codec']} lyd={au and au['codec']}")
         if not (v and au):
             continue
+        dur = info["duration"]
         err = run(["ffmpeg", "-v", "error", "-i", f, "-f", "null", "-"]).stderr.strip()
         check(f"{key}: dekoder uten feil", not err, err[:200] or "hele filen dekodet")
         check(f"{key}: bildeformat", abs(v["width"] / v["height"] - 9 / 16) < 0.02,
               f"{v['width']}x{v['height']} @ {v['fps']} fps, {v['pix_fmt']}", is_hard=False)
         check(f"{key}: lyd/bilde samme lengde", abs(v["duration"] - au["duration"]) < 0.15,
               f"video {v['duration']:.2f} s, lyd {au['duration']:.2f} s")
-        black = detect(f, vf="blackdetect=d=0.4:pix_th=0.10", pattern=r"black_start:([\d.]+) black_end:([\d.]+)")
+        black = detect(f, "blackdetect=d=0.4:pix_th=0.10", r"black_start:([\d.]+) black_end:([\d.]+)")
         check(f"{key}: ingen svarte partier", not black, f"{black}" if black else "ingen >= 0,4 s")
         if key == "clean":
-            frz = detect(f, vf="freezedetect=n=0.003:d=1.5", pattern=r"freeze_start: ([\d.]+)")
-            check("clean: ingen frys", not frz, f"frys ved {frz} s" if frz else "ingen >= 1,5 s")
             voice = exp / EXPORT_NAMES["voice"]  # ren tale: musikk skal ikke skjule et kutt
             sil_src = voice if voice.exists() else f
             sil = silences(sil_src, noise_db=-38, min_d=0.25)
-            dur = probe(sil_src)["duration"]
+            sdur = audio_duration(sil_src)
+            t0 = 0.0
+            for s, e in sil:
+                if s - t0 > 0.05:
+                    speech.append((t0, s))
+                t0 = e
+            if sdur - t0 > 0.05:
+                speech.append((t0, sdur))
+            talk = sum(e - s for s, e in speech)
+            check("clean: det er tale i lydsporet", talk >= max(1.0, 0.2 * sdur),
+                  f"{talk:.1f} s lyd over stillhetsgrensen av {sdur:.1f} s")
             head = sil[0][1] if sil and sil[0][0] <= 0.02 else 0.0
-            tail = dur - sil[-1][0] if sil and sil[-1][1] >= dur - 0.05 else 0.0
+            tail = sdur - sil[-1][0] if sil and sil[-1][1] >= sdur - 0.05 else 0.0
             check("clean: tale kuttes ikke i starten", head >= 0.03, f"{head:.2f} s luft før første lyd", is_hard=False)
             check("clean: tale kuttes ikke i slutten", tail >= 0.10, f"{tail:.2f} s luft etter siste lyd", is_hard=False)
-            long_sil = [(round(s, 2), round(e, 2)) for s, e in sil if e - s > 2.5 and s > 0.1 and e < dur - 0.1]
+            check("clean: talen stopper ikke midt i filmen", tail <= max(4.0, 0.2 * sdur),
+                  f"{tail:.1f} s stillhet til slutt")
+            long_sil = [(round(s, 2), round(e, 2)) for s, e in sil if e - s > 2.5 and s > 0.1 and e < sdur - 0.1]
             check("clean: ingen lange stille hull", not long_sil, f"{long_sil}" if long_sil else "ingen > 2,5 s", is_hard=False)
+            frz, open_start = [], None  # en frys som varer ut filmen får ingen freeze_end
+            for kind, val in detect(f, "freezedetect=n=0.001:d=2.5", r"freeze_(start|end): ([\d.]+)"):
+                if kind == "start":
+                    open_start = float(val)
+                elif open_start is not None:
+                    frz.append((open_start, float(val)))
+                    open_start = None
+            if open_start is not None:
+                frz.append((open_start, dur))
+            during = [(round(s, 1), round(e, 1)) for s, e in frz
+                      if sum(max(0.0, min(e, b) - max(s, x)) for x, b in speech) > 1.0]
+            check("clean: bildet fryser ikke mens det snakkes", not during, f"{during}" if during else "ingen frys under tale")
+            check("clean: ingen frys ellers", len(frz) == len(during), f"{frz}" if frz else "ingen >= 2,5 s", is_hard=False)
             _, m = loudnorm_filter(f)
-            if m:
+            if m and m["input_i"] not in ("-inf", "inf"):
                 lufs = float(m["input_i"])
                 check("clean: lydstyrke", -17 <= lufs <= -12, f"{lufs:.1f} LUFS, topp {m['input_tp']} dBTP", is_hard=False)
-            dur = info["duration"]
+            else:
+                check("clean: lydstyrke", False, "lydsporet er stille")
             pts = [0.4, dur * 0.25, dur * 0.5, dur * 0.75, max(0.4, dur - 0.5)]
             for seg in job["settings"].get("segment_boundaries", []):
                 pts += [max(0, seg - 0.08), seg + 0.08]
         else:
-            pts = [dur * x for x in (0.1, 0.5, 0.9)] if (dur := info["duration"]) else []
+            pts = [dur * x for x in (0.1, 0.5, 0.9)]
         for i, t in enumerate(sorted(pts)):
             run(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", f, "-frames:v", "1", "-vf", "scale=540:-2",
                  kdir / f"{key}_{i:02d}_{t:06.2f}s.jpg"])
-    srt = exp / EXPORT_NAMES["srt"]
-    manus = exp / EXPORT_NAMES["manus"]
+    srt, manus = exp / EXPORT_NAMES["srt"], exp / EXPORT_NAMES["manus"]
+    clean, burned = exp / EXPORT_NAMES["clean"], exp / EXPORT_NAMES["burned"]
     if srt.exists() and manus.exists():
         cues = parse_srt(srt)
-        mw = [norm(w) for w in WORD_RE.findall(read_manus(manus)) if norm(w)]
-        sw = [norm(w) for _, _, t in cues for w in t.split() if norm(w)]
+        mw = [norm(w) for w in tokens(read_manus(manus)) if norm(w)]
+        sw = [norm(w) for _, _, t in cues for w in tokens(t) if norm(w)]
         check("teksting: alle manusord med", mw == sw, f"{len(sw)} ord i teksting / {len(mw)} i manus")
         dur = next(iter(report["files"].values()), {}).get("duration", 0)
-        over = [c for i, c in enumerate(cues[:-1]) if c[1] > cues[i + 1][0] + 0.001]
-        check("teksting: ingen overlapp, innenfor filmen", not over and (not cues or cues[-1][1] <= dur + 0.05),
-              f"{len(cues)} blokker, siste slutter {cues[-1][1]:.2f} s av {dur:.2f} s" if cues else "ingen blokker")
+        bad = [(round(s, 2), round(e, 2)) for s, e, _ in cues if not (0 <= s < e <= dur + 0.05)]
+        order = all(cues[i][0] < cues[i + 1][0] and cues[i][1] <= cues[i + 1][0] + 0.001 for i in range(len(cues) - 1))
+        check("teksting: gyldige tider, stigende, uten overlapp", bool(cues) and not bad and order,
+              f"{len(cues)} blokker, siste slutter {cues[-1][1]:.2f} s av {dur:.2f} s" if cues and not bad else f"ugyldige: {bad[:3]}")
+        short = [(round(c[0], 2), c[2]) for c in cues if c[1] - c[0] < 0.2]
+        check("teksting: ingen blokk for kort til å leses", not short, f"{short[:3]}" if short else "alle >= 0,2 s")
+        cps = max((len(t) / max(0.05, e - s) for s, e, t in cues), default=0)
+        check("teksting: lesehastighet", cps <= 40, f"høyest {cps:.0f} tegn/s")
+        check("teksting: behagelig lesehastighet", cps <= 25, f"høyest {cps:.0f} tegn/s", is_hard=False)
+        tm = job["settings"].get("subtitle_timing") or ""
+        check("teksting: timing fra faktiske tidsstempler", "ESTIMERT" not in tm and "AVVIK" not in tm, tm or "ukjent",
+              is_hard=False)
+        outside = [(round(s, 2), t) for s, e, t in cues
+                   if speech and sum(max(0.0, min(e, b) - max(s, x)) for x, b in speech) < 0.05]
+        check("teksting: hver blokk vises mens det er lyd", not outside, f"{outside[:3]}" if outside else "alle overlapper tale")
         longest = max((len(line) for _, _, t in parse_srt_raw(srt) for line in t.split("\n")), default=0)
         check("teksting: korte linjer", longest <= 26, f"lengste linje {longest} tegn", is_hard=False)
-        check("teksting: første og siste setning", bool(cues) and cues[0][0] < 3.0, f"første blokk starter {cues[0][0]:.2f} s: «{cues[0][2]}» / siste: «{cues[-1][2]}»" if cues else "-", is_hard=False)
+        if cues and clean.exists() and burned.exists():
+            mids = [(c[0] + c[1]) / 2 for c in (cues[0], cues[len(cues) // 2], cues[-1])]
+            vals = [band_psnr(burned, clean, t) for t in mids]
+            seen = [x for x in vals if x is not None and x < 30]
+            check("burned: teksten er synlig i bildet", len(seen) >= 2,
+                  "likhet med ren versjon i tekstfeltet: " + ", ".join("?" if x is None else f"{x:.0f} dB" for x in vals))
+        check("teksting: første og siste setning", bool(cues) and cues[0][0] < 3.0,
+              f"første blokk {cues[0][0]:.2f} s: «{cues[0][2]}» / siste: «{cues[-1][2]}»" if cues else "-", is_hard=False)
     else:
         check("teksting: filer finnes", False, "mangler SRT eller manus")
     report["passed"] = not hard
     report["subtitle_timing"] = job["settings"].get("subtitle_timing")
     report["human_review_required"] = [
         "Se kontrollbildene i kontroll/ (ansikt, utsnitt, tekst dekker ikke munn).",
-        "Stemmelikhet og leppesynk kan ikke bevises maskinelt - må vurderes ved avspilling.",
+        "Stemmelikhet, norsk uttale og leppesynk kan ikke bevises maskinelt - må vurderes ved avspilling.",
     ]
-    (jd / "kontroll" / "verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    (kdir / "verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     set_step(job, "verify", "done" if not hard else "failed", "maskinell kontroll OK" if not hard else f"feil: {hard}")
     save(jd, job)
     write_note(jd, job, report)
-    print(f"\nKontrollbilder: {kdir}\nResultat: {'BESTÅTT (maskinell del)' if not hard else 'IKKE BESTÅTT: ' + ', '.join(hard)}")
+    soft = [c["check"] for c in report["checks"] if not c["ok"] and not c["hard"]]
+    print(f"\nKontrollbilder: {kdir}\nResultat: " + ("BESTÅTT (maskinell del)" if not hard else "IKKE BESTÅTT: " + ", ".join(hard))
+          + (f"\nMerknader: {', '.join(soft)}" if soft else ""))
     sys.exit(0 if not hard else 1)
 
 
 def parse_srt_raw(path):
     out = []
-    for block in re.split(r"\n\s*\n", Path(path).read_text(encoding="utf-8-sig").strip()):
+    for block in re.split(r"\n\s*\n", Path(path).read_text(encoding="utf-8-sig").replace("\r", "").strip()):
         lines = block.split("\n")
         if len(lines) >= 3:
             out.append((0, 0, "\n".join(lines[2:])))
@@ -796,23 +953,31 @@ def parse_srt_raw(path):
 
 def write_note(jd, job, report):
     s, st = job["source"], job["settings"]
-    prof = json.loads(PROFILE.read_text(encoding="utf-8")) if PROFILE.exists() else {}
-    hey = prof.get("heygen", {})
-    L = [f"# Produksjonsnotat - {job['job_id']}", "", f"Generert: {now()}", "", "## Kilde",
+    none = "ikke registrert i jobben"
+    bill = job.get("billing") or {}
+    hard = [c["check"] for c in report["checks"] if not c["ok"] and c.get("hard", True)]
+    soft = [c["check"] for c in report["checks"] if not c["ok"] and not c.get("hard", True)]
+    L = [f"# Produksjonsnotat - {job['job_id']}", "", f"Generert: {now()}", "",
+         "Maskinell kontroll: " + ("BESTÅTT" if not hard else "IKKE BESTÅTT (" + ", ".join(hard) + ")")
+         + (f". Merknader: {', '.join(soft)}" if soft else ""), "", "## Kilde",
          f"- URL: {s['url']}", f"- Video-ID: {s['video_id']}", f"- Tittel: {s['title']}", f"- Kanal: {s['channel']}",
          f"- Varighet: {s['duration_s']} s, språk: {s['language']}", f"- Taler: {s['speaker']} (er Don: {s['speaker_is_don']})",
          f"- Transkripsjon: {s['transcript_method']}", f"- Uklare partier: {s['unclear_parts'] or 'ingen notert'}", "",
-         "## Identitet og produksjonsvei", f"- Produksjonsmåte: {job['production_mode']}",
-         f"- Avatar: {st.get('avatar_name', hey.get('avatar_name'))} (ID {st.get('avatar_id', hey.get('avatar_id'))})",
-         f"- Stemme: {st.get('voice_name', hey.get('voice_name'))} (ID {st.get('voice_id', hey.get('voice_id'))})",
-         f"- Motor/innstillinger: {st.get('engine')}", f"- Tilkobling: {st.get('connection', prof.get('connection'))}",
-         f"- Ny leppesynk: {st.get('new_lipsync')}", f"- Utdata: {st.get('output_size')}", "", "## Eksterne jobber"]
+         "## Identitet og produksjonsvei", f"- Produksjonsmåte: {job['production_mode'] or none}",
+         f"- Avatar: {st.get('avatar_name', none)} (ID {st.get('avatar_id', none)})",
+         f"- Stemme: {st.get('voice_name', none)} (ID {st.get('voice_id', none)})",
+         f"- Motor/innstillinger: {st.get('engine', none)}", f"- Tilkobling: {st.get('connection', none)}",
+         f"- Ny leppesynk: {st.get('new_lipsync', none)}", f"- Utdata: {st.get('output_size')}", "", "## Eksterne jobber"]
     L += [f"- {e['service']} {e['kind']}: {e['id']} ({e.get('status')})" for e in job["external_jobs"]] or ["- ingen"]
-    L += ["", "## Ressursbruk", "- Nye betalingsbelastninger: 0 kr"]
+    L += ["", "## Ressursbruk",
+          f"- Betalingstype sett hos tjenesten: {bill.get('billing_type', none)}",
+          f"- Saldo før / etter: {bill.get('balance_before', none)} / {bill.get('balance_after', none)}",
+          f"- Nye betalingsbelastninger: {bill.get('new_charges_nok', 'ikke kontrollert - ' + none)}"]
     L += [f"- {r['service']} - {r['what']}: {r['credits']} kreditter ({'estimat' if r.get('estimated') else 'faktisk'})"
           for r in job["resources"]] or ["- ingen kreditter ført"]
     L += ["", "## Maskinell kontroll av eksporten"]
-    L += [f"- [{'OK' if c['ok'] else 'AVVIK'}] {c['check']}: {c['detail']}" for c in report["checks"]]
+    L += [f"- [{'OK' if c['ok'] else 'FEIL' if c.get('hard', True) else 'MERKNAD'}] {c['check']}: {c['detail']}"
+          for c in report["checks"]]
     L += ["", f"- Tekstingens timing: {report.get('subtitle_timing')}", "", "## Krever menneskelig/visuell vurdering"]
     L += [f"- {x}" for x in report["human_review_required"]]
     L += ["", "## Merknader"] + [f"- {n}" for n in st.get("notes", [])] + [f"- {n}" for n in st.get("limitations", [])]

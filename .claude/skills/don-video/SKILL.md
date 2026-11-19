@@ -38,6 +38,9 @@ python3 don-video/donvideo.py status <jobb-id>
 
 Jobb-ID er `<dato>_<video-id>`; bruk hele ID-en (video-ID kan begynne med `-`).
 
+`jobs/` ligger ikke i git. I en ny container: se etter Drive-mappen «Don-video/<jobb-id>» og legg `Manus_nb.txt`, `tilpasninger.md`, `proveklipp.txt`, `kilde/transkripsjon_kilde.txt` og `job.json` tilbake i `don-video/jobs/<jobb-id>/` før du gjør noe på nytt. Ferdige trinn gjenbrukes.
+Kjør `python3 don-video/selftest.py` én gang per container. Den skal ende med «SELVTEST BESTÅTT».
+
 `source` henter metadata og tekstsporet til originalspråket (`<språk>-orig`) fra `www.youtube.com`. Lyd og bilde ligger på `googlevideo`-verter som ikke kan tillates enkeltvis, så transkripsjonen blir ikke kontrollert mot lyd. Skriv det i `source.transcript_method`.
 
 Når `source` blir blokkert:
@@ -68,7 +71,9 @@ Lagre `jobs/<id>/Manus_nb.txt` (linjer med `#` og `[regi]` leses ikke opp og tek
 ## 5. Budsjettport
 
 Før hvert kredittbrukende kall: konto og tjeneste, saldo nå, motor og pris per minutt lest fra live-skjema/looken (send alltid `engine` eksplisitt, aldri stol på standard), estimat for prøve + sluttproduksjon, og at saldoen dekker det uten kjøp. Før det med
-`donvideo.py ledger <jobb> --what "..." --credits N [--estimated]`, og mål faktisk forbruk som saldo før/etter. Unngå Video Agent (dyrest). Minstebelastning per jobb er udokumentert: mål den på prøveklippet før du deler i segmenter.
+`donvideo.py ledger <jobb> --what "..." --credits N [--estimated]`, og mål faktisk forbruk som saldo før/etter.
+Skriv det som faktisk ble sett inn i jobben, ellers står det «ikke registrert» i produksjonsnotatet:
+`donvideo.py set <jobb> billing.billing_type=subscription billing.balance_before=N billing.balance_after=M billing.new_charges_nok='"0 kr"' settings.avatar_name=... settings.avatar_id=... settings.voice_name=... settings.voice_id=... settings.engine=... settings.new_lipsync=true settings.connection='"HeyGen MCP (OAuth)"'` Unngå Video Agent (dyrest). Minstebelastning per jobb er udokumentert: mål den på prøveklippet før du deler i segmenter.
 
 ## 6. Prøveklipp (15–25 s fra sluttmanus), så full generering
 
@@ -89,7 +94,7 @@ python3 don-video/donvideo.py verify <jobb>
 ```
 
 `finish` lager `Don_Moses_Norsk_Ren.mp4`, `Don_Moses_Norsk_Med_Tekst.mp4`, `Undertekster_nb.srt`, `Manus_nb.txt`, `Norsk_stemme.wav` fra samme master. Uten `--srt`/`--words` blir tekstingens timing **estimert fra pauser** og må kontrolleres visuelt.
-`verify` skriver `kontroll/verification.json`, kontrollbilder og `Produksjonsnotat.md`. Se bildene med Read (start, midt, slutt, segmentoverganger). Skriv ærlig hva som er sett og hørt: maskinell kontroll beviser ikke stemmelikhet eller leppesynk.
+`verify` skriver `kontroll/verification.json`, kontrollbilder og `Produksjonsnotat.md`. Den feiler blant annet når lydsporet er stille, talen stopper midt i filmen, bildet står stille mens det snakkes, teksten ikke er synlig i bildet eller en tekstblokk vises uten lyd. Melder den «AVVIK: N manusord manglet», sier stemmen noe annet enn manus: rett `Manus_nb.txt` til det som faktisk sies, eller regenerer. Se bildene med Read (start, midt, slutt, segmentoverganger). Skriv ærlig hva som er sett og hørt: maskinell kontroll beviser ikke stemmelikhet eller leppesynk.
 
 ## 8. Leveranse og sluttrapport
 

@@ -27,6 +27,7 @@ python3 don-video/donvideo.py extjob <jobb> --kind final --id <ekstern-id>
 python3 don-video/donvideo.py ledger <jobb> --what "..." --credits N [--estimated]
 python3 don-video/donvideo.py finish <jobb> --master <video.mp4> [--srt <fil.srt>] [--music <fil>]
 python3 don-video/donvideo.py verify <jobb>
+python3 don-video/selftest.py                                # beviser at teksting, eksport og kontroll virker her
 ```
 
 Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` installeres ved behov.
@@ -36,6 +37,8 @@ Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` installeres ved behov.
 | Sti | Innhold | I git |
 |---|---|---|
 | `donvideo.py` | arbeidsflyten | ja |
+| `selftest.py` | selvtest på syntetisk media | ja |
+| `HEYGEN_FAKTA.md` | betalingsvei, kreditter, verktøy, norsk-risiko | ja |
 | `profile/don_moses.example.json` | profilmal | ja |
 | `profile/don_moses.json` | Dons avatar, stemme og innstillinger | **nei** |
 | `jobs/<id>/` | kilde, manus, jobbstatus, eksport, kontroll | **nei** |
