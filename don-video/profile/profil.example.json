@@ -1,5 +1,5 @@
 {
-  "_comment": "Mal. Den ekte profilen heter don_moses.json, ligger utenfor git (repoet er offentlig) og lagres privat i Google Drive-mappen «Don-video». file_prefix styrer navnet på de eksporterte videofilene.",
+  "_comment": "Mal. Den ekte profilen heter profil.json, ligger utenfor git (repoet er offentlig) og lagres privat i Google Drive-mappen «Don-video». file_prefix styrer navnet på de eksporterte videofilene.",
   "name": "<navn>",
   "updated": "YYYY-MM-DD",
   "connection": "HeyGen remote MCP (OAuth) via claude.ai-connector, URL https://mcp.heygen.com/mcp/v1/",

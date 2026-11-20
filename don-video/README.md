@@ -42,8 +42,8 @@ Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` og `faster-whisper` installe
 | `donvideo.py` | arbeidsflyten | ja |
 | `selftest.py` | selvtest på syntetisk media | ja |
 | `HEYGEN_FAKTA.md` | betalingsvei, kreditter, verktøy, norsk-risiko | ja |
-| `profile/don_moses.example.json` | profilmal | ja |
-| `profile/don_moses.json` | avatar, stemme, innstillinger og filnavn-prefiks | **nei** |
+| `profile/profil.example.json` | profilmal | ja |
+| `profile/profil.json` | avatar, stemme, innstillinger og filnavn-prefiks | **nei** |
 | `jobs/<id>/` | kilde, manus, jobbstatus, eksport, kontroll | **nei** |
 
 Repoet er offentlig. Profil, jobber og media lagres privat (Drive-mappen «Don-video»), ikke i git.

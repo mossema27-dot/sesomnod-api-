@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 JOBS = Path(os.environ.get("DONVIDEO_JOBS") or ROOT / "jobs")
-PROFILE = ROOT / "profile" / "don_moses.json"
+PROFILE = ROOT / "profile" / "profil.json"
 STEPS = ["source", "manus", "budget", "test_clip", "generation", "subs", "export", "verify"]
 
 

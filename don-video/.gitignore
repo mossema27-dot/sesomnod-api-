@@ -1,5 +1,5 @@
 # Repoet er OFFENTLIG: identitetsprofil, jobbdata og media skal aldri i git.
-profile/don_moses.json
+profile/profil.json
 jobs/
 _test/
 __pycache__/

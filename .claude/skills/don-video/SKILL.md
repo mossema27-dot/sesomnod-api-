@@ -14,7 +14,7 @@ Les `don-video/HEYGEN_FAKTA.md` før første HeyGen-kall: betalingsvei, kreditte
 - **0 kr i nye utgifter.** Ingen kjøp, oppgradering, påfyll, prøveperiode eller API-nøkkel.
   `HEYGEN_API_KEY`, HeyGen Direct API og PyPI-pakken `heygen-mcp` bruker en separat API-lommebok — aldri bruk dem.
 - **Én ansvarlig prosess** (hovedøkten) starter alle kredittbrukende kall. Subagenter får aldri generere.
-- **Privat.** Repoet er offentlig: profil (`profile/don_moses.json`), `jobs/` og media skal aldri committes. Ikke publiser eller del videoen.
+- **Privat.** Repoet er offentlig: profil (`profile/profil.json`), `jobs/` og media skal aldri committes. Ikke publiser eller del videoen.
 - **Riktig person og stemme først.** En generisk stemme skal aldri kalles Dons. Mangler stemmen: stopp og rapporter.
 - **Ikke gjett.** Les verktøyenes faktiske skjema (ToolSearch) før du setter ID-er og parametere.
 - Lagre ekstern jobb-ID med `donvideo.py extjob` straks den er opprettet. Ved timeout: hent status på lagret ID før noe nytt startes.
@@ -25,7 +25,7 @@ Les `don-video/HEYGEN_FAKTA.md` før første HeyGen-kall: betalingsvei, kreditte
    > Åpne claude.ai → **+** → Connectors → Manage connectors → «Add custom connector». Navn: HeyGen. URL: `https://mcp.heygen.com/mcp/v1/`. Trykk Connect, logg inn med HeyGen-kontoen og godkjenn. Start deretter en **ny** økt i miljøet «don-video» (connectors leses ved oppstart) og skriv: «Lag norsk Don-video av denne: <lenke>».
 2. Kall `get_current_user`. Krav: `billing_type = subscription`. Ved `usage_based` eller `wallet`: **stopp**, det kan gi ny belastning. Noter kredittsaldo og `resets_at` (mobilabonnement mister ubrukte kreditter ved fornyelse).
    Nettverk: YouTube og HeyGens filverter er bare tillatt i miljøet «don-video». Kjører økten i et annet miljø: bytt med miljøverktøyene (én godkjenning).
-3. Profil: `don-video/profile/don_moses.json`. Mangler den (ny container): hent `don_moses.json` fra Drive-mappen «Don-video»; finnes den ikke, kopier `don_moses.example.json` og fyll inn fra HeyGen.
+3. Profil: `don-video/profile/profil.json`. Mangler den (ny container): hent `profil.json` fra Drive-mappen «Don-video»; finnes den ikke, kopier `profil.example.json` og fyll inn fra HeyGen.
 4. Er `heygen.verified` false: list avatargrupper/looks og stemmer, velg ut fra navnehintene i profilen (`avatar_candidates…`, `voice_hint…`) **og** forhåndsvisning. Et navn alene er ikke nok. Er flere mulige og de ikke kan skilles sikkert: spør brukeren én gang. Skriv ID-er i profilen.
 
 ## 2. Jobb og kilde
