@@ -1,0 +1,57 @@
+# don-video
+
+Norsk video med eierens egen avatar og stemme fra en YouTube-lenke. 0 kr i nye utgifter.
+
+## Slik starter du neste video
+
+Skriv i en Claude Code-økt der HeyGen-connectoren er på:
+
+> Lag norsk Don-video av denne: https://youtube.com/shorts/...
+
+Skillen `.claude/skills/don-video/SKILL.md` styrer resten. Den ligger på grenen `claude/sweet-cerf-pv0trw` til den er flettet inn i `main`.
+
+## Engangsoppsett
+
+1. claude.ai → **+** → Connectors → Manage connectors → «Add custom connector» → navn `HeyGen`, URL `https://mcp.heygen.com/mcp/v1/` → Connect, logg inn og godkjenn.
+2. Start en ny økt i miljøet «don-video». Connectors leses bare ved oppstart, og bare dette miljøet slipper gjennom YouTube og HeyGens filservere.
+
+Ikke bruk HeyGen API-nøkkel: den trekker fra en separat lommebok, ikke fra abonnementet.
+
+## Kommandoer
+
+```bash
+python3 don-video/donvideo.py new "<youtube-lenke>"          # jobbmappe jobs/<dato>_<video-id>/
+python3 don-video/donvideo.py source <jobb>                  # metadata + teksting (eller --video-file / --transcript-file)
+python3 don-video/donvideo.py status <jobb>
+python3 don-video/donvideo.py step <jobb> <trinn> done --note "..."
+python3 don-video/donvideo.py set <jobb> source.title='"..."' settings.engine='"..."' billing.balance_before=N
+python3 don-video/donvideo.py extjob <jobb> --service heygen --kind final --id <ekstern-id> [--status <status>]
+python3 don-video/donvideo.py ledger <jobb> --service heygen --what "..." --credits N [--estimated]
+python3 don-video/donvideo.py asr <jobb> --media <klipp.mp4>                # lokal talegjenkjenning: språk, ordlyd, ordtider
+python3 don-video/donvideo.py finish <jobb> --master <video.mp4> [--srt <fil.srt> | --words <ord.json>] [--music <fil>]
+python3 don-video/donvideo.py verify <jobb>
+python3 don-video/selftest.py                                # beviser at teksting, eksport og kontroll virker her
+```
+
+Krever `ffmpeg`/`ffprobe` og Python 3.10+. `yt-dlp` og `faster-whisper` installeres ved behov. Whisper-modellen hentes fra huggingface.co, som er tillatt i miljøet «don-video».
+
+## Hva som ligger hvor
+
+| Sti | Innhold | I git |
+|---|---|---|
+| `donvideo.py` | arbeidsflyten | ja |
+| `selftest.py` | selvtest på syntetisk media | ja |
+| `HEYGEN_FAKTA.md` | betalingsvei, kreditter, verktøy, norsk-risiko | ja |
+| `profile/profil.example.json` | profilmal | ja |
+| `profile/profil.json` | avatar, stemme, innstillinger og filnavn-prefiks | **nei** |
+| `jobs/<id>/` | kilde, manus, jobbstatus, eksport, kontroll | **nei** |
+
+Repoet er offentlig. Profil, jobber og media lagres privat (Drive-mappen «Don-video»), ikke i git.
+
+## Kjente begrensninger
+
+- YouTube struper skyservere etter få oppslag («Sign in to confirm you're not a bot»). Da trengs videofilen.
+- Kildens lyd og bilde kan ikke lastes ned i skyøkten. Transkripsjonen kommer fra YouTubes tekstspor og er ikke kontrollert mot lyd.
+- HeyGens egen stemmemotor har ikke norsk. Se `HEYGEN_FAKTA.md`.
+- Uten SRT eller ordtidsstempler estimeres tekstingens timing fra pauser i lyden. Kontroller visuelt.
+- Maskinell kontroll beviser ikke stemmelikhet eller leppesynk. Det må ses og høres.
