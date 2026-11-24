@@ -150,6 +150,24 @@ def main():
         rep = json.loads((job / "kontroll" / "verification.json").read_text())
         check("ingen avvik på god eksport", all(c["ok"] for c in rep["checks"]),
               ", ".join(c["check"] for c in rep["checks"] if not c["ok"]))
+        good = json.loads((job / "job.json").read_text())
+        good_hash = good["settings"]["export_files"][d.EXPORT_NAMES["clean"]]["sha256"]
+        try:
+            d.cmd_finish(types.SimpleNamespace(srt=str(tmp / "feil.srt"), **ns))
+            check("feil tekstfil avbryter finish", False)
+        except SystemExit as e:
+            check("feil tekstfil avbryter finish", e.code not in (0, None))
+        state = json.loads((job / "job.json").read_text())
+        clean = job / "eksport" / d.EXPORT_NAMES["clean"]
+        kept = (state["steps"]["export"]["status"] == "done"
+                and state["settings"].get("export_files", {}).get(d.EXPORT_NAMES["clean"], {}).get("sha256") == good_hash
+                and d.sha256(clean) == good_hash
+                and (job / "kontroll" / "verification.json").exists())
+        check("avbrutt finish beholder ferdig eksport", kept, f"status={state['steps']['export']['status']}")
+        try:
+            d.cmd_verify(types.SimpleNamespace(job=str(job)))
+        except SystemExit as e:
+            check("verify består fortsatt etter avbrutt finish", e.code == 0)
         d.cmd_finish(types.SimpleNamespace(srt=str(tmp / "hull.srt"), **ns))
         try:
             d.cmd_verify(types.SimpleNamespace(job=str(job)))

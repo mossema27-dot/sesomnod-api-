@@ -871,19 +871,9 @@ def _finish(a, jd):
     manus = Path(a.manus) if a.manus else jd / EXPORT_NAMES["manus"]
     if not manus.exists():
         die(f"Mangler manus: {manus}")
-    if manus.resolve() != (exp / EXPORT_NAMES["manus"]).resolve():
-        shutil.copy(manus, exp / EXPORT_NAMES["manus"])
     info = probe(master)
     if not info["video"] or not info["audio"]:
         die("Master mangler video- eller lydstrøm.")
-    # Ny eksport gjør gammel kontroll og gammelt notat ugyldig.
-    set_step(job, "export", "running")
-    set_step(job, "verify", "pending")
-    for stale in (exp / EXPORT_NAMES["note"], jd / "kontroll" / "verification.json", exp / ".ny_ren.mp4",
-                  exp / ".ny_tekst.mp4"):
-        stale.unlink(missing_ok=True)
-    job["settings"].pop("export_files", None)
-    save(jd, job)
     w, h = info["video"]["width"], info["video"]["height"]
     scale, note = None, []
     if abs(w / h - 9 / 16) < 0.02:
@@ -901,12 +891,24 @@ def _finish(a, jd):
     pad_v = target - vdur if target - vdur > 0.05 else 0.0
     if abs(vdur - adur) > 0.15:
         note.append(f"Master hadde ulik lengde på bilde ({vdur:.2f} s) og lyd ({adur:.2f} s); korteste spor er fylt ut.")
-    # 1) ren talelyd (før eventuell musikk)
+    # Teksting før eksporten merkes som påbegynt. align_to_timed avviser en
+    # urelatert tidsfil før noe skrives; da skal en allerede ferdig eksport
+    # beholde status, fingeravtrykk og kontrollrapport.
+    timed, method = make_subs(jd, job, master, manus, a.srt, a.words)
+    if manus.resolve() != (exp / EXPORT_NAMES["manus"]).resolve():
+        shutil.copy(manus, exp / EXPORT_NAMES["manus"])
+    # Ny eksport gjør gammel kontroll og gammelt notat ugyldig.
+    set_step(job, "export", "running")
+    set_step(job, "verify", "pending")
+    for stale in (exp / EXPORT_NAMES["note"], jd / "kontroll" / "verification.json", exp / ".ny_ren.mp4",
+                  exp / ".ny_tekst.mp4"):
+        stale.unlink(missing_ok=True)
+    job["settings"].pop("export_files", None)
+    save(jd, job)
+    # Ren talelyd (før eventuell musikk). Skrives etter at tekstingen er godkjent.
     run(["ffmpeg", "-y", "-v", "error", "-i", master, "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
          exp / EXPORT_NAMES["voice"]], check=True)
-    # 2) teksting fra faktisk ferdig lyd
-    timed, method = make_subs(jd, job, master, manus, a.srt, a.words)
-    # 3) lydkjede: skånsom lydstyrke-normalisering, ingen støyfjerning
+    # Lydkjede: skånsom lydstyrke-normalisering, ingen støyfjerning
     ln, measured = loudnorm_filter(master)
     inputs, amap = ["-i", master], f"[0:a]{ln},aresample=48000,apad[a]"
     if music:
